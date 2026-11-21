@@ -535,6 +535,33 @@ fn write_icons_to(path: &Path, icons: &[(u32, String)]) -> Result<(), String> {
     write_atomic(&path, &vdf::write(&root, end))
 }
 
+/// Un nom sans caractères de contrôle (un octet nul casserait shortcuts.vdf).
+pub fn clean_name(name: &str) -> String {
+    name.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()
+}
+
+/// Renomme des raccourcis. L'identifiant est écrit dans l'entrée : sans lui, un ancien
+/// raccourci changerait d'identifiant avec son nom et perdrait images, temps de jeu et Proton.
+fn write_names_to(path: &Path, names: &[(u32, String)]) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|e| format!("Lecture de shortcuts.vdf impossible : {e}"))?;
+    let (mut root, end) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
+    if vdf::write(&root, end) != data { return Err("shortcuts.vdf a un format inattendu : il n'a pas été modifié.".into()); }
+    let list = root.as_map_mut().and_then(|m| m.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"shortcuts"))).and_then(|(_, v)| v.as_map_mut()).ok_or("shortcuts.vdf ne contient pas de raccourcis.")?;
+    let mut done = 0;
+    for (_, entry) in list.iter_mut() {
+        let Some(id) = shortcut_id(entry) else { continue };
+        let Some((_, name)) = names.iter().find(|(i, _)| *i == id) else { continue };
+        let name = clean_name(name);
+        if name.is_empty() || entry.str("AppName").as_deref() == Some(name.as_str()) { continue; }
+        entry.set_int("appid", id as i32);
+        entry.set_str("AppName", &name);
+        done += 1;
+    }
+    if done == 0 { return Ok(()); }
+    backup(path)?;
+    write_atomic(path, &vdf::write(&root, end))
+}
+
 pub fn save_art(a: &Account, id: u32, kind: Kind, bytes: &[u8]) -> Result<PathBuf, String> {
     let (ext, data): (&str, std::borrow::Cow<[u8]>) = match image::guess_format(bytes) {
         Ok(image::ImageFormat::Png) => ("png", bytes.into()),
@@ -763,11 +790,13 @@ fn with_steam_closed<T>(a: &Account, work: impl FnOnce() -> Result<T, String>) -
 
 /// Ce qui attend que Steam puisse être fermé.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)> }
+pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)>, pub names: Vec<(u32, String)> }
 
 impl Queue {
-    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() }
-    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() }
+    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() }
+    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() }
+    /// Une icône seule ne vaut pas un redémarrage de Steam.
+    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() }
 }
 
 fn shortcut_ids(path: &Path) -> Result<HashSet<u32>, String> {
@@ -787,6 +816,7 @@ fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<(), String>
     if !new.is_empty() { add_shortcuts_to(shortcuts, &new)?; }
     for g in &q.games { if let Some(t) = g.tool.as_deref() { set_compat(config, new_id(&g.name, &g.exe), Some(t))?; } }
     for (id, tool) in &q.compat { set_compat(config, *id, tool.as_deref())?; }
+    if !q.names.is_empty() && shortcuts.exists() { write_names_to(shortcuts, &q.names)?; }
     if !q.icons.is_empty() && shortcuts.exists() { write_icons_to(shortcuts, &q.icons)?; }
     Ok(())
 }
@@ -908,6 +938,75 @@ mod tests {
     }
 
     #[test]
+    fn rename_keeps_id_and_other_fields() {
+        let d = temp("rename");
+        let p = d.join("shortcuts.vdf");
+        let a = add_shortcut_to(&p, "Updater", "/j/Updater.AppImage", "-x").unwrap();
+        let b = add_shortcut_to(&p, "Autre", "/j/autre", "").unwrap();
+        let q = Queue { names: vec![(a, " Tony Hawk\n American Wasteland ".into())], ..Default::default() };
+        let c = d.join("config.vdf");
+        write_queue(&p, &c, &q).unwrap();
+        let once = std::fs::read(&p).unwrap();
+        write_queue(&p, &c, &q).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), once);
+        let (v, end) = vdf::parse_file(&once).unwrap();
+        assert_eq!(vdf::write(&v, end), once);
+        let l = v.get("shortcuts").unwrap();
+        let e = l.get("0").unwrap();
+        assert_eq!(e.str("AppName").as_deref(), Some("Tony Hawk American Wasteland"));
+        assert_eq!(shortcut_id(e), Some(a));
+        assert_eq!(e.str("LaunchOptions").as_deref(), Some("-x"));
+        assert_eq!(l.get("1").unwrap().str("AppName").as_deref(), Some("Autre"));
+        assert_eq!(shortcut_id(l.get("1").unwrap()), Some(b));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Un ancien raccourci sans `appid` garde lui aussi son identifiant.
+    #[test]
+    fn rename_pins_legacy_id() {
+        use vdf::Value::{Map, Str};
+        let d = temp("rename-legacy");
+        let p = d.join("shortcuts.vdf");
+        let entry = Map(vec![(b"AppName".to_vec(), Str(b"Vieux".to_vec())), (b"Exe".to_vec(), Str(b"\"/j/v\"".to_vec()))]);
+        let root = Map(vec![(b"shortcuts".to_vec(), Map(vec![(b"0".to_vec(), entry)]))]);
+        std::fs::write(&p, vdf::write(&root, true)).unwrap();
+        let id = legacy_appid(b"\"/j/v\"", b"Vieux");
+        write_names_to(&p, &[(id, "Nouveau".into())]).unwrap();
+        let (v, _) = vdf::parse_file(&std::fs::read(&p).unwrap()).unwrap();
+        let e = v.get("shortcuts").unwrap().get("0").unwrap().clone();
+        assert_eq!(e.str("AppName").as_deref(), Some("Nouveau"));
+        assert_eq!(shortcut_id(&e), Some(id));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Sur une copie du vrai fichier : seul le nom du raccourci choisi change.
+    #[test]
+    fn rename_on_copy_of_real_shortcuts() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let Ok(dirs) = std::fs::read_dir(PathBuf::from(home).join(".local/share/Steam/userdata")) else { return };
+        for u in dirs.flatten() {
+            let Ok(original) = std::fs::read(u.path().join("config/shortcuts.vdf")) else { continue };
+            let (ov, _) = vdf::parse_file(&original).unwrap();
+            let Some((key, entry)) = ov.get("shortcuts").and_then(|s| s.as_map()).and_then(|l| l.iter().find(|(_, e)| e.int("appid").is_some_and(|i| i != 0))) else { continue };
+            let d = temp(&format!("rename-real-{}", u.file_name().to_string_lossy()));
+            let p = d.join("shortcuts.vdf");
+            std::fs::write(&p, &original).unwrap();
+            write_names_to(&p, &[(shortcut_id(entry).unwrap(), "Nom de test".into())]).unwrap();
+            let (nv, _) = vdf::parse_file(&std::fs::read(&p).unwrap()).unwrap();
+            let (ol, nl) = (ov.get("shortcuts").unwrap().as_map().unwrap(), nv.get("shortcuts").unwrap().as_map().unwrap());
+            assert_eq!(ol.len(), nl.len());
+            for ((ok, oe), (nk, ne)) in ol.iter().zip(nl) {
+                assert_eq!(ok, nk);
+                if ok != key { assert_eq!(oe, ne); continue; }
+                let mut expected = oe.clone();
+                expected.set_str("AppName", "Nom de test");
+                assert_eq!(&expected, ne);
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
     fn compat_insert_and_update() {
         let t = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"CompatToolMapping\"\n\t\t\t\t{\n\t\t\t\t\t\"10\"\n\t\t\t\t\t{\n\t\t\t\t\t\t\"name\"\t\t\"old\"\n\t\t\t\t\t\t\"config\"\t\t\"\"\n\t\t\t\t\t\t\"priority\"\t\t\"250\"\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\t\"After\"\t\t\"1\"\n\t\t\t}\n\t\t}\n\t}\n}\n";
         let path = ["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"];
@@ -929,7 +1028,7 @@ mod tests {
         std::fs::write(&c, "\"CompatToolMapping\"\n{\n\t\"10\"\n\t{\n\t\t\"name\"\t\t\"old\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}\n}\n").unwrap();
         let g = NewGame { name: "Jeu".into(), exe: "/j/jeu.exe".into(), options: String::new(), tool: Some("proton_11".into()), icon: String::new() };
         let id = new_id(&g.name, &g.exe);
-        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())] };
+        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![] };
         write_queue(&s, &c, &q).unwrap();
         write_queue(&s, &c, &q).unwrap();
         let (v, _) = vdf::parse_file(&std::fs::read(&s).unwrap()).unwrap();

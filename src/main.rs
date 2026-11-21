@@ -163,6 +163,7 @@ struct Config {
     pending_icons: HashMap<String, Vec<(u32, String)>>,
     pending_games: HashMap<String, Vec<steam::NewGame>>,
     pending_compat: HashMap<String, Vec<(u32, Option<String>)>>,
+    pending_names: HashMap<String, Vec<(u32, String)>>,
 }
 
 fn config_dir(app: &str) -> Option<PathBuf> {
@@ -372,6 +373,8 @@ struct App {
     dirty: bool,
     tools: Vec<(String, String)>,
     compat_edit: Option<(u32, Option<String>)>,
+    rename: Option<(u32, String)>,
+    rename_focus: bool,
     game_filter: [String; 3],
     settings_zone: Zone,
     backdrops: [Arc<Mutex<blur::Backdrop>>; 3],
@@ -414,7 +417,7 @@ impl App {
         let app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.reload(&cc.egui_ctx);
         app
@@ -628,6 +631,7 @@ impl App {
                                 if let Some(l) = self.cfg.pending_games.get_mut(&id) { l.retain(|x| !applied.games.contains(x)); if l.is_empty() { self.cfg.pending_games.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_compat.get_mut(&id) { l.retain(|x| !applied.compat.contains(x)); if l.is_empty() { self.cfg.pending_compat.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_icons.get_mut(&id) { l.retain(|x| !applied.icons.contains(x)); if l.is_empty() { self.cfg.pending_icons.remove(&id); } }
+                                if let Some(l) = self.cfg.pending_names.get_mut(&id) { l.retain(|x| !applied.names.contains(x)); if l.is_empty() { self.cfg.pending_names.remove(&id); } }
                                 self.cfg.save();
                             }
                             self.set_status("Changements enregistrés dans Steam.", false);
@@ -673,6 +677,7 @@ impl App {
             games: self.cfg.pending_games.get(id).cloned().unwrap_or_default(),
             compat: self.cfg.pending_compat.get(id).cloned().unwrap_or_default(),
             icons: self.pending(),
+            names: self.cfg.pending_names.get(id).cloned().unwrap_or_default(),
         }
     }
 
@@ -685,6 +690,9 @@ impl App {
         let q = self.queue();
         for (id, tool) in &q.compat {
             if let Some(g) = self.games.iter_mut().find(|g| g.id == *id) { g.compat = tool.clone(); g.compat_queued = true; }
+        }
+        for (id, name) in &q.names {
+            if let Some(g) = self.games.iter_mut().find(|g| g.id == *id) { g.name = name.clone(); }
         }
         for n in &q.games {
             let id = steam::new_id(&n.name, &n.exe);
@@ -707,6 +715,29 @@ impl App {
         self.cfg.save();
         if self.game_active() { self.set_status("Version de Proton en attente : appliquée à la fermeture du jeu.", false); }
         else { self.apply_queue(ctx); }
+        self.reload(ctx);
+    }
+
+    /// Le nouveau nom s'affiche tout de suite ; Steam le reçoit quand il peut redémarrer.
+    fn queue_name(&mut self, ctx: &egui::Context, g: &Game, name: String) {
+        let name = steam::clean_name(&name);
+        if name.is_empty() || name == g.name { return; }
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        let list = self.cfg.pending_names.entry(account).or_default();
+        list.retain(|(i, _)| *i != g.id);
+        list.push((g.id, name.clone()));
+        self.cfg.save();
+        if let Some(x) = self.games.iter_mut().find(|x| x.id == g.id) { x.name = name; }
+        self.games.sort_by_key(|x| x.name.to_lowercase());
+        if self.game_active() { self.set_status("Nouveau nom en attente : appliqué à la fermeture du jeu.", false); }
+        self.reload(ctx);
+    }
+
+    fn cancel_name(&mut self, ctx: &egui::Context, id: u32) {
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        if let Some(l) = self.cfg.pending_names.get_mut(&account) { l.retain(|(i, _)| *i != id); if l.is_empty() { self.cfg.pending_names.remove(&account); } }
+        self.cfg.save();
+        self.set_status("Renommage annulé.", false);
         self.reload(ctx);
     }
 
@@ -750,14 +781,14 @@ impl App {
         if self.game_active() { self.hold = false; self.countdown = None; return; }
         if !self.steam_on { if !self.hold { self.apply_queue(ctx); } return; }
         // Une icône seule ne vaut pas un redémarrage de Steam : elle a son bouton.
-        if self.hold || (q.games.is_empty() && q.compat.is_empty()) { self.countdown = None; return; }
+        if self.hold || !q.needs_restart() { self.countdown = None; return; }
         let at = *self.countdown.get_or_insert_with(|| Instant::now() + Duration::from_secs(10));
         if Instant::now() >= at { self.apply_queue(ctx); } else { ctx.request_repaint_after(Duration::from_millis(250)); }
     }
 
     fn queue_bar(&mut self, ctx: &egui::Context) {
         let q = self.queue();
-        if q.is_empty() || (q.games.is_empty() && q.compat.is_empty() && self.busy.is_none()) { return; }
+        if q.is_empty() || (!q.needs_restart() && self.busy.is_none()) { return; }
         let n = q.len();
         let what = if n > 1 { format!("{n} changements") } else { "1 changement".to_string() };
         let (mut now, mut later) = (false, false);
@@ -890,6 +921,7 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) { self.focus_search = true; }
         if modal { return; }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.rename.take().is_some() { ctx.memory_mut(|m| m.stop_text_input()); return; }
             if !self.query.is_empty() { self.query.clear(); } else { self.selected = None; }
             ctx.memory_mut(|m| m.stop_text_input());
         }
@@ -903,6 +935,7 @@ impl App {
     fn hook_open(&mut self, ctx: &egui::Context) {
         if self.hook.editor { if let Some(id) = self.selected { self.open_editor(ctx, id); } }
         if self.hook.picker { self.open_back_picker(ctx, Zone::Lib); }
+        if self.hook.rename { if let Some(g) = self.selected.and_then(|id| self.game(id)) { self.rename = Some((g.id, g.name.clone())); self.rename_focus = true; } }
     }
 
     // ------------------------------------------------------------ interface
@@ -1161,6 +1194,7 @@ impl App {
     }
 
     fn detail(&mut self, ctx: &egui::Context) {
+        if self.rename.as_ref().is_some_and(|r| Some(r.0) != self.selected) { self.rename = None; }
         let Some(g) = self.selected.and_then(|id| self.game(id)).cloned() else { return };
         let (mut play, mut fav, mut edit, mut close) = (false, false, false, false);
         let favorite = self.is_favorite(g.id);
@@ -1170,6 +1204,8 @@ impl App {
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
         let (mut stop, mut open_dir) = (false, false);
+        let (mut rename_open, mut rename_save, mut rename_cancel, mut name_undo) = (false, false, false, false);
+        let name_queued = self.acc().and_then(|a| self.cfg.pending_names.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
         let halting = self.stopping.get(&g.id).is_some_and(|t| t.elapsed() < Duration::from_secs(20));
         let confirming = self.stop_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
         if confirming || halting { ctx.request_repaint_after(Duration::from_millis(250)); }
@@ -1295,6 +1331,32 @@ impl App {
                 }
                 ui.add_space(10.0);
                 edit = ui.add(egui::Button::new("Modifier les images").min_size(egui::vec2(310.0, 36.0))).clicked();
+                if !g.steam {
+                    ui.add_space(6.0);
+                    if let Some(r) = self.rename.as_mut().filter(|r| r.0 == g.id) {
+                        let field = ui.add(egui::TextEdit::singleline(&mut r.1).desired_width(296.0).char_limit(200).hint_text("Nouveau nom"));
+                        if std::mem::take(&mut self.rename_focus) { field.request_focus(); }
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let clean = steam::clean_name(&r.1);
+                        let valid = !clean.is_empty() && clean != g.name;
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let label = if game_running { "Enregistrer (à la fermeture du jeu)" } else if steam_on { "Enregistrer (redémarre Steam)" } else { "Enregistrer" };
+                            let saved = fill_button(ui, label, egui::vec2(0.0, 30.0), 13.5, if valid { pal().accent } else { pal().card }, valid);
+                            rename_save = valid && (saved || enter);
+                            rename_cancel = ui.button("Annuler").clicked();
+                        });
+                    } else {
+                        rename_open = ui.add_enabled(!g.pending, egui::Button::new("Renommer").min_size(egui::vec2(310.0, 36.0))).on_disabled_hover_text("Possible une fois le jeu enregistré dans Steam").clicked();
+                    }
+                    if name_queued {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(GOLD, "Nouveau nom en attente.");
+                            name_undo = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler")).clicked();
+                        });
+                    }
+                }
             });
             });
         });
@@ -1312,6 +1374,10 @@ impl App {
         if compat_cancel { self.compat_edit = None; }
         if compat_apply { self.compat_edit = None; self.queue_compat(ctx, &g, chosen.clone()); }
         if cancel_add { self.cancel_pending(ctx, g.id); }
+        if rename_open { self.rename = Some((g.id, g.name.clone())); self.rename_focus = true; }
+        if rename_cancel { self.rename = None; }
+        if rename_save { let name = self.rename.take().map(|r| r.1).unwrap_or_default(); self.queue_name(ctx, &g, name); }
+        if name_undo { self.cancel_name(ctx, g.id); }
     }
 
     fn add_modal(&mut self, ctx: &egui::Context) {
@@ -2080,7 +2146,7 @@ impl eframe::App for App {
 }
 
 /// Captures d'écran de test : ne lance jamais de jeu et n'écrit rien dans Steam.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
 
 impl Default for TestHook {
     fn default() -> Self {
@@ -2089,6 +2155,7 @@ impl Default for TestHook {
         let (mut hide, mut theme, mut size, mut queue) = (Vec::new(), None, None, false);
         let (mut panel, mut lib, mut picker, mut top_clear, mut top) = (None, None, false, false, None);
         let (mut tab, mut zone, mut blur, mut top_blur, mut font) = (0, Zone::Lib, None, None, false);
+        let mut rename = false;
         for part in spec.split(',') {
             if let Some(s) = part.strip_prefix("sel:") { select = Some(s.to_lowercase()); }
             editor |= part == "editor";
@@ -2097,6 +2164,7 @@ impl Default for TestHook {
             demo |= part == "demo";
             queue |= part == "queue";
             picker |= part == "picker";
+            rename |= part == "rename";
             font |= part == "font";
             if let Some(n) = part.strip_prefix("tab:") { tab = n.parse().unwrap_or(0); }
             if part == "zone:top" { zone = Zone::Top; }
@@ -2112,7 +2180,7 @@ impl Default for TestHook {
             if let Some(t) = part.strip_prefix("theme:") { theme = Some(t.to_string()); }
             if let Some(s) = part.strip_prefix("size:") { size = s.parse().ok(); }
         }
-        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, top_clear, top, panel, lib, hide, theme, size, back_game }
+        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, rename, top_clear, top, panel, lib, hide, theme, size, back_game }
     }
 }
 

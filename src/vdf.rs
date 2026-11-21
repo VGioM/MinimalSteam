@@ -48,6 +48,15 @@ impl Value {
             None => m.push((key.as_bytes().to_vec(), Value::Str(value.as_bytes().to_vec()))),
         }
     }
+
+    /// Remplace l'entier d'une clé (ou l'ajoute à la fin s'il n'existe pas).
+    pub fn set_int(&mut self, key: &str, value: i32) {
+        let Some(m) = self.as_map_mut() else { return };
+        match m.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key.as_bytes())) {
+            Some((_, v)) => *v = Value::Int(value),
+            None => m.push((key.as_bytes().to_vec(), Value::Int(value))),
+        }
+    }
 }
 
 struct Reader<'a> { data: &'a [u8], pos: usize }
