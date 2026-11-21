@@ -23,6 +23,10 @@ use selfupdate::SelfUpdate;
 use sgdb::{Img, SgdbGame};
 use steam::{Account, Game, Kind};
 
+/// Temps pendant lequel un jeu qui vient d'être lancé ne peut pas l'être une seconde fois.
+const LAUNCH_GUARD: Duration = Duration::from_secs(25);
+const APPLYING: &str = "Application des changements…";
+
 #[derive(Clone, Copy)]
 struct Pal { bg: Color32, panel: Color32, card: Color32, hover: Color32, line: Color32, text: Color32, muted: Color32, accent: Color32, on_accent: Color32, input: Color32 }
 
@@ -50,7 +54,7 @@ enum Filter { All, Favorites, Steam, Other }
 struct Match { id: u64, name: String }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum Back { #[default] Color, Image, Game }
+enum Back { #[default] Color, Image, Game, Chosen }
 
 /// (nom, accent, fond, panneaux, cartes)
 const PRESETS: [(&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]); 7] = [
@@ -65,12 +69,12 @@ const PRESETS: [(&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]); 7] = [
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-struct Theme { preset: String, accent: [u8; 3], bg: [u8; 3], panel: [u8; 3], card: [u8; 3], background: Back, image: String, dim: u8, radius: u8, show_names: bool }
+struct Theme { preset: String, accent: [u8; 3], bg: [u8; 3], panel: [u8; 3], card: [u8; 3], background: Back, image: String, game: u32, dim: u8, panel_back: Back, panel_image: String, panel_game: u32, panel_dim: u8, radius: u8, show_names: bool }
 
 impl Default for Theme {
     fn default() -> Self {
         let (n, accent, bg, panel, card) = PRESETS[0];
-        Theme { preset: n.into(), accent, bg, panel, card, background: Back::Color, image: String::new(), dim: 70, radius: 10, show_names: true }
+        Theme { preset: n.into(), accent, bg, panel, card, background: Back::Color, image: String::new(), game: 0, dim: 70, panel_back: Back::Color, panel_image: String::new(), panel_game: 0, panel_dim: 80, radius: 10, show_names: true }
     }
 }
 
@@ -113,6 +117,8 @@ struct Config {
     favorites: HashSet<String>,
     matches: HashMap<String, Match>,
     pending_icons: HashMap<String, Vec<(u32, String)>>,
+    pending_games: HashMap<String, Vec<steam::NewGame>>,
+    pending_compat: HashMap<String, Vec<(u32, Option<String>)>>,
 }
 
 fn config_dir(app: &str) -> Option<PathBuf> {
@@ -245,10 +251,10 @@ enum Msg {
     List { game: u64, kind: Kind, page: u32, result: Result<Vec<Img>, String> },
     Applied { id: u32, kind: Kind, result: Result<PathBuf, String> },
     Found(Vec<scan::Found>),
-    BackImage(PathBuf),
+    BackImage(PathBuf, bool),
     Progress(String),
-    Added(Result<Vec<u32>, String>),
-    IconsApplied(Result<(), String>),
+    Queued(Vec<steam::NewGame>),
+    QueueDone { applied: steam::Queue, result: Result<(), String> },
 }
 
 struct Row { on: bool, exists: bool, name: String, exe: String, options: String, windows: bool }
@@ -303,6 +309,11 @@ struct App {
     settings_tab: u8,
     color_edit: Option<usize>,
     dirty: bool,
+    tools: Vec<(String, String)>,
+    compat_edit: Option<(u32, Option<String>)>,
+    game_filter: [String; 2],
+    countdown: Option<Instant>,
+    hold: bool,
     update: SelfUpdate,
     hook: TestHook,
 }
@@ -322,10 +333,15 @@ impl App {
         let watched = Arc::new(Mutex::new(accounts.get(account).map(|a| a.watched()).unwrap_or_default()));
         start_poll(cc.egui_ctx.clone(), tx.clone(), watched.clone());
         let (steam_on, running) = steam::processes();
+        if hook.queue {
+            if let Some(a) = accounts.get(account) {
+                cfg.pending_games.insert(a.id.clone(), vec![steam::NewGame { name: "Hollow Knight".into(), exe: "/Jeux/Hollow Knight/hollow_knight.exe".into(), options: String::new(), tool: Some("proton_experimental".into()), icon: String::new() }]);
+            }
+        }
         let app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: 0, color_edit: None, dirty: false, update: SelfUpdate::new(), hook,
+            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: 0, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.reload(&cc.egui_ctx);
         app
@@ -373,8 +389,12 @@ impl App {
 
     fn launch(&mut self, id: u32) {
         if self.running.contains(&id) { self.set_status("Ce jeu est déjà lancé.", false); return; }
-        if self.launched.get(&id).is_some_and(|t| t.elapsed() < Duration::from_secs(8)) { return; }
+        if self.launched.contains_key(&id) { self.set_status("Ce jeu est en cours de lancement.", false); return; }
         let (Some(a), Some(g)) = (self.acc().cloned(), self.game(id).cloned()) else { return };
+        if g.pending { self.set_status("Ce jeu sera disponible une fois enregistré dans Steam.", false); return; }
+        // Steam est peut-être en train de redémarrer : un lancement maintenant se perdrait.
+        if self.busy.as_deref() == Some(APPLYING) { self.set_status("Steam redémarre : relance le jeu dans un instant.", false); return; }
+        self.countdown = None;
         match steam::launch(&a, &g) {
             Ok(()) => { self.launched.insert(id, Instant::now()); self.set_status(format!("Lancement de {}…", g.name), false); }
             Err(e) => self.set_status(e, true),
@@ -389,13 +409,23 @@ impl App {
                 Msg::Loaded(Ok(mut g)) => {
                     if !self.hook.hide.is_empty() { g.retain(|x| !self.hook.hide.iter().any(|h| x.name.to_lowercase().contains(h))); }
                     self.games = g;
+                    self.merge_queue();
+                    let find = |games: &[Game], n: &str| games.iter().find(|g| g.name.to_lowercase().contains(n)).map(|g| g.id);
+                    if let Some(id) = self.hook.panel.take().and_then(|n| find(&self.games, &n)) { self.cfg.theme.panel_game = id; self.cfg.theme.panel_back = Back::Chosen; }
+                    if let Some(id) = self.hook.lib.take().and_then(|n| find(&self.games, &n)) { self.cfg.theme.game = id; self.cfg.theme.background = Back::Chosen; }
+                    self.tools = self.acc().map(steam::compat_tools).unwrap_or_default();
                     self.loaded = true;
                     self.error = None;
                     if let Some(t) = self.hook.select.clone() { self.selected = self.games.iter().find(|g| g.name.to_lowercase().contains(&t)).map(|g| g.id); self.hook.select = None; self.hook_open(ctx); }
                     if self.selected.is_some_and(|s| !self.games.iter().any(|g| g.id == s)) { self.selected = None; }
                 }
                 Msg::Loaded(Err(e)) => { self.loaded = true; self.error = Some(e); }
-                Msg::Poll { steam, running, changed } => { self.steam_on = steam; self.running = running; if changed { self.reload(ctx); } }
+                Msg::Poll { steam, running, changed } => {
+                    self.steam_on = steam;
+                    self.launched.retain(|id, _| !running.contains(id));
+                    self.running = running;
+                    if changed { self.reload(ctx); }
+                }
                 Msg::Search { id, result } => {
                     let mut pick = None;
                     if let Some(ed) = self.editor.as_mut().filter(|e| e.id == id) {
@@ -428,34 +458,45 @@ impl App {
                     }
                 }
                 Msg::Found(list) => { if let Some(f) = self.add.as_mut() { f.scanning = false; } self.add_rows(list); }
-                Msg::BackImage(p) => {
-                    self.cfg.theme.image = p.to_string_lossy().to_string();
-                    self.cfg.theme.background = Back::Image;
+                Msg::BackImage(p, panel) => {
+                    let path = p.to_string_lossy().to_string();
+                    let t = &mut self.cfg.theme;
+                    if panel { t.panel_image = path; t.panel_back = Back::Image; } else { t.image = path; t.background = Back::Image; }
                     self.dirty = true;
                 }
                 Msg::Progress(t) => self.busy = Some(t),
-                Msg::Added(r) => {
+                Msg::Queued(games) => {
                     self.busy = None;
-                    match r {
-                        Ok(ids) => {
-                            self.add = None;
-                            self.selected = ids.last().copied();
-                            self.set_status(if ids.len() > 1 { format!("{} jeux ajoutés.", ids.len()) } else { "Jeu ajouté.".to_string() }, false);
-                            self.reload(ctx);
-                        }
-                        Err(e) => { if let Some(f) = self.add.as_mut() { f.error = Some(e.clone()); } self.set_status(e, true); }
+                    self.add = None;
+                    let n = games.len();
+                    self.selected = games.last().map(|g| steam::new_id(&g.name, &g.exe));
+                    if let Some(id) = self.acc().map(|a| a.id.clone()) {
+                        let list = self.cfg.pending_games.entry(id).or_default();
+                        for g in games { if !list.iter().any(|x| steam::new_id(&x.name, &x.exe) == steam::new_id(&g.name, &g.exe)) { list.push(g); } }
+                        self.cfg.save();
                     }
+                    let what = if n > 1 { format!("{n} jeux") } else { "Le jeu".to_string() };
+                    if self.game_active() { self.set_status(format!("{what} en attente : ajout à la fermeture du jeu en cours."), false); }
+                    else { self.apply_queue(ctx); }
+                    self.reload(ctx);
                 }
-                Msg::IconsApplied(r) => {
+                Msg::QueueDone { applied, result } => {
                     self.busy = None;
-                    match r {
+                    self.countdown = None;
+                    match result {
                         Ok(()) => {
-                            if let Some(id) = self.acc().map(|a| a.id.clone()) { self.cfg.pending_icons.remove(&id); self.cfg.save(); }
-                            self.set_status("Icônes appliquées.", false);
-                            self.reload(ctx);
+                            if let Some(id) = self.acc().map(|a| a.id.clone()) {
+                                if let Some(l) = self.cfg.pending_games.get_mut(&id) { l.retain(|x| !applied.games.contains(x)); if l.is_empty() { self.cfg.pending_games.remove(&id); } }
+                                if let Some(l) = self.cfg.pending_compat.get_mut(&id) { l.retain(|x| !applied.compat.contains(x)); if l.is_empty() { self.cfg.pending_compat.remove(&id); } }
+                                if let Some(l) = self.cfg.pending_icons.get_mut(&id) { l.retain(|x| !applied.icons.contains(x)); if l.is_empty() { self.cfg.pending_icons.remove(&id); } }
+                                self.cfg.save();
+                            }
+                            self.set_status("Changements enregistrés dans Steam.", false);
                         }
-                        Err(e) => self.set_status(e, true),
+                        // Pas de nouvel essai automatique avant la fin de la prochaine partie.
+                        Err(e) => { self.hold = true; self.set_status(e, true); }
                     }
+                    self.reload(ctx);
                 }
             }
         }
@@ -484,15 +525,113 @@ impl App {
         list.retain(|(i, _)| *i != id);
         list.push((id, path));
         self.cfg.save();
-        if !steam::processes().0 { self.apply_icons(ctx); }
+        if !self.steam_on && !self.game_active() { self.apply_queue(ctx); }
     }
 
-    fn apply_icons(&mut self, ctx: &egui::Context) {
+    fn queue(&self) -> steam::Queue {
+        let Some(id) = self.acc().map(|a| &a.id) else { return steam::Queue::default() };
+        steam::Queue {
+            games: self.cfg.pending_games.get(id).cloned().unwrap_or_default(),
+            compat: self.cfg.pending_compat.get(id).cloned().unwrap_or_default(),
+            icons: self.pending(),
+        }
+    }
+
+    /// Un jeu tourne, ou vient d'être lancé et n'est pas encore détecté.
+    fn game_active(&self) -> bool { !self.running.is_empty() || !self.launched.is_empty() }
+
+    /// Montre dans la bibliothèque ce qui n'est pas encore écrit dans Steam.
+    fn merge_queue(&mut self) {
         let Some(a) = self.acc().cloned() else { return };
-        let icons = self.pending();
-        if icons.is_empty() || self.busy.is_some() { return; }
-        self.busy = Some("Application des icônes…".into());
-        self.spawn(ctx, move || Msg::IconsApplied(steam::apply_icons(&a, &icons)));
+        let q = self.queue();
+        for (id, tool) in &q.compat {
+            if let Some(g) = self.games.iter_mut().find(|g| g.id == *id) { g.compat = tool.clone(); g.compat_queued = true; }
+        }
+        for n in &q.games {
+            let id = steam::new_id(&n.name, &n.exe);
+            if !self.games.iter().any(|g| g.id == id) { self.games.push(steam::pending_game(&a, n)); }
+        }
+        self.games.sort_by_key(|g| g.name.to_lowercase());
+    }
+
+    fn queue_compat(&mut self, ctx: &egui::Context, g: &Game, tool: Option<String>) {
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        if g.pending {
+            if let Some(n) = self.cfg.pending_games.get_mut(&account).and_then(|l| l.iter_mut().find(|n| steam::new_id(&n.name, &n.exe) == g.id)) { n.tool = tool; }
+            self.cfg.save();
+            self.reload(ctx);
+            return;
+        }
+        let list = self.cfg.pending_compat.entry(account).or_default();
+        list.retain(|(i, _)| *i != g.id);
+        list.push((g.id, tool));
+        self.cfg.save();
+        if self.game_active() { self.set_status("Version de Proton en attente : appliquée à la fermeture du jeu.", false); }
+        else { self.apply_queue(ctx); }
+        self.reload(ctx);
+    }
+
+    fn cancel_pending(&mut self, ctx: &egui::Context, id: u32) {
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        if let Some(l) = self.cfg.pending_games.get_mut(&account) { l.retain(|n| steam::new_id(&n.name, &n.exe) != id); if l.is_empty() { self.cfg.pending_games.remove(&account); } }
+        if let Some(l) = self.cfg.pending_icons.get_mut(&account) { l.retain(|(i, _)| *i != id); if l.is_empty() { self.cfg.pending_icons.remove(&account); } }
+        self.cfg.save();
+        self.selected = None;
+        self.set_status("Ajout annulé.", false);
+        self.reload(ctx);
+    }
+
+    fn apply_queue(&mut self, ctx: &egui::Context) {
+        // Les captures de test n'écrivent jamais dans Steam et ne le redémarrent pas.
+        if std::env::var_os("APP_SCREENSHOT").is_some() { return; }
+        let Some(a) = self.acc().cloned() else { return };
+        let q = self.queue();
+        if q.is_empty() || self.busy.is_some() { return; }
+        self.busy = Some(APPLYING.into());
+        self.countdown = None;
+        self.spawn(ctx, move || { let result = steam::apply_queue(&a, &q); Msg::QueueDone { applied: q, result } });
+    }
+
+    /// Applique la file quand plus aucun jeu ne tourne, après un court délai.
+    fn tick_queue(&mut self, ctx: &egui::Context) {
+        self.launched.retain(|_, t| t.elapsed() < LAUNCH_GUARD);
+        if !self.launched.is_empty() { ctx.request_repaint_after(Duration::from_secs(1)); }
+        let q = self.queue();
+        if q.is_empty() { self.countdown = None; return; }
+        if self.busy.is_some() { return; }
+        if self.game_active() { self.hold = false; self.countdown = None; return; }
+        if !self.steam_on { if !self.hold { self.apply_queue(ctx); } return; }
+        // Une icône seule ne vaut pas un redémarrage de Steam : elle a son bouton.
+        if self.hold || (q.games.is_empty() && q.compat.is_empty()) { self.countdown = None; return; }
+        let at = *self.countdown.get_or_insert_with(|| Instant::now() + Duration::from_secs(10));
+        if Instant::now() >= at { self.apply_queue(ctx); } else { ctx.request_repaint_after(Duration::from_millis(250)); }
+    }
+
+    fn queue_bar(&mut self, ctx: &egui::Context) {
+        let q = self.queue();
+        if q.is_empty() || (q.games.is_empty() && q.compat.is_empty() && self.busy.is_none()) { return; }
+        let n = q.len();
+        let what = if n > 1 { format!("{n} changements") } else { "1 changement".to_string() };
+        let (mut now, mut later) = (false, false);
+        egui::TopBottomPanel::bottom("queue").exact_height(42.0).frame(egui::Frame::new().fill(pal().card).inner_margin(Margin::symmetric(20, 0))).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.5, GOLD);
+                let text = if let Some(b) = &self.busy { b.clone() }
+                    else if self.game_active() { format!("{what} en attente : appliqué à la fermeture du jeu.") }
+                    else if let Some(at) = self.countdown { format!("Steam redémarre dans {} s pour appliquer {what}.", at.saturating_duration_since(Instant::now()).as_secs() + 1) }
+                    else { format!("{what} en attente.") };
+                ui.label(RichText::new(text).size(13.5));
+                if self.busy.is_none() && !self.game_active() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.countdown.is_some() { later = ui.button("Plus tard").clicked(); }
+                        now = ui.add(egui::Button::new(RichText::new(if self.countdown.is_some() { "Maintenant" } else { "Appliquer" }).color(pal().on_accent)).fill(pal().accent)).clicked();
+                    });
+                }
+            });
+        });
+        if later { self.hold = true; self.countdown = None; }
+        if now { self.hold = false; self.apply_queue(ctx); }
     }
 
     fn open_editor(&mut self, ctx: &egui::Context, id: u32) {
@@ -641,21 +780,23 @@ impl App {
         });
     }
 
+    /// L'image d'un fond. Le jeu sélectionné est flouté, un jeu choisi reste net.
+    fn back_texture(&mut self, back: Back, image: &str, chosen: u32, max: u32) -> Option<egui::TextureHandle> {
+        let art = |g: &Game| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
+        let (path, size) = match back {
+            Back::Color => return None,
+            Back::Image => ((!image.is_empty()).then(|| PathBuf::from(image))?, max),
+            Back::Game => (self.selected.and_then(|id| self.game(id)).and_then(art)?, 72),
+            Back::Chosen => (self.game(chosen).and_then(art)?, max),
+        };
+        self.tex.file(&path, size).cloned()
+    }
+
     fn paint_back(&mut self, ctx: &egui::Context, area: egui::Rect) {
         let painter = ctx.layer_painter(egui::LayerId::background());
         painter.rect_filled(area, 0.0, pal().bg);
         let t = self.cfg.theme.clone();
-        let src = match t.background {
-            Back::Color => None,
-            Back::Image => (!t.image.is_empty()).then(|| (PathBuf::from(&t.image), 1920)),
-            // Une image très réduite puis agrandie donne un fond flou et léger.
-            Back::Game => self.selected.and_then(|id| self.game(id)).and_then(|g| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned()).map(|p| (p, 72)),
-        };
-        if let Some(tex) = src.and_then(|(p, max)| self.tex.file(&p, max)) {
-            painter.image(tex.id(), area, cover_uv(tex.size(), area), Color32::WHITE);
-            let a = (t.dim as f32 * 2.55).round() as u8;
-            painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(t.bg[0], t.bg[1], t.bg[2], a));
-        }
+        if let Some(tex) = self.back_texture(t.background, &t.image, t.game, 1920) { fill_back(&painter, area, &tex, t.dim, t.bg); }
     }
 
     fn grid(&mut self, ctx: &egui::Context) {
@@ -702,6 +843,7 @@ impl App {
                     let hovered = resp.contains_pointer();
                     let selected = self.selected == Some(g.id);
                     let running = self.running.contains(&g.id);
+                    let blocked = running || g.pending || self.launched.contains_key(&g.id);
                     let p = ui.painter();
                     p.rect_filled(rect, rad, pal().card);
                     let tex = g.art(Kind::Cover).and_then(|f| self.tex.file(f, quality));
@@ -716,11 +858,17 @@ impl App {
                     if selected { p.rect_stroke(rect, rad, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside); }
                     else if hovered { p.rect_stroke(rect, rad, Stroke::new(1.5_f32, Color32::from_gray(150)), egui::StrokeKind::Outside); }
                     let center = rect.right_bottom() - egui::vec2(30.0, 30.0);
-                    if hovered && !running { play_icon(p, center, 21.0); }
+                    if hovered && !blocked { play_icon(p, center, 21.0); }
                     if running {
                         let b = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(72.0, 22.0));
                         p.rect_filled(b, 11.0, OK);
                         p.text(b.center(), egui::Align2::CENTER_CENTER, "En cours", egui::FontId::proportional(12.0), pal().on_accent);
+                    }
+                    if !running && (g.pending || self.launched.contains_key(&g.id)) {
+                        let (label, width) = if g.pending { ("En attente", 82.0) } else { ("Lancement…", 88.0) };
+                        let b = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(width, 22.0));
+                        p.rect_filled(b, 11.0, GOLD);
+                        p.text(b.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), Color32::from_rgb(0x24, 0x18, 0x04));
                     }
                     if self.cfg.favorites.contains(&gkey(self.accounts.get(self.account).map_or("", |a| &a.id), g.id)) {
                         p.text(rect.right_top() + egui::vec2(-16.0, 16.0), egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(17.0), GOLD);
@@ -731,7 +879,7 @@ impl App {
                     }
                     if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
                     else if resp.clicked() {
-                        let on_play = hovered && !running && resp.interact_pointer_pos().is_some_and(|q| q.distance(center) <= 22.0);
+                        let on_play = hovered && !blocked && resp.interact_pointer_pos().is_some_and(|q| q.distance(center) <= 22.0);
                         acts.push(if on_play { Act::Launch(g.id) } else { Act::Select(g.id) });
                     }
                 }
@@ -747,7 +895,16 @@ impl App {
         let (mut play, mut fav, mut edit, mut close) = (false, false, false, false);
         let favorite = self.is_favorite(g.id);
         let running = self.running.contains(&g.id);
+        let chosen = self.compat_edit.as_ref().filter(|e| e.0 == g.id).map_or_else(|| g.compat.clone(), |e| e.1.clone());
+        let default_label = if g.steam { "Par défaut de Steam" } else { "Aucune (jeu Linux)" };
+        let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
+        let launching = self.launched.contains_key(&g.id);
+        let (busy, game_running, steam_on) = (self.busy.clone(), self.game_active(), self.steam_on);
+        let t = self.cfg.theme.clone();
+        let panel_tex = self.back_texture(t.panel_back, &t.panel_image, t.panel_game, 1200);
+        let fade = if panel_tex.is_some() { Color32::from_rgba_unmultiplied(t.panel[0], t.panel[1], t.panel[2], (t.panel_dim as f32 * 2.55).round() as u8) } else { pal().panel };
         egui::SidePanel::right("detail").exact_width(350.0).resizable(false).frame(egui::Frame::new().fill(pal().panel)).show(ctx, |ui| {
+            if let Some(tex) = &panel_tex { fill_back(ui.painter(), ui.max_rect(), tex, t.panel_dim, t.panel); }
             let (hero, _) = ui.allocate_exact_size(egui::vec2(350.0, 196.0), Sense::hover());
             ui.painter().rect_filled(hero, 0.0, pal().card);
             let src = g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
@@ -756,8 +913,8 @@ impl App {
             let mut mesh = egui::Mesh::default();
             mesh.colored_vertex(shade.left_top(), Color32::TRANSPARENT);
             mesh.colored_vertex(shade.right_top(), Color32::TRANSPARENT);
-            mesh.colored_vertex(shade.right_bottom(), pal().panel);
-            mesh.colored_vertex(shade.left_bottom(), pal().panel);
+            mesh.colored_vertex(shade.right_bottom(), fade);
+            mesh.colored_vertex(shade.left_bottom(), fade);
             mesh.add_triangle(0, 1, 2);
             mesh.add_triangle(0, 2, 3);
             ui.painter().add(mesh);
@@ -777,9 +934,9 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(&g.name).size(21.0).strong()).wrap());
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let (label, color) = if running { ("En cours", OK) } else { ("▶  Jouer", pal().accent) };
+                    let (label, color) = if running { ("En cours", OK) } else if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else { ("▶  Jouer", pal().accent) };
                     let b = egui::Button::new(RichText::new(label).size(16.0).strong().color(pal().on_accent)).fill(color).min_size(egui::vec2(252.0, 42.0));
-                    play = ui.add_enabled(!running, b).clicked();
+                    play = ui.add_enabled(!running && !launching && !g.pending, b).clicked();
                     let star = RichText::new(if favorite { "★" } else { "☆" }).size(20.0).color(if favorite { GOLD } else { pal().text });
                     fav = ui.add(egui::Button::new(star).min_size(egui::vec2(46.0, 42.0))).on_hover_text("Favori").clicked();
                 });
@@ -788,7 +945,32 @@ impl App {
                 info(ui, "Dernière partie", &last_played(g.last_played));
                 if let Some(s) = g.size { info(ui, "Taille", &size(s)); }
                 info(ui, "Emplacement", &g.disk);
-                if let Some(c) = &g.compat { info(ui, "Compatibilité", c); }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Compatibilité").size(13.5).color(pal().muted));
+                let mut pick = chosen.clone();
+                let shown = pick.as_ref().map_or(default_label.to_string(), |k| self.tools.iter().find(|t| &t.0 == k).map_or(k.clone(), |t| t.1.clone()));
+                egui::ComboBox::from_id_salt(("compat", g.id)).selected_text(shown).width(298.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut pick, None, default_label);
+                    for (k, l) in &self.tools { ui.selectable_value(&mut pick, Some(k.clone()), l); }
+                    if let Some(k) = g.compat.as_ref().filter(|k| !self.tools.iter().any(|t| &t.0 == *k)) { ui.selectable_value(&mut pick, Some(k.clone()), k); }
+                });
+                if pick != chosen { compat_pick = Some(pick); }
+                if chosen != g.compat {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let can = busy.is_none();
+                        let label = if g.pending { "Enregistrer" } else if game_running { "Appliquer à la fermeture du jeu" } else if steam_on { "Appliquer (redémarre Steam)" } else { "Appliquer" };
+                        compat_apply = ui.add_enabled(can, egui::Button::new(RichText::new(label).color(if can { pal().on_accent } else { pal().muted })).fill(if can { pal().accent } else { pal().card })).clicked();
+                        compat_cancel = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler")).clicked();
+                    });
+                } else if g.compat_queued {
+                    ui.colored_label(GOLD, "Changement en attente.");
+                }
+                if g.pending {
+                    ui.add_space(4.0);
+                    ui.colored_label(GOLD, "Pas encore enregistré dans Steam.");
+                    cancel_add = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler l'ajout")).clicked();
+                }
                 ui.add_space(14.0);
                 edit = ui.add(egui::Button::new("Modifier les images").min_size(egui::vec2(310.0, 36.0))).clicked();
             });
@@ -797,12 +979,16 @@ impl App {
         if fav { self.toggle_favorite(g.id); }
         if edit { self.open_editor(ctx, g.id); }
         if close { self.selected = None; }
+        if let Some(p) = compat_pick { self.compat_edit = if p == g.compat { None } else { Some((g.id, p)) }; }
+        if compat_cancel { self.compat_edit = None; }
+        if compat_apply { self.compat_edit = None; self.queue_compat(ctx, &g, chosen.clone()); }
+        if cancel_add { self.cancel_pending(ctx, g.id); }
     }
 
     fn add_modal(&mut self, ctx: &egui::Context) {
         if self.add.is_none() { return; }
         let busy = self.busy.clone();
-        let (steam_on, game_running) = (self.steam_on, !self.running.is_empty());
+        let (steam_on, game_running) = (self.steam_on, self.game_active());
         let (mut files, mut folder, mut submit, mut cancel) = (false, false, false, false);
         let screen = ctx.screen_rect();
         let has_key = !self.cfg.api_key.trim().is_empty();
@@ -856,12 +1042,12 @@ impl App {
             let count = f.rows.iter().filter(|r| r.on && !r.exists && !r.name.trim().is_empty()).count();
             let needs_tool = f.rows.iter().any(|r| r.on && r.windows) && f.tool.is_none();
             ui.add_space(4.0);
-            if game_running { ui.colored_label(GOLD, "Un jeu est en cours : ferme-le pour pouvoir ajouter ces jeux."); }
+            if game_running && count > 0 { ui.colored_label(GOLD, "Un jeu est en cours : ils seront ajoutés dès sa fermeture."); }
             else if needs_tool { ui.colored_label(GOLD, "Installe Proton dans Steam pour ajouter des jeux Windows."); }
             else if steam_on && count > 0 { ui.label(RichText::new("Steam redémarrera une seule fois, sans afficher sa fenêtre.").size(12.5).color(pal().muted)); }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                let ready = busy.is_none() && !game_running && !needs_tool && count > 0;
+                let ready = busy.is_none() && !needs_tool && count > 0;
                 let label = busy.clone().unwrap_or_else(|| match count { 0 => "Ajouter".to_string(), 1 => "Ajouter 1 jeu".to_string(), n => format!("Ajouter {n} jeux") });
                 submit = ui.add_enabled(ready, egui::Button::new(RichText::new(label).color(if ready { pal().on_accent } else { pal().muted }).strong()).fill(if ready { pal().accent } else { pal().card }).min_size(egui::vec2(170.0, 34.0))).clicked();
                 cancel = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler").min_size(egui::vec2(0.0, 34.0))).clicked();
@@ -904,8 +1090,7 @@ impl App {
                             if let Some(icon) = fetch_art(&key, &a, steam::new_id(&g.name, &g.exe), &g.name) { g.icon = icon; }
                         }
                     }
-                    say("Redémarrage de Steam…".into());
-                    let _ = tx.send(Msg::Added(steam::add_games(&a, &games)));
+                    let _ = tx.send(Msg::Queued(games));
                     c.request_repaint();
                 });
             }
@@ -1003,14 +1188,14 @@ impl App {
                 self.reload(ctx);
             }
         }
-        if restart { self.apply_icons(ctx); }
+        if restart { self.apply_queue(ctx); }
         if close || modal.should_close() { self.editor = None; }
     }
 
     fn settings_modal(&mut self, ctx: &egui::Context) {
         if !self.settings { return; }
         let mut account = None;
-        let (mut save, mut pick_image, mut changed) = (false, false, false);
+        let (mut save, mut pick_image, mut changed) = (false, None, false);
         let screen = ctx.screen_rect();
         let demo = self.hook.demo;
         let modal = egui::Modal::new(egui::Id::new("settings")).frame(modal_frame(ctx)).show(ctx, |ui| {
@@ -1046,27 +1231,13 @@ impl App {
                             changed = true;
                         }
                     }
-                    field(ui, "Fond de la bibliothèque");
-                    ui.horizontal(|ui| {
-                        for (b, label) in [(Back::Color, "Couleur"), (Back::Image, "Mon image"), (Back::Game, "Jeu sélectionné")] {
-                            if chip(ui, label, t.background == b) {
-                                t.background = b;
-                                changed = true;
-                                if b == Back::Image && t.image.is_empty() { pick_image = true; }
-                            }
-                        }
-                    });
-                    if t.background == Back::Image {
-                        ui.horizontal(|ui| {
-                            pick_image |= ui.button("Choisir une image").clicked();
-                            let n = Path::new(&t.image).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                            ui.add(egui::Label::new(RichText::new(n).size(12.5).color(pal().muted)).truncate());
-                        });
-                    }
-                    if t.background != Back::Color {
-                        field(ui, "Assombrir le fond");
-                        changed |= ui.add(egui::Slider::new(&mut t.dim, 0..=95).suffix(" %")).changed();
-                    }
+                    let [lib_filter, panel_filter] = &mut self.game_filter;
+                    let mut pick = false;
+                    changed |= back_section(ui, "Fond de la bibliothèque", "lib", &mut t.background, &mut t.image, &mut t.game, &mut t.dim, &self.games, lib_filter, &mut pick);
+                    if pick { pick_image = Some(false); }
+                    let mut pick = false;
+                    changed |= back_section(ui, "Fond du panneau du jeu", "panel", &mut t.panel_back, &mut t.panel_image, &mut t.panel_game, &mut t.panel_dim, &self.games, panel_filter, &mut pick);
+                    if pick { pick_image = Some(true); }
                     field(ui, "Arrondi des jaquettes");
                     changed |= ui.add(egui::Slider::new(&mut t.radius, 0..=24).suffix(" px")).changed();
                     ui.add_space(6.0);
@@ -1103,10 +1274,10 @@ impl App {
             if ui.button("Fermer").clicked() { self.settings = false; }
         });
         if changed { self.dirty = true; apply_theme(ctx, &self.cfg.theme); }
-        if pick_image {
+        if let Some(panel) = pick_image {
             let (tx, c) = (self.tx.clone(), ctx.clone());
             std::thread::spawn(move || {
-                if let Some(p) = rfd::FileDialog::new().set_title("Choisir une image de fond").add_filter("Images", &["png", "jpg", "jpeg", "webp"]).pick_file() { let _ = tx.send(Msg::BackImage(p)); c.request_repaint(); }
+                if let Some(p) = rfd::FileDialog::new().set_title("Choisir une image de fond").add_filter("Images", &["png", "jpg", "jpeg", "webp"]).pick_file() { let _ = tx.send(Msg::BackImage(p, panel)); c.request_repaint(); }
             });
         }
         if let Some(i) = account {
@@ -1211,6 +1382,53 @@ fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool {
     ui.add(b).clicked()
 }
 
+fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandle, dim: u8, tint: [u8; 3]) {
+    painter.image(tex.id(), area, cover_uv(tex.size(), area), Color32::WHITE);
+    painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], (dim as f32 * 2.55).round() as u8));
+}
+
+/// Réglage d'un fond : couleur, image, jeu sélectionné ou jeu choisi dans la liste.
+#[allow(clippy::too_many_arguments)]
+fn back_section(ui: &mut egui::Ui, title: &str, salt: &str, back: &mut Back, image: &mut String, game: &mut u32, dim: &mut u8, games: &[Game], filter: &mut String, pick: &mut bool) -> bool {
+    let mut changed = false;
+    ui.push_id(salt, |ui| {
+        field(ui, title);
+        ui.horizontal(|ui| {
+            for (b, label) in [(Back::Color, "Couleur"), (Back::Image, "Mon image"), (Back::Game, "Jeu sélectionné"), (Back::Chosen, "Choisir un jeu")] {
+                if chip(ui, label, *back == b) {
+                    *back = b;
+                    changed = true;
+                    if b == Back::Image && image.is_empty() { *pick = true; }
+                }
+            }
+        });
+        if *back == Back::Image {
+            ui.horizontal(|ui| {
+                *pick |= ui.button("Choisir une image").clicked();
+                let n = Path::new(image.as_str()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                ui.add(egui::Label::new(RichText::new(n).size(12.5).color(pal().muted)).truncate());
+            });
+        }
+        if *back == Back::Chosen {
+            ui.add(egui::TextEdit::singleline(filter).hint_text("Filtrer les jeux").desired_width(f32::INFINITY));
+            let q = filter.trim().to_lowercase();
+            egui::Frame::new().fill(pal().card).corner_radius(8).inner_margin(Margin::same(6)).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("games").max_height(132.0).auto_shrink([false, true]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for g in games.iter().filter(|g| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).is_some() && (q.is_empty() || g.name.to_lowercase().contains(&q))) {
+                        if ui.add_sized([ui.available_width(), 24.0], egui::SelectableLabel::new(*game == g.id, &g.name)).clicked() { *game = g.id; changed = true; }
+                    }
+                });
+            });
+        }
+        if *back != Back::Color {
+            field(ui, "Assombrir");
+            changed |= ui.add(egui::Slider::new(dim, 0..=95).suffix(" %")).changed();
+        }
+    });
+    changed
+}
+
 fn swatch(ui: &mut egui::Ui, label: &str, c: [u8; 3], on: bool) -> bool {
     let (r, resp) = ui.allocate_exact_size(egui::vec2(112.0, 34.0), Sense::click());
     ui.painter().rect_filled(r, 8.0, pal().card);
@@ -1285,6 +1503,8 @@ impl eframe::App for App {
                 });
             }
         }
+        self.tick_queue(ctx);
+        self.queue_bar(ctx);
         self.detail(ctx);
         self.grid(ctx);
         self.add_modal(ctx);
@@ -1308,25 +1528,29 @@ impl eframe::App for App {
 }
 
 /// Captures d'écran de test : ne lance jamais de jeu et n'écrit rien dans Steam.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
 
 impl Default for TestHook {
     fn default() -> Self {
         let spec = std::env::var("MINIMALSTEAM_TEST").unwrap_or_default();
         let (mut select, mut editor, mut add, mut settings, mut demo, mut back_game) = (None, false, false, false, false, false);
-        let (mut hide, mut theme, mut size) = (Vec::new(), None, None);
+        let (mut hide, mut theme, mut size, mut queue) = (Vec::new(), None, None, false);
+        let (mut panel, mut lib) = (None, None);
         for part in spec.split(',') {
             if let Some(s) = part.strip_prefix("sel:") { select = Some(s.to_lowercase()); }
             editor |= part == "editor";
             add |= part == "add";
             settings |= part == "settings";
             demo |= part == "demo";
+            queue |= part == "queue";
+            if let Some(n) = part.strip_prefix("panel:") { panel = Some(n.to_lowercase()); }
+            if let Some(n) = part.strip_prefix("lib:") { lib = Some(n.to_lowercase()); }
             back_game |= part == "backgame";
             if let Some(h) = part.strip_prefix("hide:") { hide = h.split('|').map(|s| s.to_lowercase()).filter(|s| !s.is_empty()).collect(); }
             if let Some(t) = part.strip_prefix("theme:") { theme = Some(t.to_string()); }
             if let Some(s) = part.strip_prefix("size:") { size = s.parse().ok(); }
         }
-        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, hide, theme, size, back_game }
+        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, panel, lib, hide, theme, size, back_game }
     }
 }
 

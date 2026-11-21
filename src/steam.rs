@@ -175,6 +175,9 @@ pub struct Game {
     pub last_played: u64,
     pub playtime: u32,
     pub compat: Option<String>,
+    /// Pas encore écrit dans Steam (file d'attente).
+    pub pending: bool,
+    pub compat_queued: bool,
     pub art: [Option<PathBuf>; 5],
 }
 
@@ -271,7 +274,7 @@ pub fn load_games(a: &Account) -> Result<Vec<Game>, String> {
             let (last, time) = st.get(&id).copied().unwrap_or((0, 0));
             let cached = cache_files(&a.root, id);
             let art = Kind::ALL.map(|k| grid_art(a, id, k).or_else(|| pick_cache(&cached, k)));
-            games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: last, playtime: time, compat: compat.get(&id).cloned(), art });
+            games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: last, playtime: time, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
         }
     }
     games.extend(read_shortcuts(a, &st, &compat)?);
@@ -306,7 +309,7 @@ fn read_shortcuts(a: &Account, st: &HashMap<u32, (u64, u32)>, compat: &HashMap<u
         let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, id, k) });
         let p = PathBuf::from(&icon);
         if p.is_file() && matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(), Some("png" | "jpg" | "jpeg" | "ico" | "webp" | "bmp")) { art[Kind::Icon.index()] = Some(p); }
-        out.push(Game { id, name: v.str("AppName").unwrap_or_default(), steam: false, exe: v.str("Exe").unwrap_or_default().trim_matches('"').to_string(), icon, size: None, disk: "Non-Steam".into(), last_played: last, playtime: time, compat: compat.get(&id).cloned(), art });
+        out.push(Game { id, name: v.str("AppName").unwrap_or_default(), steam: false, exe: v.str("Exe").unwrap_or_default().trim_matches('"').to_string(), icon, size: None, disk: "Non-Steam".into(), last_played: last, playtime: time, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
     }
     Ok(out)
 }
@@ -322,7 +325,7 @@ pub fn legacy_appid(exe: &[u8], name: &[u8]) -> u32 {
 /// (nom interne, nom affiché) des versions de Proton sélectionnables.
 pub fn compat_tools(a: &Account) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for (id, internal, label) in [(1493710u32, "proton_experimental", "Proton Experimental"), (2180100, "proton_hotfix", "Proton Hotfix")] {
+    for (id, internal, label) in [(1493710u32, "proton_experimental", "Proton Experimental"), (2180100, "proton_hotfix", "Proton Hotfix"), (4628710, "proton_11", "Proton 11.0"), (3658110, "proton_10", "Proton 10.0"), (2805730, "proton_9", "Proton 9.0")] {
         if libraries(&a.root).iter().any(|l| l.join(format!("steamapps/appmanifest_{id}.acf")).is_file()) { out.push((internal.to_string(), label.to_string())); }
     }
     let mut custom = Vec::new();
@@ -357,7 +360,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
 fn empty_shortcuts() -> vdf::Value { vdf::Value::Map(vec![(b"shortcuts".to_vec(), vdf::Value::Map(vec![]))]) }
 
 /// Un jeu à ajouter à Steam.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NewGame { pub name: String, pub exe: String, pub options: String, pub tool: Option<String>, pub icon: String }
 
 /// L'identifiant que Steam donnera à ce raccourci.
@@ -423,36 +426,71 @@ fn block_end(text: &str, open: usize) -> Option<usize> {
     None
 }
 
-/// Rend `config.vdf` avec l'outil de compatibilité choisi pour ce jeu.
-pub fn with_compat(text: &str, id: u32, tool: &str) -> Result<String, String> {
+/// Le bloc d'un jeu dans CompatToolMapping : (début de la clé, `{`, `}`). Seules les
+/// clés de premier niveau comptent : `"priority" "250"` n'est pas le jeu 250.
+fn find_entry(text: &str, open: usize, close: usize, id: u32) -> Option<(usize, usize, usize)> {
+    let b = text.as_bytes();
+    let wanted = id.to_string();
+    let mut i = open + 1;
+    while i < close {
+        if b[i] != b'"' { i += 1; continue; }
+        let start = i;
+        i += 1;
+        while i < close && b[i] != b'"' { i += if b[i] == b'\\' { 2 } else { 1 }; }
+        let key = text.get(start + 1..i)?;
+        i += 1;
+        let mut n = i;
+        while n < close && b[n].is_ascii_whitespace() { n += 1; }
+        if n < close && b[n] == b'{' {
+            let end = block_end(text, n)?;
+            if key == wanted { return Some((start, n, end)); }
+            i = end + 1;
+        }
+    }
+    None
+}
+
+fn mapping(text: &str) -> Result<(usize, usize, usize), String> {
     let err = || "config.vdf a un format inattendu : il n'a pas été modifié.".to_string();
     let key_at = text.find("\"CompatToolMapping\"").ok_or_else(err)?;
     let open = key_at + text[key_at..].find('{').ok_or_else(err)?;
     let close = block_end(text, open).ok_or_else(err)?;
+    Ok((key_at, open, close))
+}
+
+/// Rend `config.vdf` avec l'outil de compatibilité choisi pour ce jeu.
+pub fn with_compat(text: &str, id: u32, tool: &str) -> Result<String, String> {
+    let err = || "config.vdf a un format inattendu : il n'a pas été modifié.".to_string();
+    let (key_at, open, close) = mapping(text)?;
     let indent: String = text[..key_at].rsplit('\n').next().unwrap_or("").chars().take_while(|c| *c == '\t').collect();
-    let key = format!("\"{id}\"");
-    if let Some(rel) = text[open..close].find(&key) {
-        let entry_open = open + rel + text[open + rel..close].find('{').ok_or_else(err)?;
-        let entry_close = block_end(text, entry_open).ok_or_else(err)?;
+    if let Some((_, entry_open, entry_close)) = find_entry(text, open, close, id) {
         let name_at = entry_open + text[entry_open..entry_close].find("\"name\"").ok_or_else(err)? + 6;
         let v1 = name_at + text[name_at..entry_close].find('"').ok_or_else(err)?;
         let v2 = v1 + 1 + text[v1 + 1..entry_close].find('"').ok_or_else(err)?;
         return Ok(format!("{}{tool}{}", &text[..v1 + 1], &text[v2..]));
     }
     let i = format!("{indent}\t");
-    let entry = format!("\n{i}{key}\n{i}{{\n{i}\t\"name\"\t\t\"{tool}\"\n{i}\t\"config\"\t\t\"\"\n{i}\t\"priority\"\t\t\"250\"\n{i}}}");
+    let entry = format!("\n{i}\"{id}\"\n{i}{{\n{i}\t\"name\"\t\t\"{tool}\"\n{i}\t\"config\"\t\t\"\"\n{i}\t\"priority\"\t\t\"250\"\n{i}}}");
     Ok(format!("{}{entry}{}", &text[..open + 1], &text[open + 1..]))
 }
 
-fn set_compat(path: &Path, id: u32, tool: &str) -> Result<(), String> {
+/// Retire le choix propre à ce jeu : Steam reprend son réglage par défaut.
+pub fn without_compat(text: &str, id: u32) -> Result<String, String> {
+    let (_, open, close) = mapping(text)?;
+    let Some((key, _, end)) = find_entry(text, open, close, id) else { return Ok(text.to_string()) };
+    let start = text[..key].rfind('\n').unwrap_or(key);
+    Ok(format!("{}{}", &text[..start], &text[end + 1..]))
+}
+
+fn set_compat(path: &Path, id: u32, tool: Option<&str>) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("Lecture de config.vdf impossible : {e}"))?;
-    let new = with_compat(&text, id, tool)?;
+    let new = match tool { Some(t) => with_compat(&text, id, t)?, None => without_compat(&text, id)? };
+    if new == text { return Ok(()); }
     backup(path)?;
     write_atomic(path, new.as_bytes())
 }
 
-pub fn write_icons(a: &Account, icons: &[(u32, String)]) -> Result<(), String> {
-    let path = a.shortcuts();
+fn write_icons_to(path: &Path, icons: &[(u32, String)]) -> Result<(), String> {
     let data = std::fs::read(&path).map_err(|e| format!("Lecture de shortcuts.vdf impossible : {e}"))?;
     let (mut root, end) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
     if vdf::write(&root, end) != data { return Err("shortcuts.vdf a un format inattendu : il n'a pas été modifié.".into()); }
@@ -603,19 +641,46 @@ fn with_steam_closed<T>(a: &Account, work: impl FnOnce() -> Result<T, String>) -
     result
 }
 
-pub fn add_games(a: &Account, games: &[NewGame]) -> Result<Vec<u32>, String> {
-    with_steam_closed(a, || {
-        let ids = add_shortcuts_to(&a.shortcuts(), games)?;
-        for g in games {
-            let id = new_id(&g.name, &g.exe);
-            if let (true, Some(t)) = (ids.contains(&id), g.tool.as_deref()) { set_compat(&a.steam_config(), id, t)?; }
-        }
-        Ok(ids)
-    })
+/// Ce qui attend que Steam puisse être fermé.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)> }
+
+impl Queue {
+    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() }
+    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() }
 }
 
-pub fn apply_icons(a: &Account, icons: &[(u32, String)]) -> Result<(), String> {
-    with_steam_closed(a, || write_icons(a, icons))
+fn shortcut_ids(path: &Path) -> Result<HashSet<u32>, String> {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(format!("Lecture de shortcuts.vdf impossible : {e}")),
+    };
+    let (root, _) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
+    Ok(root.get("shortcuts").and_then(|s| s.as_map()).map(|l| l.iter().filter_map(|(_, v)| shortcut_id(v)).collect()).unwrap_or_default())
+}
+
+/// Écrit la file. Rejouer une file déjà écrite ne change rien.
+fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<(), String> {
+    let existing = shortcut_ids(shortcuts)?;
+    let new: Vec<NewGame> = q.games.iter().filter(|g| !existing.contains(&new_id(&g.name, &g.exe))).cloned().collect();
+    if !new.is_empty() { add_shortcuts_to(shortcuts, &new)?; }
+    for g in &q.games { if let Some(t) = g.tool.as_deref() { set_compat(config, new_id(&g.name, &g.exe), Some(t))?; } }
+    for (id, tool) in &q.compat { set_compat(config, *id, tool.as_deref())?; }
+    if !q.icons.is_empty() && shortcuts.exists() { write_icons_to(shortcuts, &q.icons)?; }
+    Ok(())
+}
+
+pub fn apply_queue(a: &Account, q: &Queue) -> Result<(), String> {
+    with_steam_closed(a, || write_queue(&a.shortcuts(), &a.steam_config(), q))
+}
+
+/// Un jeu de la file, affiché en attendant d'être écrit dans Steam.
+pub fn pending_game(a: &Account, n: &NewGame) -> Game {
+    let id = new_id(&n.name, &n.exe);
+    let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, id, k) });
+    if !n.icon.is_empty() && Path::new(&n.icon).is_file() { art[Kind::Icon.index()] = Some(PathBuf::from(&n.icon)); }
+    Game { id, name: n.name.clone(), steam: false, exe: n.exe.clone(), icon: n.icon.clone(), size: None, disk: "Non-Steam".into(), last_played: 0, playtime: 0, compat: n.tool.clone(), pending: true, compat_queued: false, art }
 }
 
 #[cfg(test)]
@@ -674,7 +739,7 @@ mod tests {
 
     #[test]
     fn game_ids() {
-        let mut g = Game { id: 730, name: "x".into(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: String::new(), last_played: 0, playtime: 0, compat: None, art: Default::default() };
+        let mut g = Game { id: 730, name: "x".into(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: String::new(), last_played: 0, playtime: 0, compat: None, pending: false, compat_queued: false, art: Default::default() };
         assert_eq!(g.game_id(), 730);
         g.steam = false;
         g.id = 3746397753;
@@ -737,6 +802,39 @@ mod tests {
         assert_eq!(k.path(&path).unwrap().entries().len(), 2);
     }
 
+    #[test]
+    fn queue_is_written_once() {
+        let d = temp("queue");
+        let (s, c) = (d.join("shortcuts.vdf"), d.join("config.vdf"));
+        std::fs::write(&c, "\"CompatToolMapping\"\n{\n\t\"10\"\n\t{\n\t\t\"name\"\t\t\"old\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}\n}\n").unwrap();
+        let g = NewGame { name: "Jeu".into(), exe: "/j/jeu.exe".into(), options: String::new(), tool: Some("proton_11".into()), icon: String::new() };
+        let id = new_id(&g.name, &g.exe);
+        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())] };
+        write_queue(&s, &c, &q).unwrap();
+        write_queue(&s, &c, &q).unwrap();
+        let (v, _) = vdf::parse_file(&std::fs::read(&s).unwrap()).unwrap();
+        let l = v.get("shortcuts").unwrap();
+        assert_eq!(l.as_map().unwrap().len(), 1);
+        assert_eq!(l.get("0").unwrap().str("icon").as_deref(), Some("/i.png"));
+        let k = parse_kv(&std::fs::read_to_string(&c).unwrap());
+        let map = k.get("CompatToolMapping").unwrap();
+        assert!(map.get("10").is_none());
+        assert_eq!(map.get(&id.to_string()).unwrap().str("name"), Some("proton_11"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn compat_key_is_not_a_value() {
+        let t = "\"CompatToolMapping\"\n{\n\t\"10\"\n\t{\n\t\t\"name\"\t\t\"a\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}\n}\n";
+        let a = with_compat(t, 250, "b").unwrap();
+        let k = parse_kv(&a);
+        let m = k.get("CompatToolMapping").unwrap();
+        assert_eq!(m.get("10").unwrap().str("name"), Some("a"));
+        assert_eq!(m.get("250").unwrap().str("name"), Some("b"));
+        assert_eq!(without_compat(&a, 250).unwrap(), t);
+        assert_eq!(without_compat(t, 250).unwrap(), t);
+    }
+
     /// Sur le vrai config.vdf (en mémoire) : seule l'entrée ajoutée change.
     #[test]
     fn compat_on_real_config() {
@@ -748,5 +846,6 @@ mod tests {
         let (b, a) = (before.path(&path).unwrap().entries(), after.path(&path).unwrap().entries());
         assert_eq!(a.len(), b.len() + 1);
         assert!(b.iter().all(|e| a.contains(e)));
+        assert_eq!(without_compat(&with_compat(&text, 4000000001, "proton_experimental").unwrap(), 4000000001).unwrap(), text);
     }
 }

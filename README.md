@@ -34,7 +34,7 @@ Vérifie les noms, choisis la version de Proton pour les jeux Windows, puis vali
 
 - **7 thèmes** : Nuit, Graphite, Océan, Forêt, Aubergine, Braise et Clair.
 - **Couleurs libres** pour l'accent, le fond, les panneaux et les cartes.
-- **Fond de la bibliothèque** : une couleur, ton image, ou l'arrière-plan flouté du jeu sélectionné.
+- **Fond de la bibliothèque et du panneau du jeu**, réglés séparément : une couleur, ton image, l'arrière-plan flouté du jeu sélectionné, ou celui d'un jeu choisi dans la liste.
 - **Taille des jaquettes** réglable directement depuis la barre d'outils.
 - **Arrondi des jaquettes** et affichage ou non des noms.
 
@@ -80,7 +80,7 @@ L'app ne modifie les fichiers de Steam que pour ajouter un jeu ou appliquer une 
 | `config/config.vdf` | Version de Proton des jeux ajoutés |
 | `userdata/<compte>/config/grid/` | Images personnalisées |
 
-Ces écritures se font Steam fermé et **jamais pendant qu'un jeu tourne**. Une copie `*.minimalsteam-sauvegarde` est créée avant la première modification. Les réglages de l'app sont dans `~/.config/Minimalsteam/`.
+Ces écritures se font Steam fermé et **jamais pendant qu'un jeu tourne**. Tu peux ajouter un jeu ou changer de Proton en pleine partie : le changement passe en **file d'attente**, puis Steam redémarre discrètement quelques secondes après la fermeture du dernier jeu. Une copie `*.minimalsteam-sauvegarde` est créée avant la première modification. Les réglages de l'app sont dans `~/.config/Minimalsteam/`.
 
 ## Limites
 
