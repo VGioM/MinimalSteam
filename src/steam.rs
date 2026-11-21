@@ -566,6 +566,68 @@ pub fn processes() -> (bool, HashSet<u32>) {
     (steam, games)
 }
 
+/// (parent, date de démarrage) d'un processus vivant. La date évite de viser un PID réutilisé.
+fn proc_info(pid: i32) -> Option<(i32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    if matches!(*f.first()?, "Z" | "X") { return None; }
+    Some((f.get(1)?.parse().ok()?, f.get(19)?.parse().ok()?))
+}
+
+fn descendants(root: i32) -> Vec<(i32, u64)> {
+    let mut children: HashMap<i32, Vec<(i32, u64)>> = HashMap::new();
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        if let Some((parent, start)) = proc_info(pid) { children.entry(parent).or_default().push((pid, start)); }
+    }
+    let me = std::process::id() as i32;
+    let (mut out, mut todo) = (Vec::new(), vec![root]);
+    while let Some(p) = todo.pop() {
+        for &(pid, start) in children.get(&p).into_iter().flatten() {
+            if pid != me { out.push((pid, start)); todo.push(pid); }
+        }
+    }
+    out
+}
+
+fn signal(pid: i32, start: u64, sig: i32) {
+    if proc_info(pid).is_some_and(|i| i.1 == start) { unsafe { kill(pid, sig); } }
+}
+
+/// Demande la fermeture de tout ce qui dépend de `root`, puis force ce qui résiste après `grace`.
+fn stop_tree(root: i32, grace: std::time::Duration) {
+    const TERM: i32 = 15;
+    const KILL: i32 = 9;
+    let Some((_, root_start)) = proc_info(root) else { return };
+    let same_root = || proc_info(root).is_some_and(|i| i.1 == root_start);
+    for (p, s) in descendants(root) { signal(p, s, TERM); }
+    let end = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < end && same_root() && !descendants(root).is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if !same_root() { return; }
+    for (p, s) in descendants(root) { signal(p, s, KILL); }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    signal(root, root_start, TERM);
+}
+
+/// Arrête un jeu lancé par Steam. Renvoie `false` si aucun processus ne correspond.
+pub fn stop_game(id: u32) -> bool {
+    let wanted = format!("AppId={id}");
+    let mut roots = Vec::new();
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        if std::fs::read_to_string(e.path().join("comm")).unwrap_or_default().trim() != "reaper" || proc_info(pid).is_none() { continue; }
+        let cmd = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+        let mut args = cmd.split(|b| *b == 0);
+        if args.clone().any(|a| a == b"SteamLaunch") && args.any(|a| a == wanted.as_bytes()) { roots.push(pid); }
+    }
+    if roots.is_empty() { return false; }
+    for root in roots { std::thread::spawn(move || stop_tree(root, std::time::Duration::from_secs(10))); }
+    true
+}
+
 fn host_command(program: &str) -> Command {
     let mut c = Command::new(program);
     if std::env::var_os("APPIMAGE").is_some() {
@@ -599,7 +661,27 @@ fn spawn_detached(mut c: Command) -> std::io::Result<()> {
     Ok(())
 }
 
-extern "C" { fn setsid() -> i32; }
+extern "C" { fn setsid() -> i32; fn kill(pid: i32, sig: i32) -> i32; }
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn stops_children_even_when_they_ignore_term() {
+        let mut root = Command::new("sh").args(["-c", "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & wait"]).spawn().unwrap();
+        let pid = root.id() as i32;
+        std::thread::sleep(Duration::from_millis(300));
+        let before = descendants(pid);
+        assert!(!before.is_empty());
+        stop_tree(pid, Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(before.iter().all(|(p, s)| proc_info(*p).is_none_or(|i| i.1 != *s)));
+        let _ = root.kill();
+        let _ = root.wait();
+    }
+}
 
 /// Lance un jeu ; si Steam est fermé, il démarre sans afficher sa fenêtre.
 pub fn launch(a: &Account, g: &Game) -> Result<(), String> {

@@ -41,6 +41,8 @@ fn pal() -> Pal { PAL.with(|p| p.get()) }
 const OK: Color32 = Color32::from_rgb(0x4C, 0xC2, 0x6B);
 const BAD: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 const GOLD: Color32 = Color32::from_rgb(0xFF, 0xC8, 0x57);
+const STOP: Color32 = Color32::from_rgb(0xE0, 0x55, 0x55);
+const STOP_CONFIRM: Duration = Duration::from_secs(4);
 
 // ---------------------------------------------------------------- réglages
 
@@ -355,6 +357,8 @@ struct App {
     steam_on: bool,
     running: HashSet<u32>,
     launched: HashMap<u32, Instant>,
+    stopping: HashMap<u32, Instant>,
+    stop_confirm: Option<(u32, Instant)>,
     busy: Option<String>,
     status: Option<(String, bool, Instant)>,
     add: Option<AddForm>,
@@ -408,7 +412,7 @@ impl App {
         let app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.reload(&cc.egui_ctx);
         app
@@ -470,6 +474,22 @@ impl App {
         }
     }
 
+    /// Premier clic : demande confirmation. Second clic dans les 4 s : arrête le jeu.
+    fn request_stop(&mut self, id: u32, name: &str) {
+        if std::env::var_os("APP_SCREENSHOT").is_some() { return; }
+        if !self.stop_confirm.is_some_and(|(c, t)| c == id && t.elapsed() < STOP_CONFIRM) {
+            self.stop_confirm = Some((id, Instant::now()));
+            return;
+        }
+        self.stop_confirm = None;
+        if steam::stop_game(id) {
+            self.stopping.insert(id, Instant::now());
+            self.set_status(format!("Arrêt de {name}…"), false);
+        } else {
+            self.set_status("Impossible de trouver le jeu en cours.", true);
+        }
+    }
+
     fn pending(&self) -> Vec<(u32, String)> { self.acc().and_then(|a| self.cfg.pending_icons.get(&a.id)).cloned().unwrap_or_default() }
 
     fn handle(&mut self, ctx: &egui::Context) {
@@ -494,6 +514,8 @@ impl App {
                 Msg::Poll { steam, running, changed } => {
                     self.steam_on = steam;
                     self.launched.retain(|id, _| !running.contains(id));
+                    self.stopping.retain(|id, _| running.contains(id));
+                    if self.stop_confirm.is_some_and(|(id, _)| !running.contains(&id)) { self.stop_confirm = None; }
                     self.running = running;
                     if changed { self.reload(ctx); }
                 }
@@ -1135,6 +1157,10 @@ impl App {
         let default_label = if g.steam { "Par défaut de Steam" } else { "Aucune (jeu Linux)" };
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
+        let mut stop = false;
+        let halting = self.stopping.get(&g.id).is_some_and(|t| t.elapsed() < Duration::from_secs(20));
+        let confirming = self.stop_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
+        if confirming || halting { ctx.request_repaint_after(Duration::from_millis(250)); }
         let (busy, game_running, steam_on) = (self.busy.clone(), self.game_active(), self.steam_on);
         let t = self.cfg.theme.clone();
         let panel_tex = self.zone_tex(Zone::Panel);
@@ -1179,8 +1205,13 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(&g.name).size(21.0).strong()).wrap());
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let (label, color) = if running { ("En cours", OK) } else if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else { ("▶  Jouer", pal().accent) };
-                    play = fill_button(ui, label, egui::vec2(252.0, 42.0), 16.0, color, !running && !launching && !g.pending);
+                    if running {
+                        let (label, color, on) = if halting { ("Arrêt en cours…", GOLD, false) } else if confirming { ("Confirmer l'arrêt ?", STOP, true) } else { ("Arrêter le jeu", STOP, true) };
+                        stop = fill_button(ui, label, egui::vec2(252.0, 42.0), 16.0, color, on);
+                    } else {
+                        let (label, color) = if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else { ("▶  Jouer", pal().accent) };
+                        play = fill_button(ui, label, egui::vec2(252.0, 42.0), 16.0, color, !launching && !g.pending);
+                    }
                     let star = RichText::new(if favorite { "★" } else { "☆" }).size(20.0).color(if favorite { GOLD } else { pal().text });
                     fav = ui.add(egui::Button::new(star).min_size(egui::vec2(46.0, 42.0))).on_hover_text("Favori").clicked();
                 });
@@ -1220,6 +1251,7 @@ impl App {
             });
         });
         if play { self.launch(g.id); }
+        if stop { self.request_stop(g.id, &g.name); }
         if fav { self.toggle_favorite(g.id); }
         if edit { self.open_editor(ctx, g.id); }
         if close { self.selected = None; }
