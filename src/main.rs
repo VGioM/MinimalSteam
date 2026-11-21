@@ -2205,15 +2205,15 @@ impl TestHook {
 
 fn main() -> eframe::Result {
     let icon_png = include_bytes!("../resources/icon.png");
-    if std::env::var_os("APP_SCREENSHOT").is_none() {
-        desktop::ensure(&desktop::Entry { app_id: "minimalsteam", name: "MinimalSteam", comment: "Un lanceur épuré pour les jeux Steam et non-Steam", categories: "Game;", icon_png });
-    }
+    let app_id = if std::env::var_os("APP_SCREENSHOT").is_none() {
+        desktop::ensure(&desktop::Entry { app_id: "minimalsteam", name: "MinimalSteam", comment: "Un lanceur épuré pour les jeux Steam et non-Steam", categories: "Game;", icon_png })
+    } else { "minimalsteam".to_string() };
     let icon = image::load_from_memory(icon_png).ok().map(|i| {
         let i = i.to_rgba8();
         let (w, h) = i.dimensions();
         egui::IconData { rgba: i.into_raw(), width: w, height: h }
     });
-    let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id("minimalsteam").with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 560.0]).with_transparent(false);
+    let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id(app_id).with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 560.0]).with_transparent(false);
     if let Some(i) = icon { viewport = viewport.with_icon(i); }
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, vsync: true, ..Default::default() };
     eframe::run_native("MinimalSteam", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
