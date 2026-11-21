@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MinimalSteam
+Comment=Un lanceur épuré pour les jeux Steam et non-Steam
+Exec=minimalsteam
+Icon=minimalsteam
+Categories=Game;
+StartupWMClass=minimalsteam
+Terminal=false

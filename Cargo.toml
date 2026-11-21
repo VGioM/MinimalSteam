@@ -1,0 +1,24 @@
+[package]
+name = "minimalsteam"
+version = "1.0.1"
+edition = "2021"
+description = "Un lanceur épuré pour les jeux Steam et non-Steam"
+license = "MIT"
+publish = false
+
+[dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = "=0.31.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "ico"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
