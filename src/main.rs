@@ -29,6 +29,8 @@ use steam::{Account, Game, Kind};
 const LAUNCH_GUARD: Duration = Duration::from_secs(25);
 /// Hauteur des deux barres du haut.
 const TOP_H: f32 = 102.0;
+/// Espace entre une jaquette et la case de son nom.
+const NAME_GAP: f32 = 6.0;
 const APPLYING: &str = "Application des changements…";
 
 #[derive(Clone, Copy)]
@@ -1068,13 +1070,20 @@ impl App {
                 self.columns = cols;
                 let w = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
                 let h = w * 1.5;
-                let row = h + if names { 34.0 } else { 0.0 } + gap;
                 let rows = visible.len().div_ceil(cols);
+                // Les noms passent à la ligne : chaque rangée prend la hauteur de son nom le plus long.
+                let titles: Vec<_> = if names { visible.iter().map(|i| ui.painter().layout(self.games[*i].name.clone(), egui::FontId::proportional(13.5), pal().text, (w - 14.0).max(20.0))).collect() } else { vec![] };
+                let mut label_h = vec![0.0_f32; rows];
+                for (n, t) in titles.iter().enumerate() { label_h[n / cols] = label_h[n / cols].max(t.size().y + 8.0); }
+                let mut tops = Vec::with_capacity(rows + 1);
+                let mut y = 0.0_f32;
+                for l in &label_h { tops.push(y); y += h + if names { NAME_GAP + l } else { 0.0 } + gap; }
+                tops.push(y);
                 ui.add_space(offset);
-                let (full, _) = ui.allocate_exact_size(egui::vec2(avail, rows as f32 * row + 8.0), Sense::hover());
+                let (full, _) = ui.allocate_exact_size(egui::vec2(avail, y + 8.0), Sense::hover());
                 let rect_of = |n: usize| {
                     let (r, c) = (n / cols, n % cols);
-                    egui::Rect::from_min_size(full.min + egui::vec2(c as f32 * (w + gap), r as f32 * row), egui::vec2(w, h))
+                    egui::Rect::from_min_size(full.min + egui::vec2(c as f32 * (w + gap), tops[r]), egui::vec2(w, h))
                 };
                 if scroll_to {
                     if let Some(n) = self.selected.and_then(|s| visible.iter().position(|i| self.games[*i].id == s)) {
@@ -1083,12 +1092,13 @@ impl App {
                         ui.scroll_to_rect(target, None);
                     }
                 }
-                let first = (((vp.min.y - offset) / row).floor().max(0.0) as usize) * cols;
-                let last = ((((vp.max.y - offset).max(0.0) / row).ceil() as usize + 1) * cols).min(visible.len());
+                let first = tops.partition_point(|t| *t <= vp.min.y - offset).saturating_sub(1).min(rows) * cols;
+                let last = ((tops.partition_point(|t| *t < vp.max.y - offset) + 1).min(rows) * cols).min(visible.len());
                 for n in first..last {
                     let g = &self.games[visible[n]];
                     let rect = rect_of(n);
-                    let hit = if names { rect.union(egui::Rect::from_min_size(rect.left_bottom(), egui::vec2(w, 30.0))) } else { rect };
+                    let name_box = egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(0.0, NAME_GAP), egui::vec2(w, label_h[n / cols]));
+                    let hit = if names { rect.union(name_box) } else { rect };
                     let resp = ui.interact(hit, ui.id().with(("card", g.id)), Sense::click());
                     let hovered = resp.contains_pointer() && !over_bar;
                     let lift = ui.ctx().animate_bool_with_time(resp.id.with("lift"), hovered, 0.12);
@@ -1131,8 +1141,10 @@ impl App {
                         p.text(rect.right_top() + egui::vec2(-16.0, 16.0), egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(17.0), GOLD);
                     }
                     if names {
-                        let title = egui::WidgetText::from(RichText::new(&g.name).size(13.5).color(if selected { pal().text } else { pal().muted })).into_galley(ui, Some(egui::TextWrapMode::Truncate), w, egui::TextStyle::Body);
-                        ui.painter().galley(rect.left_bottom() + egui::vec2(1.0, 8.0), title, pal().text);
+                        let title = titles[n].clone();
+                        let border = if selected { Stroke::new(1.0_f32, pal().accent) } else { Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7)) };
+                        ui.painter().rect(name_box, 6.0, pal().menu, border, egui::StrokeKind::Inside);
+                        ui.painter().galley(egui::pos2(name_box.left() + 7.0, name_box.center().y - title.size().y / 2.0), title, pal().text);
                     }
                     if over_bar {}
                     else if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
@@ -1157,7 +1169,7 @@ impl App {
         let default_label = if g.steam { "Par défaut de Steam" } else { "Aucune (jeu Linux)" };
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
-        let mut stop = false;
+        let (mut stop, mut open_dir) = (false, false);
         let halting = self.stopping.get(&g.id).is_some_and(|t| t.elapsed() < Duration::from_secs(20));
         let confirming = self.stop_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
         if confirming || halting { ctx.request_repaint_after(Duration::from_millis(250)); }
@@ -1176,11 +1188,22 @@ impl App {
                 let pass = panel_blur.clone().map(|mut p| { p.rect = body; p });
                 fill_back(ui.painter(), body, tex, t.panel_dim, t.panel, pass);
             }
-            let (hero, _) = ui.allocate_exact_size(egui::vec2(350.0, 196.0), Sense::hover());
-            ui.painter().rect_filled(hero, 0.0, pal().card);
+            // La hauteur suit l'image pour la montrer entière au lieu de couper ses côtés.
             let src = g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
-            if let Some(t) = src.and_then(|f| self.tex.file(&f, 900).cloned()) { paint_tex(ui, hero, &t, true, 0); }
-            let shade = egui::Rect::from_min_max(egui::pos2(hero.left(), hero.bottom() - 70.0), hero.right_bottom());
+            let art = src.and_then(|f| self.tex.file(&f, 900).cloned());
+            let ratio = art.as_ref().map(|a| a.size()[0] as f32 / a.size()[1].max(1) as f32);
+            let hero_h = ratio.map_or(196.0, |r| (350.0 / r).clamp(110.0, 196.0));
+            let (hero, _) = ui.allocate_exact_size(egui::vec2(350.0, hero_h), Sense::hover());
+            ui.painter().rect_filled(hero, 0.0, pal().card);
+            if let (Some(a), Some(r)) = (&art, ratio) {
+                paint_tex(ui, hero, a, true, 0);
+                // Image haute (jaquette) : entière, posée sur sa propre version assombrie.
+                if r < 1.6 {
+                    ui.painter().rect_filled(hero, 0.0, Color32::from_black_alpha(170));
+                    paint_tex(ui, hero, a, false, 0);
+                }
+            }
+            let shade = egui::Rect::from_min_max(egui::pos2(hero.left(), hero.bottom() - (hero_h * 0.36).min(70.0)), hero.right_bottom());
             let mut mesh = egui::Mesh::default();
             mesh.colored_vertex(shade.left_top(), Color32::TRANSPARENT);
             mesh.colored_vertex(shade.right_top(), Color32::TRANSPARENT);
@@ -1190,7 +1213,7 @@ impl App {
             mesh.add_triangle(0, 2, 3);
             ui.painter().add(mesh);
             if let Some(t) = g.art(Kind::Logo).and_then(|f| self.tex.file(f, 600).cloned()) {
-                let r = egui::Rect::from_center_size(hero.center(), egui::vec2(250.0, 110.0));
+                let r = egui::Rect::from_center_size(hero.center(), egui::vec2(250.0, (hero_h * 0.62).min(110.0)));
                 paint_tex(ui, r, &t, false, 0);
             }
             let x = egui::Rect::from_center_size(hero.right_top() + egui::vec2(-24.0, 24.0), egui::vec2(30.0, 30.0));
@@ -1201,33 +1224,57 @@ impl App {
             ui.painter().line_segment([c + egui::vec2(-d, d), c + egui::vec2(d, -d)], pen);
             close = xr.clicked();
 
+            // Le panneau défile : avec toutes les stats, il peut dépasser sur une petite fenêtre.
+            egui::ScrollArea::vertical().id_salt(("detail-scroll", g.id)).auto_shrink(false).show(ui, |ui| {
             egui::Frame::new().inner_margin(Margin { left: 20, right: 20, top: 8, bottom: 16 }).show(ui, |ui| {
-                ui.add(egui::Label::new(RichText::new(&g.name).size(21.0).strong()).wrap());
+                ui.set_width(310.0);
+                pill().inner_margin(Margin::symmetric(12, 7)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(RichText::new(&g.name).size(21.0).strong()).wrap());
+                });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if running {
                         let (label, color, on) = if halting { ("Arrêt en cours…", GOLD, false) } else if confirming { ("Confirmer l'arrêt ?", STOP, true) } else { ("Arrêter le jeu", STOP, true) };
-                        stop = fill_button(ui, label, egui::vec2(252.0, 42.0), 16.0, color, on);
+                        stop = fill_button(ui, label, egui::vec2(198.0, 42.0), 16.0, color, on);
                     } else {
                         let (label, color) = if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else { ("▶  Jouer", pal().accent) };
-                        play = fill_button(ui, label, egui::vec2(252.0, 42.0), 16.0, color, !launching && !g.pending);
+                        play = fill_button(ui, label, egui::vec2(198.0, 42.0), 16.0, color, !launching && !g.pending);
                     }
+                    let has_folder = g.folder.as_ref().is_some_and(|f| f.is_dir());
+                    open_dir = ui.add_enabled(has_folder, egui::Button::new(RichText::new("🗁").size(20.0)).min_size(egui::vec2(46.0, 42.0))).on_hover_text("Ouvrir le dossier du jeu").on_disabled_hover_text("Dossier du jeu introuvable").clicked();
                     let star = RichText::new(if favorite { "★" } else { "☆" }).size(20.0).color(if favorite { GOLD } else { pal().text });
                     fav = ui.add(egui::Button::new(star).min_size(egui::vec2(46.0, 42.0))).on_hover_text("Favori").clicked();
                 });
-                ui.add_space(14.0);
-                info(ui, "Temps de jeu", &playtime(g.playtime));
-                info(ui, "Dernière partie", &last_played(g.last_played));
-                if let Some(s) = g.size { info(ui, "Taille", &size(s)); }
-                info(ui, "Emplacement", &g.disk);
-                ui.add_space(4.0);
-                ui.label(RichText::new("Compatibilité").size(13.5).color(pal().muted));
+                ui.add_space(10.0);
+                pill().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    info(ui, "Temps de jeu", &playtime(g.playtime));
+                    if g.recent > 0 { info(ui, "Ces 2 semaines", &playtime(g.recent)); }
+                    info(ui, "Dernière partie", &last_played(g.last_played));
+                    if g.last_launch > 0 {
+                        info(ui, "Dernier lancement", &full_date(g.last_launch));
+                        info(ui, "Durée de la partie", &session(g.last_session));
+                    } else if g.last_played > 0 {
+                        info(ui, "Dernière activité", &full_date(g.last_played));
+                    }
+                    if g.updated > 0 { info(ui, "Mis à jour le", &full_date(g.updated)); }
+                    if let Some(s) = g.size { info(ui, "Taille", &size(s)); }
+                    info(ui, "Emplacement", &g.disk);
+                });
+                ui.add_space(8.0);
                 let mut pick = chosen.clone();
-                let shown = pick.as_ref().map_or(default_label.to_string(), |k| self.tools.iter().find(|t| &t.0 == k).map_or(k.clone(), |t| t.1.clone()));
-                egui::ComboBox::from_id_salt(("compat", g.id)).selected_text(shown).width(298.0).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut pick, None, default_label);
-                    for (k, l) in &self.tools { ui.selectable_value(&mut pick, Some(k.clone()), l); }
-                    if let Some(k) = g.compat.as_ref().filter(|k| !self.tools.iter().any(|t| &t.0 == *k)) { ui.selectable_value(&mut pick, Some(k.clone()), k); }
+                pill().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.label(RichText::new("Compatibilité").size(13.5).color(pal().muted));
+                    let shown = pick.as_ref().map_or(default_label.to_string(), |k| self.tools.iter().find(|t| &t.0 == k).map_or(k.clone(), |t| t.1.clone()));
+                    egui::ComboBox::from_id_salt(("compat", g.id)).selected_text(shown).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut pick, None, default_label);
+                        for (k, l) in &self.tools { ui.selectable_value(&mut pick, Some(k.clone()), l); }
+                        if let Some(k) = g.compat.as_ref().filter(|k| !self.tools.iter().any(|t| &t.0 == *k)) { ui.selectable_value(&mut pick, Some(k.clone()), k); }
+                    });
                 });
                 if pick != chosen { compat_pick = Some(pick); }
                 if chosen != g.compat {
@@ -1246,10 +1293,16 @@ impl App {
                     ui.colored_label(GOLD, "Pas encore enregistré dans Steam.");
                     cancel_add = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler l'ajout")).clicked();
                 }
-                ui.add_space(14.0);
+                ui.add_space(10.0);
                 edit = ui.add(egui::Button::new("Modifier les images").min_size(egui::vec2(310.0, 36.0))).clicked();
             });
+            });
         });
+        if open_dir {
+            if let Some(f) = &g.folder {
+                match steam::open_folder(f) { Ok(()) => self.set_status("Dossier du jeu ouvert.", false), Err(e) => self.set_status(e, true) }
+            }
+        }
         if play { self.launch(g.id); }
         if stop { self.request_stop(g.id, &g.name); }
         if fav { self.toggle_favorite(g.id); }
@@ -1950,6 +2003,24 @@ fn last_played(ts: u64) -> String {
     }
 }
 
+fn session(secs: u32) -> String {
+    if secs < 60 { "Moins d'1 min".into() } else { playtime(secs / 60) }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct Tm { sec: i32, min: i32, hour: i32, mday: i32, mon: i32, year: i32, wday: i32, yday: i32, isdst: i32, gmtoff: std::ffi::c_long, zone: usize }
+
+extern "C" { fn tzset(); fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm; }
+
+/// Date et heure locales, par exemple « 21 nov. 2026 à 17:46 ».
+fn full_date(ts: u64) -> String {
+    const MONTHS: [&str; 12] = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
+    let (t, mut m) = (ts as i64, Tm::default());
+    if unsafe { tzset(); localtime_r(&t, &mut m) }.is_null() { return "Inconnue".into(); }
+    format!("{} {} {} à {:02}:{:02}", m.mday, MONTHS[m.mon.clamp(0, 11) as usize], m.year + 1900, m.hour, m.min)
+}
+
 fn size(b: u64) -> String {
     let g = b as f64 / 1_073_741_824.0;
     if g >= 1.0 { format!("{g:.1} Go").replace('.', ",") } else { format!("{} Mo", b / 1_048_576) }
@@ -1958,13 +2029,20 @@ fn size(b: u64) -> String {
 // ---------------------------------------------------------------- boucle
 
 impl eframe::App for App {
+    /// Opaque : la couleur par défaut d'eframe laisse voir le bureau sur les bords de la fenêtre.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let c = pal().bg;
+        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tex.poll(ctx);
         self.handle(ctx);
         if self.hook.demo { self.running.clear(); self.steam_on = true; }
         self.inputs(ctx);
         if !ctx.input(|i| i.pointer.any_down()) { self.shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| self.cfg.theme.blur_level(z)); }
-        self.paint_back(ctx, ctx.screen_rect());
+        // Un peu plus grand que la fenêtre : avec un écran mis à l'échelle, le bord tombe entre deux pixels.
+        self.paint_back(ctx, ctx.screen_rect().expand(2.0));
         self.paint_top(ctx);
         self.top_bar(ctx);
         if let Some((text, error, at)) = self.status.clone() {
@@ -2067,7 +2145,7 @@ fn main() -> eframe::Result {
         let (w, h) = i.dimensions();
         egui::IconData { rgba: i.into_raw(), width: w, height: h }
     });
-    let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id("minimalsteam").with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 560.0]);
+    let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id("minimalsteam").with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 560.0]).with_transparent(false);
     if let Some(i) = icon { viewport = viewport.with_icon(i); }
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, vsync: true, ..Default::default() };
     eframe::run_native("MinimalSteam", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

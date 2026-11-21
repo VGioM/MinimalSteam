@@ -174,6 +174,16 @@ pub struct Game {
     pub disk: String,
     pub last_played: u64,
     pub playtime: u32,
+    /// Minutes jouées ces deux dernières semaines.
+    pub recent: u32,
+    /// Début de la dernière partie, si Steam l'a noté pour cette partie-là.
+    pub last_launch: u64,
+    /// Durée de la dernière partie, en secondes (0 si inconnue).
+    pub last_session: u32,
+    /// Dernière mise à jour installée par Steam.
+    pub updated: u64,
+    /// Dossier du jeu sur le disque.
+    pub folder: Option<PathBuf>,
     pub compat: Option<String>,
     /// Pas encore écrit dans Steam (file d'attente).
     pub pending: bool,
@@ -202,7 +212,18 @@ fn disk_label(root: &Path, library: &Path) -> String {
     library.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| s.to_string())
 }
 
-fn stats(a: &Account) -> HashMap<u32, (u64, u32)> {
+#[derive(Clone, Copy, Debug, Default)]
+struct Stat { last: u64, time: u32, recent: u32, launch: u64, exit: u64 }
+
+impl Stat {
+    /// (début, durée) de la dernière partie. Steam ne tient pas ces dates à jour pour
+    /// tous les jeux : elles ne comptent que si leur fin correspond à la dernière partie.
+    fn session(&self, last: u64) -> (u64, u32) {
+        if self.launch > 0 && self.exit >= self.launch && self.exit.abs_diff(last) <= 120 { (self.launch, (self.exit - self.launch) as u32) } else { (0, 0) }
+    }
+}
+
+fn stats(a: &Account) -> HashMap<u32, Stat> {
     let mut out = HashMap::new();
     let Some(kv) = read_kv(&a.localconfig()) else { return out };
     let Some(apps) = kv.path(&["UserLocalConfigStore", "Software", "Valve", "Steam", "apps"]) else { return out };
@@ -210,7 +231,10 @@ fn stats(a: &Account) -> HashMap<u32, (u64, u32)> {
         let Ok(id) = k.parse::<i64>() else { continue };
         let last = v.str("LastPlayed").and_then(|s| s.parse().ok()).unwrap_or(0);
         let time = v.str("Playtime").and_then(|s| s.parse().ok()).unwrap_or(0);
-        out.insert(id as u32, (last, time));
+        let recent = v.str("Playtime2wks").and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Ces deux dates sont rangées dans un sous-bloc du jeu : on garde le plus récent.
+        let (launch, exit) = v.entries().iter().filter_map(|(_, b)| Some((b.str("lastlaunch")?.parse::<u64>().ok()?, b.str("lastexit")?.parse::<u64>().ok()?))).max_by_key(|d| d.1).unwrap_or((0, 0));
+        out.insert(id as u32, Stat { last, time, recent, launch, exit });
     }
     out
 }
@@ -271,10 +295,12 @@ pub fn load_games(a: &Account) -> Result<Vec<Game>, String> {
             if is_tool(id, name) { continue; }
             let flags: u32 = m.str("StateFlags").and_then(|s| s.parse().ok()).unwrap_or(0);
             if flags & 4 == 0 { continue; }
-            let (last, time) = st.get(&id).copied().unwrap_or((0, 0));
+            let s = st.get(&id).copied().unwrap_or_default();
+            let (last_launch, last_session) = s.session(s.last);
+            let folder = m.str("installdir").filter(|d| !d.is_empty()).map(|d| lib.join("steamapps/common").join(d));
             let cached = cache_files(&a.root, id);
             let art = Kind::ALL.map(|k| grid_art(a, id, k).or_else(|| pick_cache(&cached, k)));
-            games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: last, playtime: time, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
+            games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: s.last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: m.str("LastUpdated").and_then(|s| s.parse().ok()).unwrap_or(0), folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
         }
     }
     games.extend(read_shortcuts(a, &st, &compat)?);
@@ -291,7 +317,7 @@ fn shortcut_id(entry: &vdf::Value) -> Option<u32> {
     })
 }
 
-fn read_shortcuts(a: &Account, st: &HashMap<u32, (u64, u32)>, compat: &HashMap<u32, String>) -> Result<Vec<Game>, String> {
+fn read_shortcuts(a: &Account, st: &HashMap<u32, Stat>, compat: &HashMap<u32, String>) -> Result<Vec<Game>, String> {
     let data = match std::fs::read(a.shortcuts()) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -303,13 +329,17 @@ fn read_shortcuts(a: &Account, st: &HashMap<u32, (u64, u32)>, compat: &HashMap<u
     for (_, v) in list {
         let Some(id) = shortcut_id(v) else { continue };
         if v.int("IsHidden").unwrap_or(0) != 0 { continue; }
-        let (last, time) = st.get(&id).copied().unwrap_or((0, 0));
-        let last = last.max(v.int("LastPlayTime").unwrap_or(0).max(0) as u64);
+        let s = st.get(&id).copied().unwrap_or_default();
+        let last = s.last.max(v.int("LastPlayTime").unwrap_or(0).max(0) as u64);
+        let (last_launch, last_session) = s.session(last);
+        let exe = v.str("Exe").unwrap_or_default().trim_matches('"').to_string();
+        let start = v.str("StartDir").unwrap_or_default().trim_matches('"').to_string();
+        let folder = if start.is_empty() { Path::new(&exe).parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf) } else { Some(PathBuf::from(start)) };
         let icon = v.str("icon").unwrap_or_default();
         let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, id, k) });
         let p = PathBuf::from(&icon);
         if p.is_file() && matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(), Some("png" | "jpg" | "jpeg" | "ico" | "webp" | "bmp")) { art[Kind::Icon.index()] = Some(p); }
-        out.push(Game { id, name: v.str("AppName").unwrap_or_default(), steam: false, exe: v.str("Exe").unwrap_or_default().trim_matches('"').to_string(), icon, size: None, disk: "Non-Steam".into(), last_played: last, playtime: time, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
+        out.push(Game { id, name: v.str("AppName").unwrap_or_default(), steam: false, exe, icon, size: None, disk: "Non-Steam".into(), last_played: last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: 0, folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
     }
     Ok(out)
 }
@@ -693,6 +723,14 @@ pub fn launch(a: &Account, g: &Game) -> Result<(), String> {
     spawn_detached(c).map_err(|e| format!("Impossible de lancer le jeu : {e}"))
 }
 
+/// Ouvre le dossier du jeu dans l'explorateur de fichiers.
+pub fn open_folder(path: &Path) -> Result<(), String> {
+    if !path.is_dir() { return Err("Le dossier du jeu est introuvable.".into()); }
+    let mut c = host_command("xdg-open");
+    c.arg(path);
+    spawn_detached(c).map_err(|e| format!("Impossible d'ouvrir le dossier : {e}"))
+}
+
 fn shutdown(flatpak: bool) -> Result<(), String> {
     if !processes().0 { return Ok(()); }
     let mut c = steam_command(flatpak, false);
@@ -762,7 +800,7 @@ pub fn pending_game(a: &Account, n: &NewGame) -> Game {
     let id = new_id(&n.name, &n.exe);
     let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, id, k) });
     if !n.icon.is_empty() && Path::new(&n.icon).is_file() { art[Kind::Icon.index()] = Some(PathBuf::from(&n.icon)); }
-    Game { id, name: n.name.clone(), steam: false, exe: n.exe.clone(), icon: n.icon.clone(), size: None, disk: "Non-Steam".into(), last_played: 0, playtime: 0, compat: n.tool.clone(), pending: true, compat_queued: false, art }
+    Game { id, name: n.name.clone(), steam: false, exe: n.exe.clone(), icon: n.icon.clone(), size: None, disk: "Non-Steam".into(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: Path::new(&n.exe).parent().map(Path::to_path_buf), compat: n.tool.clone(), pending: true, compat_queued: false, art }
 }
 
 #[cfg(test)]
@@ -821,7 +859,7 @@ mod tests {
 
     #[test]
     fn game_ids() {
-        let mut g = Game { id: 730, name: "x".into(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: String::new(), last_played: 0, playtime: 0, compat: None, pending: false, compat_queued: false, art: Default::default() };
+        let mut g = Game { id: 730, name: "x".into(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: String::new(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: None, compat: None, pending: false, compat_queued: false, art: Default::default() };
         assert_eq!(g.game_id(), 730);
         g.steam = false;
         g.id = 3746397753;
