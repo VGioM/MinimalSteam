@@ -35,7 +35,7 @@ Vérifie les noms, choisis la version de Proton pour les jeux Windows, puis vali
 - **7 thèmes** : Nuit, Graphite, Océan, Forêt, Aubergine, Braise et Clair.
 - **Couleurs libres** pour l'accent, le fond, les panneaux, les cartes, le haut et le texte.
 - **Police d'écriture** au choix parmi celles installées sur ton PC.
-- **Fond du haut, de la bibliothèque et du panneau du jeu**, réglés séparément (le haut peut aussi être transparent) : une couleur, ton image, l'arrière-plan flouté du jeu sélectionné, celui d'un jeu choisi dans la liste, ou un fond haute définition de SteamGridDB, avec flou et assombrissement réglables. Le haut peut devenir un verre dépoli.
+- **Fond du haut, de la bibliothèque et du panneau du jeu**, réglés séparément (le haut peut aussi être transparent) : une couleur, ton image, l'arrière-plan flouté du jeu sélectionné, celui d'un jeu choisi dans la liste, ou un fond haute définition de SteamGridDB, avec flou et assombrissement réglables. Le haut peut devenir un verre dépoli qui floute les jaquettes passant dessous.
 - **Taille des jaquettes** réglable directement depuis la barre d'outils.
 - **Arrondi des jaquettes** et affichage ou non des noms.
 
