@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[allow(dead_code)]
 mod desktop;
+mod fonts;
 mod gamepad;
 mod scan;
 #[allow(dead_code)]
@@ -25,6 +26,8 @@ use steam::{Account, Game, Kind};
 
 /// Temps pendant lequel un jeu qui vient d'être lancé ne peut pas l'être une seconde fois.
 const LAUNCH_GUARD: Duration = Duration::from_secs(25);
+/// Hauteur des deux barres du haut.
+const TOP_H: f32 = 102.0;
 const APPLYING: &str = "Application des changements…";
 
 #[derive(Clone, Copy)]
@@ -54,7 +57,11 @@ enum Filter { All, Favorites, Steam, Other }
 struct Match { id: u64, name: String }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum Back { #[default] Color, Image, Game, Chosen }
+enum Back { #[default] Color, Image, Game, Chosen, Transparent }
+
+/// Les trois zones dont le fond se règle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Zone { Lib, Panel, Top }
 
 /// (nom, accent, fond, panneaux, cartes)
 const PRESETS: [(&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]); 7] = [
@@ -69,12 +76,12 @@ const PRESETS: [(&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]); 7] = [
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-struct Theme { preset: String, accent: [u8; 3], bg: [u8; 3], panel: [u8; 3], card: [u8; 3], background: Back, image: String, game: u32, dim: u8, panel_back: Back, panel_image: String, panel_game: u32, panel_dim: u8, radius: u8, show_names: bool }
+struct Theme { preset: String, accent: [u8; 3], bg: [u8; 3], panel: [u8; 3], card: [u8; 3], background: Back, image: String, game: u32, dim: u8, panel_back: Back, panel_image: String, panel_game: u32, panel_dim: u8, top_back: Back, top_image: String, top_game: u32, top_dim: u8, top_color: Option<[u8; 3]>, blur: Option<u8>, panel_blur: Option<u8>, top_blur: Option<u8>, text_color: Option<[u8; 3]>, muted_color: Option<[u8; 3]>, font: String, radius: u8, show_names: bool }
 
 impl Default for Theme {
     fn default() -> Self {
         let (n, accent, bg, panel, card) = PRESETS[0];
-        Theme { preset: n.into(), accent, bg, panel, card, background: Back::Color, image: String::new(), game: 0, dim: 70, panel_back: Back::Color, panel_image: String::new(), panel_game: 0, panel_dim: 80, radius: 10, show_names: true }
+        Theme { preset: n.into(), accent, bg, panel, card, background: Back::Color, image: String::new(), game: 0, dim: 70, panel_back: Back::Color, panel_image: String::new(), panel_game: 0, panel_dim: 80, top_back: Back::Color, top_image: String::new(), top_game: 0, top_dim: 70, top_color: None, blur: None, panel_blur: None, top_blur: None, text_color: None, muted_color: None, font: String::new(), radius: 10, show_names: true }
     }
 }
 
@@ -90,18 +97,44 @@ fn rgb(c: [u8; 3]) -> Color32 { Color32::from_rgb(c[0], c[1], c[2]) }
 impl Theme {
     fn light(&self) -> bool { lum(self.bg) > 0.55 }
     fn palette(&self) -> Pal {
-        let text = if self.light() { [0x16, 0x1A, 0x20] } else { [0xF1, 0xF3, 0xF6] };
+        let text = self.text_color.unwrap_or(if self.light() { [0x16, 0x1A, 0x20] } else { [0xF1, 0xF3, 0xF6] });
         let far = if self.light() { [0xFF; 3] } else { [0; 3] };
         let on = if lum(self.accent) > 0.5 { [0x0A, 0x14, 0x24] } else { [0xFF; 3] };
         Pal {
             bg: rgb(self.bg), panel: rgb(self.panel), card: rgb(self.card), hover: rgb(mix(self.card, text, 0.10)), line: rgb(mix(self.panel, text, 0.12)),
-            text: rgb(text), muted: rgb(mix(text, self.bg, 0.38)), accent: rgb(self.accent), on_accent: rgb(on), input: rgb(mix(self.bg, far, 0.3)),
+            text: rgb(text), muted: rgb(self.muted_color.unwrap_or(mix(text, self.bg, 0.38))), accent: rgb(self.accent), on_accent: rgb(on), input: rgb(mix(self.bg, far, 0.3)),
         }
     }
     fn use_preset(&mut self, name: &str) {
         if let Some((n, accent, bg, panel, card)) = PRESETS.iter().find(|p| p.0 == name) {
             self.preset = n.to_string();
             (self.accent, self.bg, self.panel, self.card) = (*accent, *bg, *panel, *card);
+            self.top_color = None;
+            self.text_color = None;
+            self.muted_color = None;
+        }
+    }
+    fn colors(&self) -> [[u8; 3]; 7] {
+        let p = self.palette();
+        let a = |c: Color32| [c.r(), c.g(), c.b()];
+        [self.accent, self.bg, self.panel, self.card, self.top_color.unwrap_or(self.panel), a(p.text), a(p.muted)]
+    }
+    fn set_color(&mut self, i: usize, v: [u8; 3]) {
+        match i { 0 => self.accent = v, 1 => self.bg = v, 2 => self.panel = v, 3 => self.card = v, 4 => self.top_color = Some(v), 5 => self.text_color = Some(v), _ => self.muted_color = Some(v) }
+    }
+    fn blur_mut(&mut self, z: Zone) -> &mut Option<u8> {
+        match z { Zone::Lib => &mut self.blur, Zone::Panel => &mut self.panel_blur, Zone::Top => &mut self.top_blur }
+    }
+    /// Niveau de flou (0 à 100). Sans choix, seul « Jeu sélectionné » est flouté.
+    fn blur_level(&self, z: Zone) -> u8 {
+        let (stored, back) = match z { Zone::Lib => (self.blur, self.background), Zone::Panel => (self.panel_blur, self.panel_back), Zone::Top => (self.top_blur, self.top_back) };
+        stored.unwrap_or(if back == Back::Game { 40 } else { 0 })
+    }
+    fn zone(&mut self, z: Zone) -> (&mut Back, &mut String, &mut u32, &mut u8) {
+        match z {
+            Zone::Lib => (&mut self.background, &mut self.image, &mut self.game, &mut self.dim),
+            Zone::Panel => (&mut self.panel_back, &mut self.panel_image, &mut self.panel_game, &mut self.panel_dim),
+            Zone::Top => (&mut self.top_back, &mut self.top_image, &mut self.top_game, &mut self.top_dim),
         }
     }
 }
@@ -215,9 +248,20 @@ impl Textures {
     }
 }
 
+/// Une taille au-delà de cette valeur demande un fond flouté : `BLUR_BASE + niveau`.
+const BLUR_BASE: u32 = 1_000_000;
+/// Les fonds sont recadrés pour remplir la zone : on garde toute leur définition.
+const FULL: u32 = 4096;
+
 fn decode(bytes: &[u8], max: u32) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
+    let (img, max) = if max > BLUR_BASE { (img.thumbnail(720, 720).blur((max - BLUR_BASE) as f32 * 0.3), 720) } else { (img, max) };
     let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
+    // Un fond plus petit que l'écran est agrandi ici, bien plus proprement que par la carte graphique.
+    let img = if max == FULL && img.height() < 1440 {
+        let f = (1440.0 / img.height() as f32).min(4096.0 / img.width() as f32);
+        if f > 1.05 { img.resize_exact((img.width() as f32 * f) as u32, (img.height() as f32 * f) as u32, image::imageops::FilterType::CatmullRom) } else { img }
+    } else { img };
     let rgba = img.to_rgba8();
     Some(egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw()))
 }
@@ -251,7 +295,10 @@ enum Msg {
     List { game: u64, kind: Kind, page: u32, result: Result<Vec<Img>, String> },
     Applied { id: u32, kind: Kind, result: Result<PathBuf, String> },
     Found(Vec<scan::Found>),
-    BackImage(PathBuf, bool),
+    Fonts(Vec<String>),
+    FontReady(String, Option<Vec<u8>>),
+    BackImage(PathBuf, Zone),
+    BackSaved(Zone, Result<PathBuf, String>),
     Progress(String),
     Queued(Vec<steam::NewGame>),
     QueueDone { applied: steam::Queue, result: Result<(), String> },
@@ -275,6 +322,8 @@ struct Editor {
     more: bool,
     applying: Option<u64>,
     error: Option<String>,
+    /// Choix d'un fond de l'app : rien n'est écrit dans Steam.
+    back_for: Option<Zone>,
 }
 
 enum Act { Select(u32), Launch(u32) }
@@ -311,7 +360,14 @@ struct App {
     dirty: bool,
     tools: Vec<(String, String)>,
     compat_edit: Option<(u32, Option<String>)>,
-    game_filter: [String; 2],
+    game_filter: [String; 3],
+    settings_zone: Zone,
+    fonts: Option<Vec<String>>,
+    font_filter: String,
+    font_applied: String,
+    /// Flou réellement affiché : suit le curseur une fois relâché.
+    shown_blur: [u8; 3],
+    last_back: [Option<egui::TextureHandle>; 3],
     countdown: Option<Instant>,
     hold: bool,
     update: SelfUpdate,
@@ -338,10 +394,14 @@ impl App {
                 cfg.pending_games.insert(a.id.clone(), vec![steam::NewGame { name: "Hollow Knight".into(), exe: "/Jeux/Hollow Knight/hollow_knight.exe".into(), options: String::new(), tool: Some("proton_experimental".into()), icon: String::new() }]);
             }
         }
+        if hook.font { if let Some(n) = fonts::list().into_iter().find(|n| fonts::load(n).is_some()) { cfg.theme.font = n; } }
+        if let Some(b) = hook.blur { cfg.theme.blur = Some(b); cfg.theme.panel_blur = Some(b); }
+        if let Some(b) = hook.top_blur { cfg.theme.top_blur = Some(b); }
+        let shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| cfg.theme.blur_level(z));
         let app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: 0, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), settings_zone: hook.zone, fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.reload(&cc.egui_ctx);
         app
@@ -388,6 +448,8 @@ impl App {
     }
 
     fn launch(&mut self, id: u32) {
+        // Les tests à l'écran virtuel ne lancent jamais de jeu.
+        if std::env::var_os("APP_SCREENSHOT").is_some() { return; }
         if self.running.contains(&id) { self.set_status("Ce jeu est déjà lancé.", false); return; }
         if self.launched.contains_key(&id) { self.set_status("Ce jeu est en cours de lancement.", false); return; }
         let (Some(a), Some(g)) = (self.acc().cloned(), self.game(id).cloned()) else { return };
@@ -412,6 +474,8 @@ impl App {
                     self.merge_queue();
                     let find = |games: &[Game], n: &str| games.iter().find(|g| g.name.to_lowercase().contains(n)).map(|g| g.id);
                     if let Some(id) = self.hook.panel.take().and_then(|n| find(&self.games, &n)) { self.cfg.theme.panel_game = id; self.cfg.theme.panel_back = Back::Chosen; }
+                    if self.hook.top_clear { self.cfg.theme.top_back = Back::Transparent; }
+                    if let Some(id) = self.hook.top.take().and_then(|n| find(&self.games, &n)) { self.cfg.theme.top_game = id; self.cfg.theme.top_back = Back::Chosen; }
                     if let Some(id) = self.hook.lib.take().and_then(|n| find(&self.games, &n)) { self.cfg.theme.game = id; self.cfg.theme.background = Back::Chosen; }
                     self.tools = self.acc().map(steam::compat_tools).unwrap_or_default();
                     self.loaded = true;
@@ -441,7 +505,12 @@ impl App {
                     if let Some(ed) = self.editor.as_mut().filter(|e| e.game == Some(game) && e.kind == kind && e.page == page) {
                         ed.loading = false;
                         match result {
-                            Ok(l) => { ed.more = l.len() >= 20; ed.items.extend(l); ed.page += 1; }
+                            Ok(l) => {
+                                ed.more = l.len() >= 20;
+                                ed.items.extend(l);
+                                ed.page += 1;
+                                if ed.back_for.is_some() { ed.items.sort_by_key(|i| std::cmp::Reverse(i.width as u64 * i.height as u64)); }
+                            }
                             Err(e) => ed.error = Some(e),
                         }
                     }
@@ -461,8 +530,47 @@ impl App {
                 Msg::BackImage(p, panel) => {
                     let path = p.to_string_lossy().to_string();
                     let t = &mut self.cfg.theme;
-                    if panel { t.panel_image = path; t.panel_back = Back::Image; } else { t.image = path; t.background = Back::Image; }
+                    let (b, i, _, _) = t.zone(panel);
+                            *i = path;
+                            *b = Back::Image;
                     self.dirty = true;
+                }
+                Msg::BackSaved(panel, result) => {
+                    if let Some(ed) = self.editor.as_mut() { ed.applying = None; }
+                    match result {
+                        Ok(p) => {
+                            let path = p.to_string_lossy().to_string();
+                            let t = &mut self.cfg.theme;
+                            let (b, i, _, _) = t.zone(panel);
+                            *i = path;
+                            *b = Back::Image;
+                            self.cfg.save();
+                            self.editor = None;
+                            self.settings = true;
+                            self.set_status("Fond enregistré.", false);
+                        }
+                        Err(e) => self.set_status(e, true),
+                    }
+                }
+                Msg::Fonts(list) => self.fonts = Some(list),
+                Msg::FontReady(name, bytes) => {
+                    if name == self.cfg.theme.font {
+                        match bytes {
+                            Some(b) => {
+                                let mut f = egui::FontDefinitions::default();
+                                f.font_data.insert("choisie".into(), Arc::new(egui::FontData::from_owned(b)));
+                                if let Some(l) = f.families.get_mut(&egui::FontFamily::Proportional) { l.insert(0, "choisie".into()); }
+                                ctx.set_fonts(f);
+                            }
+                            None => {
+                                self.cfg.theme.font.clear();
+                                self.font_applied.clear();
+                                self.dirty = true;
+                                ctx.set_fonts(egui::FontDefinitions::default());
+                                self.set_status(format!("La police {name} ne peut pas être utilisée."), true);
+                            }
+                        }
+                    }
                 }
                 Msg::Progress(t) => self.busy = Some(t),
                 Msg::Queued(games) => {
@@ -593,6 +701,15 @@ impl App {
     }
 
     /// Applique la file quand plus aucun jeu ne tourne, après un court délai.
+    /// Charge la police du thème quand elle change.
+    fn sync_font(&mut self, ctx: &egui::Context) {
+        if self.cfg.theme.font == self.font_applied { return; }
+        self.font_applied = self.cfg.theme.font.clone();
+        if self.font_applied.is_empty() { ctx.set_fonts(egui::FontDefinitions::default()); return; }
+        let name = self.font_applied.clone();
+        self.spawn(ctx, move || { let b = fonts::load(&name); Msg::FontReady(name, b) });
+    }
+
     fn tick_queue(&mut self, ctx: &egui::Context) {
         self.launched.retain(|_, t| t.elapsed() < LAUNCH_GUARD);
         if !self.launched.is_empty() { ctx.request_repaint_after(Duration::from_secs(1)); }
@@ -625,7 +742,7 @@ impl App {
                 if self.busy.is_none() && !self.game_active() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.countdown.is_some() { later = ui.button("Plus tard").clicked(); }
-                        now = ui.add(egui::Button::new(RichText::new(if self.countdown.is_some() { "Maintenant" } else { "Appliquer" }).color(pal().on_accent)).fill(pal().accent)).clicked();
+                        now = fill_button(ui, if self.countdown.is_some() { "Maintenant" } else { "Appliquer" }, egui::vec2(0.0, 30.0), 13.5, pal().accent, true);
                     });
                 }
             });
@@ -638,7 +755,7 @@ impl App {
         let Some(g) = self.game(id) else { return };
         let term = sgdb::search_term(&g.name);
         let saved = self.acc().and_then(|a| self.cfg.matches.get(&gkey(&a.id, id))).cloned();
-        self.editor = Some(Editor { id, kind: Kind::Cover, term: term.clone(), results: vec![], game: None, game_name: String::new(), searching: false, items: vec![], loading: false, page: 0, more: false, applying: None, error: None });
+        self.editor = Some(Editor { id, kind: Kind::Cover, term: term.clone(), results: vec![], game: None, game_name: String::new(), searching: false, items: vec![], loading: false, page: 0, more: false, applying: None, error: None, back_for: None });
         if self.cfg.api_key.trim().is_empty() {
             if let Some(ed) = self.editor.as_mut() { ed.error = Some("Ajoute ta clé SteamGridDB dans les réglages.".into()); }
             return;
@@ -648,6 +765,16 @@ impl App {
             self.load_images(ctx);
         }
         self.search_editor(ctx);
+    }
+
+    /// Choisir un fond sur SteamGridDB, en partant du jeu déjà choisi ou sélectionné.
+    fn open_back_picker(&mut self, ctx: &egui::Context, panel: Zone) {
+        let wanted = *self.cfg.theme.zone(panel).2;
+        let Some(id) = self.game(wanted).map(|g| g.id).or(self.selected).or(self.games.first().map(|g| g.id)) else { return };
+        self.settings = false;
+        self.open_editor(ctx, id);
+        if let Some(ed) = self.editor.as_mut() { ed.kind = Kind::Hero; ed.back_for = Some(panel); }
+        self.load_images(ctx);
     }
 
     fn search_editor(&mut self, ctx: &egui::Context) {
@@ -664,9 +791,11 @@ impl App {
         let Some(ed) = self.editor.as_mut() else { return };
         ed.game = Some(g.id);
         ed.game_name = g.name.clone();
-        let key = gkey(&account, ed.id);
-        self.cfg.matches.insert(key, Match { id: g.id, name: g.name });
-        self.cfg.save();
+        if ed.back_for.is_none() {
+            let key = gkey(&account, ed.id);
+            self.cfg.matches.insert(key, Match { id: g.id, name: g.name });
+            self.cfg.save();
+        }
         self.load_images(ctx);
     }
 
@@ -742,70 +871,137 @@ impl App {
 
     fn hook_open(&mut self, ctx: &egui::Context) {
         if self.hook.editor { if let Some(id) = self.selected { self.open_editor(ctx, id); } }
+        if self.hook.picker { self.open_back_picker(ctx, Zone::Lib); }
     }
 
     // ------------------------------------------------------------ interface
 
     fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").exact_height(58.0).frame(egui::Frame::new().fill(pal().panel).inner_margin(Margin::symmetric(20, 0))).show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.label(RichText::new("MinimalSteam").size(18.0).strong());
-                ui.add_space(14.0);
-                let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(280.0).margin(Margin::symmetric(10, 6)));
-                if self.focus_search { r.request_focus(); self.focus_search = false; }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Button::new(RichText::new("⚙").size(17.0)).min_size(egui::vec2(36.0, 32.0))).on_hover_text("Réglages").clicked() { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
-                    if ui.add(egui::Button::new(RichText::new("+ Ajouter des jeux").color(pal().on_accent).strong()).fill(pal().accent).min_size(egui::vec2(0.0, 32.0))).clicked() { self.open_add(); }
-                });
+        if self.cfg.theme.top_back != Back::Transparent {
+            egui::TopBottomPanel::top("top").exact_height(58.0).frame(egui::Frame::new().inner_margin(Margin::symmetric(20, 0))).show_separator_line(false).show(ctx, |ui| {
+                ui.horizontal_centered(|ui| self.top_row(ui, false));
             });
+            egui::TopBottomPanel::top("tools").exact_height(44.0).frame(egui::Frame::new().inner_margin(Margin::symmetric(20, 0))).show(ctx, |ui| {
+                ui.horizontal_centered(|ui| self.tools_row(ui, false));
+            });
+            return;
+        }
+        // Transparent : la barre flotte au-dessus des jaquettes et prend tous les clics.
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("topbar")).order(egui::Order::Middle).fixed_pos(screen.min).constrain(false).show(ctx, |ui| {
+            let area = egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), TOP_H));
+            ui.interact(area, ui.id().with("block"), Sense::click_and_drag());
+            ui.expand_to_include_rect(area);
+            let row = |y: f32, h: f32| egui::Rect::from_min_size(egui::pos2(area.left() + 20.0, area.top() + y), egui::vec2(area.width() - 40.0, h));
+            let layout = egui::Layout::left_to_right(egui::Align::Center);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(row(0.0, 58.0)).layout(layout), |ui| self.top_row(ui, true));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(row(58.0, 44.0)).layout(layout), |ui| self.tools_row(ui, true));
         });
-        egui::TopBottomPanel::top("tools").exact_height(44.0).frame(egui::Frame::new().fill(pal().panel).inner_margin(Margin::symmetric(20, 0))).show_separator_line(false).show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam")] {
-                    if chip(ui, label, self.filter == f) { self.filter = f; }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let before = self.cfg.sort;
-                    egui::ComboBox::from_id_salt("sort").selected_text(self.cfg.sort.label()).width(130.0).show_ui(ui, |ui| {
-                        for s in [Sort::Recent, Sort::Name, Sort::Playtime] { ui.selectable_value(&mut self.cfg.sort, s, s.label()); }
-                    });
-                    if before != self.cfg.sort { self.cfg.save(); }
-                    ui.add_space(10.0);
-                    let mut size = self.cfg.cover() as u16;
-                    ui.spacing_mut().slider_width = 130.0;
-                    if ui.add(egui::Slider::new(&mut size, 110..=340).show_value(false)).on_hover_text("Taille des jaquettes").changed() { self.cfg.cover_size = size; self.dirty = true; }
-                    ui.label(RichText::new("Taille").size(13.0).color(pal().muted));
+    }
+
+    fn top_row(&mut self, ui: &mut egui::Ui, clear: bool) {
+        let title = RichText::new("MinimalSteam").size(18.0).strong();
+        if clear { pill(clear).inner_margin(Margin::symmetric(14, 6)).show(ui, |ui| ui.label(title)); } else { ui.label(title); }
+        ui.add_space(14.0);
+        let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(280.0).margin(Margin::symmetric(10, 6)));
+        if self.focus_search { r.request_focus(); self.focus_search = false; }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.add(egui::Button::new(RichText::new("⚙").size(17.0)).min_size(egui::vec2(36.0, 32.0))).on_hover_text("Réglages").clicked() { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
+            if fill_button(ui, "+ Ajouter des jeux", egui::vec2(0.0, 32.0), 14.5, pal().accent, true) { self.open_add(); }
+        });
+    }
+
+    fn tools_row(&mut self, ui: &mut egui::Ui, clear: bool) {
+        pill(clear).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam")] {
+                if chip(ui, label, self.filter == f) { self.filter = f; }
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            pill(clear).inner_margin(Margin::symmetric(10, 2)).show(ui, |ui| {
+                let before = self.cfg.sort;
+                egui::ComboBox::from_id_salt("sort").selected_text(self.cfg.sort.label()).width(130.0).show_ui(ui, |ui| {
+                    for s in [Sort::Recent, Sort::Name, Sort::Playtime] { ui.selectable_value(&mut self.cfg.sort, s, s.label()); }
                 });
+                if before != self.cfg.sort { self.cfg.save(); }
+                ui.add_space(10.0);
+                let mut size = self.cfg.cover() as u16;
+                ui.spacing_mut().slider_width = 130.0;
+                if ui.add(egui::Slider::new(&mut size, 110..=340).show_value(false)).on_hover_text("Taille des jaquettes").changed() { self.cfg.cover_size = size; self.dirty = true; }
+                ui.label(RichText::new("Taille").size(13.0).color(pal().muted));
             });
         });
     }
 
-    /// L'image d'un fond. Le jeu sélectionné est flouté, un jeu choisi reste net.
-    fn back_texture(&mut self, back: Back, image: &str, chosen: u32, max: u32) -> Option<egui::TextureHandle> {
+    /// L'image d'un fond. Pendant le chargement d'une nouvelle version, l'ancienne reste affichée.
+    fn source_tex(&mut self, z: Zone, back: Back, image: &str, chosen: u32, blur: u8) -> Option<egui::TextureHandle> {
         let art = |g: &Game| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
-        let (path, size) = match back {
-            Back::Color => return None,
-            Back::Image => ((!image.is_empty()).then(|| PathBuf::from(image))?, max),
-            Back::Game => (self.selected.and_then(|id| self.game(id)).and_then(art)?, 72),
-            Back::Chosen => (self.game(chosen).and_then(art)?, max),
+        let path = match back {
+            Back::Color | Back::Transparent => None,
+            Back::Image => (!image.is_empty()).then(|| PathBuf::from(image)),
+            Back::Game => self.selected.and_then(|id| self.game(id)).and_then(art),
+            Back::Chosen => self.game(chosen).and_then(art),
         };
-        self.tex.file(&path, size).cloned()
+        let Some(path) = path else { self.last_back[z as usize] = None; return None };
+        let max = if blur == 0 { FULL } else { BLUR_BASE + blur as u32 };
+        let Some(tex) = self.tex.file(&path, max).cloned() else { return self.last_back[z as usize].clone() };
+        if let Some(old) = self.last_back[z as usize].take() {
+            let used = self.last_back.iter().flatten().any(|o| o.name() == old.name());
+            if old.name() != tex.name() && !used { self.tex.slots.remove(&old.name()); }
+        }
+        self.last_back[z as usize] = Some(tex.clone());
+        Some(tex)
+    }
+
+    fn zone_tex(&mut self, z: Zone) -> Option<egui::TextureHandle> {
+        let mut t = self.cfg.theme.clone();
+        let (back, image, game, _) = t.zone(z);
+        let (back, game) = (*back, *game);
+        self.source_tex(z, back, image, game, self.shown_blur[z as usize])
+    }
+
+    fn paint_top(&mut self, ctx: &egui::Context) {
+        let t = self.cfg.theme.clone();
+        let screen = ctx.screen_rect();
+        let area = egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), 102.0));
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        if t.top_back == Back::Transparent {
+            // Verre dépoli : la même image que la bibliothèque, floutée, à la même place.
+            let level = self.shown_blur[Zone::Top as usize];
+            if level == 0 { self.last_back[Zone::Top as usize] = None; return; }
+            let blur = level.max(self.shown_blur[Zone::Lib as usize]);
+            let Some(tex) = self.source_tex(Zone::Top, t.background, &t.image, t.game, blur) else { return };
+            let uv = cover_uv(tex.size(), screen);
+            let strip = egui::Rect::from_min_max(uv.min, egui::pos2(uv.max.x, uv.min.y + uv.height() * area.height() / screen.height()));
+            painter.image(tex.id(), area, strip, Color32::WHITE);
+            painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(t.bg[0], t.bg[1], t.bg[2], (t.dim as f32 * 2.55).round() as u8));
+            return;
+        }
+        let color = t.top_color.unwrap_or(t.panel);
+        match self.zone_tex(Zone::Top) {
+            Some(tex) => fill_back(&painter, area, &tex, t.top_dim, color),
+            None => { painter.rect_filled(area, 0.0, rgb(color)); }
+        }
     }
 
     fn paint_back(&mut self, ctx: &egui::Context, area: egui::Rect) {
         let painter = ctx.layer_painter(egui::LayerId::background());
         painter.rect_filled(area, 0.0, pal().bg);
         let t = self.cfg.theme.clone();
-        if let Some(tex) = self.back_texture(t.background, &t.image, t.game, 1920) { fill_back(&painter, area, &tex, t.dim, t.bg); }
+        if let Some(tex) = self.zone_tex(Zone::Lib) { fill_back(&painter, area, &tex, t.dim, t.bg); }
     }
 
     fn grid(&mut self, ctx: &egui::Context) {
         let visible = self.visible();
         let mut acts = Vec::new();
-        self.paint_back(ctx, ctx.available_rect());
         let (cover, rad, names) = (self.cfg.cover(), self.cfg.theme.radius, self.cfg.theme.show_names);
+        let clear = self.cfg.theme.top_back == Back::Transparent;
+        let offset = if clear { TOP_H + 18.0 } else { 0.0 };
+        let over_bar = clear && ctx.pointer_latest_pos().is_some_and(|p| p.y < TOP_H);
         let quality = if cover > 240.0 { 720 } else { 420 };
-        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin { left: 22, right: 10, top: 18, bottom: 0 })).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin { left: 22, right: 10, top: if clear { 0 } else { 18 }, bottom: 0 })).show(ctx, |ui| {
+            if clear && (!self.loaded || self.error.is_some() || visible.is_empty()) { ui.add_space(offset); }
             if !self.loaded { ui.centered_and_justified(|ui| ui.label(RichText::new("Chargement…").color(pal().muted))); return; }
             if let Some(e) = &self.error { ui.colored_label(BAD, e); }
             if visible.is_empty() {
@@ -823,6 +1019,7 @@ impl App {
                 let h = w * 1.5;
                 let row = h + if names { 34.0 } else { 0.0 } + gap;
                 let rows = visible.len().div_ceil(cols);
+                ui.add_space(offset);
                 let (full, _) = ui.allocate_exact_size(egui::vec2(avail, rows as f32 * row + 8.0), Sense::hover());
                 let rect_of = |n: usize| {
                     let (r, c) = (n / cols, n % cols);
@@ -830,33 +1027,42 @@ impl App {
                 };
                 if scroll_to {
                     if let Some(n) = self.selected.and_then(|s| visible.iter().position(|i| self.games[*i].id == s)) {
-                        ui.scroll_to_rect(rect_of(n).expand2(egui::vec2(0.0, 12.0)), None);
+                        let mut target = rect_of(n).expand2(egui::vec2(0.0, 12.0));
+                        target.min.y -= offset;
+                        ui.scroll_to_rect(target, None);
                     }
                 }
-                let first = ((vp.min.y / row).floor().max(0.0) as usize) * cols;
-                let last = (((vp.max.y / row).ceil() as usize + 1) * cols).min(visible.len());
+                let first = (((vp.min.y - offset) / row).floor().max(0.0) as usize) * cols;
+                let last = ((((vp.max.y - offset).max(0.0) / row).ceil() as usize + 1) * cols).min(visible.len());
                 for n in first..last {
                     let g = &self.games[visible[n]];
                     let rect = rect_of(n);
                     let hit = if names { rect.union(egui::Rect::from_min_size(rect.left_bottom(), egui::vec2(w, 30.0))) } else { rect };
                     let resp = ui.interact(hit, ui.id().with(("card", g.id)), Sense::click());
-                    let hovered = resp.contains_pointer();
+                    let hovered = resp.contains_pointer() && !over_bar;
+                    let lift = ui.ctx().animate_bool_with_time(resp.id.with("lift"), hovered, 0.12);
+                    let shown = rect.expand(lift * 3.0);
+                    if hovered { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
                     let selected = self.selected == Some(g.id);
                     let running = self.running.contains(&g.id);
                     let blocked = running || g.pending || self.launched.contains_key(&g.id);
                     let p = ui.painter();
-                    p.rect_filled(rect, rad, pal().card);
+                    if lift > 0.0 {
+                        let shadow = egui::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha((130.0 * lift) as u8) };
+                        p.add(shadow.as_shape(shown, rad));
+                    }
+                    p.rect_filled(shown, rad, pal().card);
                     let tex = g.art(Kind::Cover).and_then(|f| self.tex.file(f, quality));
                     match tex {
-                        Some(t) => paint_tex(ui, rect, t, true, rad),
+                        Some(t) => paint_tex(ui, shown, t, true, rad),
                         None => {
                             let inner = rect.shrink(12.0);
                             let galley = p.layout(g.name.clone(), egui::FontId::proportional(15.0), pal().muted, inner.width());
                             p.galley(egui::pos2(inner.left(), rect.center().y - galley.size().y / 2.0), galley, pal().muted);
                         }
                     }
-                    if selected { p.rect_stroke(rect, rad, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside); }
-                    else if hovered { p.rect_stroke(rect, rad, Stroke::new(1.5_f32, Color32::from_gray(150)), egui::StrokeKind::Outside); }
+                    if selected { p.rect_stroke(shown, rad, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside); }
+                    else if hovered { p.rect_stroke(shown, rad, Stroke::new(1.5_f32, Color32::from_gray(170)), egui::StrokeKind::Outside); }
                     let center = rect.right_bottom() - egui::vec2(30.0, 30.0);
                     if hovered && !blocked { play_icon(p, center, 21.0); }
                     if running {
@@ -877,7 +1083,8 @@ impl App {
                         let title = egui::WidgetText::from(RichText::new(&g.name).size(13.5).color(if selected { pal().text } else { pal().muted })).into_galley(ui, Some(egui::TextWrapMode::Truncate), w, egui::TextStyle::Body);
                         ui.painter().galley(rect.left_bottom() + egui::vec2(1.0, 8.0), title, pal().text);
                     }
-                    if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
+                    if over_bar {}
+                    else if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
                     else if resp.clicked() {
                         let on_play = hovered && !blocked && resp.interact_pointer_pos().is_some_and(|q| q.distance(center) <= 22.0);
                         acts.push(if on_play { Act::Launch(g.id) } else { Act::Select(g.id) });
@@ -901,10 +1108,14 @@ impl App {
         let launching = self.launched.contains_key(&g.id);
         let (busy, game_running, steam_on) = (self.busy.clone(), self.game_active(), self.steam_on);
         let t = self.cfg.theme.clone();
-        let panel_tex = self.back_texture(t.panel_back, &t.panel_image, t.panel_game, 1200);
+        let panel_tex = self.zone_tex(Zone::Panel);
         let fade = if panel_tex.is_some() { Color32::from_rgba_unmultiplied(t.panel[0], t.panel[1], t.panel[2], (t.panel_dim as f32 * 2.55).round() as u8) } else { pal().panel };
-        egui::SidePanel::right("detail").exact_width(350.0).resizable(false).frame(egui::Frame::new().fill(pal().panel)).show(ctx, |ui| {
-            if let Some(tex) = &panel_tex { fill_back(ui.painter(), ui.max_rect(), tex, t.panel_dim, t.panel); }
+        let clear = t.top_back == Back::Transparent;
+        egui::SidePanel::right("detail").exact_width(350.0).resizable(false).show_separator_line(!clear).frame(egui::Frame::new()).show(ctx, |ui| {
+            let mut body = ui.max_rect();
+            if clear { body.min.y += TOP_H; ui.add_space(TOP_H); }
+            ui.painter().rect_filled(body, 0.0, pal().panel);
+            if let Some(tex) = &panel_tex { fill_back(ui.painter(), body, tex, t.panel_dim, t.panel); }
             let (hero, _) = ui.allocate_exact_size(egui::vec2(350.0, 196.0), Sense::hover());
             ui.painter().rect_filled(hero, 0.0, pal().card);
             let src = g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
@@ -935,8 +1146,7 @@ impl App {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     let (label, color) = if running { ("En cours", OK) } else if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else { ("▶  Jouer", pal().accent) };
-                    let b = egui::Button::new(RichText::new(label).size(16.0).strong().color(pal().on_accent)).fill(color).min_size(egui::vec2(252.0, 42.0));
-                    play = ui.add_enabled(!running && !launching && !g.pending, b).clicked();
+                    play = fill_button(ui, label, egui::vec2(252.0, 42.0), 16.0, color, !running && !launching && !g.pending);
                     let star = RichText::new(if favorite { "★" } else { "☆" }).size(20.0).color(if favorite { GOLD } else { pal().text });
                     fav = ui.add(egui::Button::new(star).min_size(egui::vec2(46.0, 42.0))).on_hover_text("Favori").clicked();
                 });
@@ -960,7 +1170,7 @@ impl App {
                     ui.horizontal(|ui| {
                         let can = busy.is_none();
                         let label = if g.pending { "Enregistrer" } else if game_running { "Appliquer à la fermeture du jeu" } else if steam_on { "Appliquer (redémarre Steam)" } else { "Appliquer" };
-                        compat_apply = ui.add_enabled(can, egui::Button::new(RichText::new(label).color(if can { pal().on_accent } else { pal().muted })).fill(if can { pal().accent } else { pal().card })).clicked();
+                        compat_apply = fill_button(ui, label, egui::vec2(0.0, 30.0), 13.5, if can { pal().accent } else { pal().card }, can);
                         compat_cancel = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler")).clicked();
                     });
                 } else if g.compat_queued {
@@ -1049,7 +1259,7 @@ impl App {
             ui.horizontal(|ui| {
                 let ready = busy.is_none() && !needs_tool && count > 0;
                 let label = busy.clone().unwrap_or_else(|| match count { 0 => "Ajouter".to_string(), 1 => "Ajouter 1 jeu".to_string(), n => format!("Ajouter {n} jeux") });
-                submit = ui.add_enabled(ready, egui::Button::new(RichText::new(label).color(if ready { pal().on_accent } else { pal().muted }).strong()).fill(if ready { pal().accent } else { pal().card }).min_size(egui::vec2(170.0, 34.0))).clicked();
+                submit = fill_button(ui, &label, egui::vec2(170.0, 34.0), 14.5, if ready { pal().accent } else { pal().card }, ready);
                 cancel = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler").min_size(egui::vec2(0.0, 34.0))).clicked();
             });
         });
@@ -1102,9 +1312,10 @@ impl App {
         let Some(id) = self.editor.as_ref().map(|e| e.id) else { return };
         let Some(g) = self.game(id).cloned() else { self.editor = None; return };
         let Some(a) = self.acc().cloned() else { return };
-        let kinds: Vec<Kind> = Kind::ALL.into_iter().filter(|k| !g.steam || *k != Kind::Icon).collect();
-        let pending = self.pending().iter().any(|(i, _)| *i == id);
-        let custom = self.editor.as_ref().is_some_and(|e| steam::has_custom_art(&a, id, e.kind));
+        let back_for = self.editor.as_ref().and_then(|e| e.back_for);
+        let kinds: Vec<Kind> = if back_for.is_some() { vec![] } else { Kind::ALL.into_iter().filter(|k| !g.steam || *k != Kind::Icon).collect() };
+        let pending = back_for.is_none() && self.pending().iter().any(|(i, _)| *i == id);
+        let custom = back_for.is_none() && self.editor.as_ref().is_some_and(|e| steam::has_custom_art(&a, id, e.kind));
         let (mut new_kind, mut search, mut pick, mut apply, mut more, mut remove, mut close, mut restart) = (None, false, None, None, false, false, false, false);
         let (busy, game_running) = (self.busy.clone(), !self.running.is_empty());
         let screen = ctx.screen_rect();
@@ -1112,7 +1323,7 @@ impl App {
             ui.set_width((screen.width() - 120.0).clamp(640.0, 1000.0));
             let Some(ed) = self.editor.as_mut() else { return };
             ui.horizontal(|ui| {
-                ui.heading(&g.name);
+                ui.heading(match back_for { Some(Zone::Top) => "Fond du haut", Some(Zone::Panel) => "Fond du panneau du jeu", Some(Zone::Lib) => "Fond de la bibliothèque", None => g.name.as_str() });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { close = ui.button("Fermer").clicked(); });
             });
             ui.add_space(4.0);
@@ -1150,6 +1361,12 @@ impl App {
                             ui.painter().rect_filled(r, 8.0, pal().card);
                             if let Some(t) = self.tex.url(&img.thumb) { paint_tex(ui, r, t, portrait, 8); }
                             if resp.contains_pointer() { ui.painter().rect_stroke(r, 8.0, Stroke::new(2.0_f32, pal().accent), egui::StrokeKind::Outside); }
+                            if back_for.is_some() && img.width > 0 {
+                                let text = format!("{}×{}", img.width, img.height);
+                                let b = egui::Rect::from_min_size(r.left_bottom() + egui::vec2(6.0, -26.0), egui::vec2(82.0, 20.0));
+                                ui.painter().rect_filled(b, 6.0, Color32::from_black_alpha(190));
+                                ui.painter().text(b.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(11.5), Color32::WHITE);
+                            }
                             if ed.applying == Some(img.id) { ui.painter().rect_filled(r, 8.0, Color32::from_black_alpha(150)); ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "…", egui::FontId::proportional(24.0), pal().text); }
                         }
                         if resp.clicked() && ed.applying.is_none() { apply = Some(img.clone()); }
@@ -1178,7 +1395,12 @@ impl App {
             if let Some(ed) = self.editor.as_mut() {
                 ed.applying = Some(img.id);
                 let (kind, url, acc) = (ed.kind, img.url.clone(), a.clone());
-                self.spawn(ctx, move || Msg::Applied { id, kind, result: sgdb::download(&url).and_then(|b| steam::save_art(&acc, id, kind, &b)) });
+                if let Some(panel) = back_for {
+                    let image_id = img.id;
+                    self.spawn(ctx, move || Msg::BackSaved(panel, sgdb::download(&url).and_then(|b| save_background(panel, image_id, &b))));
+                } else {
+                    self.spawn(ctx, move || Msg::Applied { id, kind, result: sgdb::download(&url).and_then(|b| steam::save_art(&acc, id, kind, &b)) });
+                }
             }
         }
         if remove {
@@ -1189,91 +1411,153 @@ impl App {
             }
         }
         if restart { self.apply_queue(ctx); }
-        if close || modal.should_close() { self.editor = None; }
+        if close || modal.should_close() { self.editor = None; if back_for.is_some() { self.settings = true; } }
     }
 
     fn settings_modal(&mut self, ctx: &egui::Context) {
         if !self.settings { return; }
         let mut account = None;
-        let (mut save, mut pick_image, mut changed) = (false, None, false);
+        let (mut save, mut pick_image, mut changed, mut pick_sgdb, mut close, mut need_fonts) = (false, None, false, None, false, false);
         let screen = ctx.screen_rect();
         let demo = self.hook.demo;
-        let modal = egui::Modal::new(egui::Id::new("settings")).frame(modal_frame(ctx)).show(ctx, |ui| {
-            ui.set_width(520.0);
+        let width = (screen.width() - 80.0).clamp(640.0, 760.0);
+        let height = (screen.height() - 150.0).clamp(340.0, 540.0);
+        // Fond peu assombri : on voit le résultat pendant qu'on règle.
+        let modal = egui::Modal::new(egui::Id::new("settings")).backdrop_color(Color32::from_black_alpha(60)).frame(modal_frame(ctx)).show(ctx, |ui| {
+            ui.set_width(width);
             ui.horizontal(|ui| {
                 ui.heading("Réglages");
-                ui.add_space(12.0);
-                if chip(ui, "Apparence", self.settings_tab == 0) { self.settings_tab = 0; }
-                if chip(ui, "Compte", self.settings_tab == 1) { self.settings_tab = 1; }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { close = ui.button("Fermer").clicked(); });
             });
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical().max_height((screen.height() - 170.0).max(240.0)).auto_shrink([false, true]).show(ui, |ui| {
-                ui.set_width(504.0);
-                if self.settings_tab == 0 {
-                    let t = &mut self.cfg.theme;
-                    field(ui, "Thème");
-                    ui.horizontal_wrapped(|ui| {
-                        for p in PRESETS { if chip(ui, p.0, t.preset == p.0) { t.use_preset(p.0); self.color_edit = None; changed = true; } }
-                    });
-                    field(ui, "Couleurs");
-                    ui.horizontal(|ui| {
-                        for (i, label) in ["Accent", "Fond", "Panneaux", "Cartes"].into_iter().enumerate() {
-                            let c = [t.accent, t.bg, t.panel, t.card][i];
-                            if swatch(ui, label, c, self.color_edit == Some(i)) { self.color_edit = if self.color_edit == Some(i) { None } else { Some(i) }; }
-                        }
-                    });
-                    if let Some(i) = self.color_edit {
-                        let slot = match i { 0 => &mut t.accent, 1 => &mut t.bg, 2 => &mut t.panel, _ => &mut t.card };
-                        let mut c = rgb(*slot);
-                        if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
-                            *slot = [c.r(), c.g(), c.b()];
-                            t.preset = "Personnalisé".into();
-                            changed = true;
-                        }
+            ui.add_space(10.0);
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(128.0);
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    for (i, label) in ["Thème", "Fonds", "Affichage", "Compte"].into_iter().enumerate() {
+                        if nav_item(ui, label, self.settings_tab == i as u8) { self.settings_tab = i as u8; self.color_edit = None; }
                     }
-                    let [lib_filter, panel_filter] = &mut self.game_filter;
-                    let mut pick = false;
-                    changed |= back_section(ui, "Fond de la bibliothèque", "lib", &mut t.background, &mut t.image, &mut t.game, &mut t.dim, &self.games, lib_filter, &mut pick);
-                    if pick { pick_image = Some(false); }
-                    let mut pick = false;
-                    changed |= back_section(ui, "Fond du panneau du jeu", "panel", &mut t.panel_back, &mut t.panel_image, &mut t.panel_game, &mut t.panel_dim, &self.games, panel_filter, &mut pick);
-                    if pick { pick_image = Some(true); }
-                    field(ui, "Arrondi des jaquettes");
-                    changed |= ui.add(egui::Slider::new(&mut t.radius, 0..=24).suffix(" px")).changed();
-                    ui.add_space(6.0);
-                    changed |= ui.checkbox(&mut t.show_names, "Afficher le nom sous les jaquettes").changed();
-                    ui.add_space(8.0);
-                    if ui.button("Revenir au thème d'origine").clicked() { *t = Theme::default(); self.color_edit = None; changed = true; }
-                } else {
-                    field(ui, "Compte Steam");
-                    let shown = |a: &Account| if demo { "Mon compte".to_string() } else { a.name.clone() };
-                    let current = self.accounts.get(self.account).map_or("Aucun".to_string(), shown);
-                    egui::ComboBox::from_id_salt("account").selected_text(current).width(300.0).show_ui(ui, |ui| {
-                        for (i, a) in self.accounts.iter().enumerate() { if ui.selectable_label(i == self.account, shown(a)).clicked() { account = Some(i); } }
+                });
+                ui.add_space(12.0);
+                let line = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(1.0, height));
+                ui.painter().rect_filled(line, 0.0, pal().line);
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    let content = width - 170.0;
+                    egui::ScrollArea::vertical().id_salt("settings").max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.set_width(content - 14.0);
+                        match self.settings_tab {
+                            0 => {
+                                let t = &mut self.cfg.theme;
+                                field(ui, "Thème");
+                                ui.horizontal_wrapped(|ui| {
+                                    for p in PRESETS { if theme_card(ui, p, t.preset == p.0) { t.use_preset(p.0); self.color_edit = None; changed = true; } }
+                                });
+                                ui.add_space(10.0);
+                                field(ui, "Couleurs");
+                                ui.horizontal_wrapped(|ui| {
+                                    for (i, label) in ["Accent", "Fond", "Panneaux", "Cartes", "Haut", "Texte", "Secondaire"].into_iter().enumerate() {
+                                        let c = t.colors()[i];
+                                        if swatch(ui, label, c, self.color_edit == Some(i)) { self.color_edit = if self.color_edit == Some(i) { None } else { Some(i) }; }
+                                    }
+                                });
+                                if let Some(i) = self.color_edit {
+                                    let mut c = rgb(t.colors()[i]);
+                                    if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) {
+                                        t.set_color(i, [c.r(), c.g(), c.b()]);
+                                        t.preset = "Personnalisé".into();
+                                        changed = true;
+                                    }
+                                }
+                                ui.add_space(14.0);
+                                if ui.button("Revenir au thème d'origine").clicked() { *t = Theme::default(); self.color_edit = None; changed = true; }
+                            }
+                            1 => {
+                                ui.horizontal(|ui| {
+                                    for (z, label) in [(Zone::Lib, "Bibliothèque"), (Zone::Panel, "Panneau du jeu"), (Zone::Top, "Haut")] {
+                                        if chip(ui, label, self.settings_zone == z) { self.settings_zone = z; }
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                ui.separator();
+                                let zone = self.settings_zone;
+                                let t = &mut self.cfg.theme;
+                                let before = t.blur_level(zone);
+                                let mut level = before;
+                                let lib_plain = matches!(t.background, Back::Color | Back::Transparent);
+                                let (mut pick, mut web) = (false, false);
+                                let (b, image, game, dim) = t.zone(zone);
+                                changed |= back_section(ui, zone, lib_plain, b, image, game, dim, &mut level, &self.games, &mut self.game_filter[zone as usize], &mut pick, &mut web);
+                                if level != before { *t.blur_mut(zone) = Some(level); changed = true; }
+                                if pick { pick_image = Some(zone); }
+                                if web { pick_sgdb = Some(zone); }
+                            }
+                            2 => {
+                                let mut size = self.cfg.cover() as u16;
+                                field(ui, "Jaquettes");
+                                ui.spacing_mut().slider_width = 240.0;
+                                ui.horizontal(|ui| {
+                                    ui.add_sized([120.0, 24.0], egui::Label::new(RichText::new("Taille").size(13.5)));
+                                    if ui.add(egui::Slider::new(&mut size, 110..=340).suffix(" px")).changed() { self.cfg.cover_size = size; self.dirty = true; }
+                                });
+                                let t = &mut self.cfg.theme;
+                                changed |= slider_row(ui, "Arrondi", &mut t.radius, 24, " px");
+                                ui.add_space(8.0);
+                                changed |= ui.checkbox(&mut t.show_names, "Afficher le nom sous les jaquettes").changed();
+                                ui.add_space(12.0);
+                                field(ui, "Police d'écriture");
+                                match &self.fonts {
+                                    None => { need_fonts = true; ui.spinner(); }
+                                    Some(list) => {
+                                        ui.add(egui::TextEdit::singleline(&mut self.font_filter).hint_text("Filtrer les polices").desired_width(f32::INFINITY));
+                                        let q = self.font_filter.trim().to_lowercase();
+                                        egui::Frame::new().fill(pal().card).corner_radius(8).inner_margin(Margin::same(6)).show(ui, |ui| {
+                                            egui::ScrollArea::vertical().id_salt("fonts").max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
+                                                ui.spacing_mut().item_spacing.y = 2.0;
+                                                if q.is_empty() && ui.add_sized([ui.available_width(), 24.0], egui::SelectableLabel::new(t.font.is_empty(), "Police par défaut")).clicked() { t.font.clear(); changed = true; }
+                                                for n in list.iter().filter(|n| q.is_empty() || n.to_lowercase().contains(&q)) {
+                                                    if ui.add_sized([ui.available_width(), 24.0], egui::SelectableLabel::new(t.font == *n, n)).clicked() { t.font = n.clone(); changed = true; }
+                                                }
+                                            });
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {
+                                field(ui, "Compte Steam");
+                                let shown = |a: &Account| if demo { "Mon compte".to_string() } else { a.name.clone() };
+                                let current = self.accounts.get(self.account).map_or("Aucun".to_string(), shown);
+                                egui::ComboBox::from_id_salt("account").selected_text(current).width(300.0).show_ui(ui, |ui| {
+                                    for (i, a) in self.accounts.iter().enumerate() { if ui.selectable_label(i == self.account, shown(a)).clicked() { account = Some(i); } }
+                                });
+                                ui.add_space(8.0);
+                                field(ui, "Clé API SteamGridDB");
+                                ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).desired_width(f32::INFINITY));
+                                ui.horizontal(|ui| {
+                                    ui.hyperlink_to("Obtenir une clé gratuite", sgdb::KEY_PAGE);
+                                    save = ui.button("Enregistrer la clé").clicked();
+                                });
+                                ui.add_space(12.0);
+                                let (c, s) = if self.steam_on { (OK, "Steam est ouvert en arrière-plan.") } else { (pal().muted, "Steam est fermé : il démarrera sans fenêtre au lancement d'un jeu.") };
+                                ui.colored_label(c, s);
+                                ui.add_space(12.0);
+                                field(ui, &format!("MinimalSteam {}", env!("CARGO_PKG_VERSION")));
+                                ui.horizontal(|ui| {
+                                    let label = if self.update.busy() { "Recherche…" } else { "Rechercher les mises à jour" };
+                                    if ui.add_enabled(!self.update.busy(), egui::Button::new(label)).clicked() { self.update.check_now(ui.ctx()); }
+                                    let mut auto = self.update.prefs.automatic;
+                                    if ui.checkbox(&mut auto, "Automatiquement").changed() { self.update.prefs.automatic = auto; self.update.prefs.save(); }
+                                });
+                            }
+                        }
                     });
-                    field(ui, "Clé API SteamGridDB");
-                    ui.add(egui::TextEdit::singleline(&mut self.key_input).password(true).desired_width(f32::INFINITY));
-                    ui.horizontal(|ui| {
-                        ui.hyperlink_to("Obtenir une clé gratuite", sgdb::KEY_PAGE);
-                        save = ui.button("Enregistrer la clé").clicked();
-                    });
-                    ui.add_space(10.0);
-                    let (c, s) = if self.steam_on { (OK, "Steam est ouvert en arrière-plan.") } else { (pal().muted, "Steam est fermé : il démarrera sans fenêtre au lancement d'un jeu.") };
-                    ui.colored_label(c, s);
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("MinimalSteam {}", env!("CARGO_PKG_VERSION"))).size(12.5).color(pal().muted));
-                        let label = if self.update.busy() { "Recherche…" } else { "Rechercher les mises à jour" };
-                        if ui.add_enabled(!self.update.busy(), egui::Button::new(RichText::new(label).size(12.5)).small()).clicked() { self.update.check_now(ui.ctx()); }
-                        let mut auto = self.update.prefs.automatic;
-                        if ui.checkbox(&mut auto, RichText::new("automatiquement").size(12.5).color(pal().muted)).changed() { self.update.prefs.automatic = auto; self.update.prefs.save(); }
-                    });
-                }
+                });
             });
-            ui.add_space(8.0);
-            if ui.button("Fermer").clicked() { self.settings = false; }
         });
+        if need_fonts { self.fonts = Some(vec![]); self.spawn(ctx, || Msg::Fonts(fonts::list())); }
+        if close { self.settings = false; }
         if changed { self.dirty = true; apply_theme(ctx, &self.cfg.theme); }
+        if let Some(panel) = pick_sgdb { self.open_back_picker(ctx, panel); return; }
         if let Some(panel) = pick_image {
             let (tx, c) = (self.tx.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -1359,9 +1643,11 @@ fn style(ctx: &egui::Context, light: bool) {
     v.widgets.inactive.bg_stroke = Stroke::NONE;
     v.widgets.hovered.bg_fill = pal().hover;
     v.widgets.hovered.weak_bg_fill = pal().hover;
-    v.widgets.hovered.bg_stroke = Stroke::NONE;
-    v.widgets.active.bg_fill = pal().hover;
-    v.widgets.active.weak_bg_fill = pal().hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal().accent.gamma_multiply(0.55));
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    v.widgets.active.bg_fill = pal().line;
+    v.widgets.active.weak_bg_fill = pal().line;
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, pal().accent);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal().line);
     s.spacing.item_spacing = egui::vec2(8.0, 8.0);
     s.spacing.button_padding = egui::vec2(12.0, 6.0);
@@ -1376,10 +1662,72 @@ fn modal_frame(ctx: &egui::Context) -> egui::Frame {
     egui::Frame::popup(&ctx.style()).fill(pal().panel).inner_margin(Margin::same(22)).corner_radius(14)
 }
 
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// Le fond arrondi qui garde les commandes lisibles, même sur une jaquette.
+fn pill(clear: bool) -> egui::Frame {
+    let p = pal().panel;
+    let fill = if clear { Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), 225) } else { pal().card };
+    egui::Frame::new().fill(fill).corner_radius(18).inner_margin(Margin::symmetric(4, 3))
+}
+
 fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool {
-    let t = RichText::new(text).color(if on { pal().on_accent } else { pal().muted });
-    let b = egui::Button::new(t).fill(if on { pal().accent } else { Color32::TRANSPARENT }).corner_radius(16).min_size(egui::vec2(0.0, 30.0));
-    ui.add(b).clicked()
+    let font = egui::FontId::proportional(14.0);
+    let width = ui.painter().layout_no_wrap(text.to_string(), font.clone(), pal().text).size().x;
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(width + 24.0, 30.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
+    let (fill, color) = if on {
+        (blend(pal().accent, Color32::WHITE, 0.12 * hover), pal().on_accent)
+    } else {
+        (pal().hover.gamma_multiply(hover), blend(pal().muted, pal().text, hover))
+    };
+    ui.painter().rect_filled(r, 15.0, fill);
+    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, text, font, color);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// Bouton plein : s'éclaircit au survol et s'assombrit à l'appui.
+fn fill_button(ui: &mut egui::Ui, text: &str, min: egui::Vec2, size: f32, color: Color32, enabled: bool) -> bool {
+    let font = egui::FontId::proportional(size);
+    let ink = if color == pal().card { pal().muted } else { pal().on_accent };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, ink);
+    let wanted = egui::vec2((galley.size().x + 28.0).max(min.x), (galley.size().y + 10.0).max(min.y));
+    let (r, resp) = ui.allocate_exact_size(wanted, if enabled { Sense::click() } else { Sense::hover() });
+    let hover = ui.ctx().animate_bool_with_time(resp.id.with("hover"), enabled && resp.hovered(), 0.12);
+    let fill = if !enabled && color != pal().card { color.gamma_multiply(0.8) }
+        else if enabled && resp.is_pointer_button_down_on() { blend(color, Color32::BLACK, 0.14) }
+        else { blend(color, Color32::WHITE, 0.14 * hover) };
+    ui.painter().rect_filled(r, 8.0, fill);
+    let at = r.center() - galley.size() / 2.0;
+    ui.painter().galley(at, galley, ink);
+    let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
+    enabled && resp.clicked()
+}
+
+/// Range un fond téléchargé dans les réglages de l'app, sans toucher aux images de Steam.
+fn save_background(panel: Zone, image_id: u64, bytes: &[u8]) -> Result<PathBuf, String> {
+    let ext = match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Png) => "png",
+        Ok(image::ImageFormat::Jpeg) => "jpg",
+        Ok(image::ImageFormat::WebP) => "webp",
+        _ => return Err("Le fichier reçu n'est pas une image.".into()),
+    };
+    let dir = config_dir("Minimalsteam").ok_or("Dossier de réglages introuvable.")?.join("fonds");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Dossier impossible à créer : {e}"))?;
+    let slot = match panel { Zone::Panel => "panneau", Zone::Lib => "bibliotheque", Zone::Top => "haut" };
+    let target = dir.join(format!("{slot}-{image_id}.{ext}"));
+    let tmp = dir.join(format!(".{slot}-{image_id}.part"));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("Écriture impossible : {e}"))?;
+    std::fs::rename(&tmp, &target).map_err(|e| format!("Écriture impossible : {e}"))?;
+    if let Ok(list) = std::fs::read_dir(&dir) {
+        for f in list.flatten() {
+            if f.path() != target && f.file_name().to_string_lossy().starts_with(&format!("{slot}-")) { let _ = std::fs::remove_file(f.path()); }
+        }
+    }
+    Ok(target)
 }
 
 fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandle, dim: u8, tint: [u8; 3]) {
@@ -1387,43 +1735,90 @@ fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandl
     painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], (dim as f32 * 2.55).round() as u8));
 }
 
-/// Réglage d'un fond : couleur, image, jeu sélectionné ou jeu choisi dans la liste.
-#[allow(clippy::too_many_arguments)]
-fn back_section(ui: &mut egui::Ui, title: &str, salt: &str, back: &mut Back, image: &mut String, game: &mut u32, dim: &mut u8, games: &[Game], filter: &mut String, pick: &mut bool) -> bool {
+fn nav_item(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(128.0, 36.0), Sense::click());
+    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    if on { ui.painter().rect_filled(r, 8.0, pal().accent); }
+    else if resp.hovered() { ui.painter().rect_filled(r, 8.0, pal().hover); }
+    ui.painter().text(r.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), if on { pal().on_accent } else { pal().text });
+    resp.clicked()
+}
+
+fn theme_card(ui: &mut egui::Ui, p: (&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]), on: bool) -> bool {
+    let (name, accent, bg, panel, card) = p;
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(118.0, 66.0), Sense::click());
+    ui.painter().rect_filled(r, 8.0, rgb(bg));
+    let bar = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 16.0));
+    ui.painter().rect_filled(bar, CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, rgb(panel));
+    ui.painter().circle_filled(bar.right_center() - egui::vec2(11.0, 0.0), 4.0, rgb(accent));
+    ui.painter().rect_filled(egui::Rect::from_min_size(r.left_top() + egui::vec2(8.0, 22.0), egui::vec2(12.0, 16.0)), 2.0, rgb(card));
+    ui.painter().rect_filled(egui::Rect::from_min_size(r.left_top() + egui::vec2(24.0, 22.0), egui::vec2(12.0, 16.0)), 2.0, rgb(card));
+    let text = if lum(bg) > 0.55 { Color32::from_rgb(0x16, 0x1A, 0x20) } else { Color32::from_rgb(0xF1, 0xF3, 0xF6) };
+    ui.painter().text(r.left_bottom() + egui::vec2(8.0, -13.0), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.0), text);
+    let stroke = if on { Stroke::new(2.0_f32, pal().accent) } else if resp.hovered() { Stroke::new(1.5_f32, pal().muted) } else { Stroke::new(1.0_f32, pal().line) };
+    ui.painter().rect_stroke(r, 8.0, stroke, egui::StrokeKind::Outside);
+    resp.clicked()
+}
+
+fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut u8, max: u8, suffix: &str) -> bool {
     let mut changed = false;
-    ui.push_id(salt, |ui| {
-        field(ui, title);
-        ui.horizontal(|ui| {
-            for (b, label) in [(Back::Color, "Couleur"), (Back::Image, "Mon image"), (Back::Game, "Jeu sélectionné"), (Back::Chosen, "Choisir un jeu")] {
-                if chip(ui, label, *back == b) {
-                    *back = b;
-                    changed = true;
-                    if b == Back::Image && image.is_empty() { *pick = true; }
-                }
+    ui.spacing_mut().slider_width = 240.0;
+    ui.horizontal(|ui| {
+        ui.add_sized([120.0, 24.0], egui::Label::new(RichText::new(label).size(13.5)));
+        changed = ui.add(egui::Slider::new(value, 0..=max).suffix(suffix)).changed();
+    });
+    changed
+}
+
+/// Réglage du fond d'une zone : une seule source à la fois, et seulement ses options.
+#[allow(clippy::too_many_arguments)]
+fn back_section(ui: &mut egui::Ui, zone: Zone, lib_plain: bool, back: &mut Back, image: &mut String, game: &mut u32, dim: &mut u8, blur: &mut u8, games: &[Game], filter: &mut String, pick: &mut bool, web: &mut bool) -> bool {
+    let mut changed = false;
+    ui.push_id(zone as u8, |ui| {
+        field(ui, "Source");
+        ui.horizontal_wrapped(|ui| {
+            let mut options = vec![(Back::Color, "Couleur")];
+            if zone == Zone::Top { options.push((Back::Transparent, "Transparent")); }
+            options.extend([(Back::Image, "Image"), (Back::Game, "Jeu sélectionné"), (Back::Chosen, "Un jeu")]);
+            for (b, label) in options {
+                if chip(ui, label, *back == b) { *back = b; changed = true; }
             }
         });
-        if *back == Back::Image {
-            ui.horizontal(|ui| {
-                *pick |= ui.button("Choisir une image").clicked();
-                let n = Path::new(image.as_str()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                ui.add(egui::Label::new(RichText::new(n).size(12.5).color(pal().muted)).truncate());
-            });
-        }
-        if *back == Back::Chosen {
-            ui.add(egui::TextEdit::singleline(filter).hint_text("Filtrer les jeux").desired_width(f32::INFINITY));
-            let q = filter.trim().to_lowercase();
-            egui::Frame::new().fill(pal().card).corner_radius(8).inner_margin(Margin::same(6)).show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("games").max_height(132.0).auto_shrink([false, true]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for g in games.iter().filter(|g| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).is_some() && (q.is_empty() || g.name.to_lowercase().contains(&q))) {
-                        if ui.add_sized([ui.available_width(), 24.0], egui::SelectableLabel::new(*game == g.id, &g.name)).clicked() { *game = g.id; changed = true; }
-                    }
+        ui.add_space(6.0);
+        match *back {
+            Back::Color => { ui.label(RichText::new("La couleur se règle dans l'onglet Thème.").size(13.0).color(pal().muted)); }
+            Back::Image => {
+                ui.horizontal(|ui| {
+                    *pick |= ui.button("Depuis mon PC").clicked();
+                    *web |= ui.button("Depuis SteamGridDB").clicked();
                 });
-            });
+                let n = Path::new(image.as_str()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Aucune image choisie".into());
+                ui.add(egui::Label::new(RichText::new(n).size(12.5).color(pal().muted)).truncate());
+            }
+            Back::Chosen => {
+                ui.add(egui::TextEdit::singleline(filter).hint_text("Filtrer les jeux").desired_width(f32::INFINITY));
+                let q = filter.trim().to_lowercase();
+                egui::Frame::new().fill(pal().card).corner_radius(8).inner_margin(Margin::same(6)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("games").max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for g in games.iter().filter(|g| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).is_some() && (q.is_empty() || g.name.to_lowercase().contains(&q))) {
+                            if ui.add_sized([ui.available_width(), 24.0], egui::SelectableLabel::new(*game == g.id, &g.name)).clicked() { *game = g.id; changed = true; }
+                        }
+                    });
+                });
+            }
+            _ => {}
         }
-        if *back != Back::Color {
-            field(ui, "Assombrir");
-            changed |= ui.add(egui::Slider::new(dim, 0..=95).suffix(" %")).changed();
+        if *back == Back::Transparent {
+            field(ui, "Effet verre");
+            slider_row(ui, "Flou", blur, 100, " %");
+            let hint = if lib_plain { "Choisis une image pour la bibliothèque : le flou s'applique à ce qui passe derrière le haut." } else { "Seul le fond est flouté, jamais le texte ni les boutons." };
+            ui.label(RichText::new(hint).size(12.5).color(pal().muted));
+        } else if *back != Back::Color {
+            ui.add_space(6.0);
+            field(ui, "Réglages de l'image");
+            slider_row(ui, "Flou", blur, 100, " %");
+            changed |= slider_row(ui, "Assombrir", dim, 95, " %");
         }
     });
     changed
@@ -1493,6 +1888,9 @@ impl eframe::App for App {
         self.handle(ctx);
         if self.hook.demo { self.running.clear(); self.steam_on = true; }
         self.inputs(ctx);
+        if !ctx.input(|i| i.pointer.any_down()) { self.shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| self.cfg.theme.blur_level(z)); }
+        self.paint_back(ctx, ctx.screen_rect());
+        self.paint_top(ctx);
         self.top_bar(ctx);
         if let Some((text, error, at)) = self.status.clone() {
             if at.elapsed() > Duration::from_secs(5) { self.status = None; }
@@ -1503,6 +1901,7 @@ impl eframe::App for App {
                 });
             }
         }
+        self.sync_font(ctx);
         self.tick_queue(ctx);
         self.queue_bar(ctx);
         self.detail(ctx);
@@ -1528,14 +1927,15 @@ impl eframe::App for App {
 }
 
 /// Captures d'écran de test : ne lance jamais de jeu et n'écrit rien dans Steam.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
 
 impl Default for TestHook {
     fn default() -> Self {
         let spec = std::env::var("MINIMALSTEAM_TEST").unwrap_or_default();
         let (mut select, mut editor, mut add, mut settings, mut demo, mut back_game) = (None, false, false, false, false, false);
         let (mut hide, mut theme, mut size, mut queue) = (Vec::new(), None, None, false);
-        let (mut panel, mut lib) = (None, None);
+        let (mut panel, mut lib, mut picker, mut top_clear, mut top) = (None, None, false, false, None);
+        let (mut tab, mut zone, mut blur, mut top_blur, mut font) = (0, Zone::Lib, None, None, false);
         for part in spec.split(',') {
             if let Some(s) = part.strip_prefix("sel:") { select = Some(s.to_lowercase()); }
             editor |= part == "editor";
@@ -1543,6 +1943,15 @@ impl Default for TestHook {
             settings |= part == "settings";
             demo |= part == "demo";
             queue |= part == "queue";
+            picker |= part == "picker";
+            font |= part == "font";
+            if let Some(n) = part.strip_prefix("tab:") { tab = n.parse().unwrap_or(0); }
+            if part == "zone:top" { zone = Zone::Top; }
+            if part == "zone:panel" { zone = Zone::Panel; }
+            if let Some(n) = part.strip_prefix("blur:") { blur = n.parse().ok(); }
+            if let Some(n) = part.strip_prefix("topblur:") { top_blur = n.parse().ok(); }
+            top_clear |= part == "topclear";
+            if let Some(n) = part.strip_prefix("top:") { top = Some(n.to_lowercase()); }
             if let Some(n) = part.strip_prefix("panel:") { panel = Some(n.to_lowercase()); }
             if let Some(n) = part.strip_prefix("lib:") { lib = Some(n.to_lowercase()); }
             back_game |= part == "backgame";
@@ -1550,7 +1959,7 @@ impl Default for TestHook {
             if let Some(t) = part.strip_prefix("theme:") { theme = Some(t.to_string()); }
             if let Some(s) = part.strip_prefix("size:") { size = s.parse().ok(); }
         }
-        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, panel, lib, hide, theme, size, back_game }
+        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, top_clear, top, panel, lib, hide, theme, size, back_game }
     }
 }
 

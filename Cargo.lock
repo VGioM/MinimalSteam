@@ -1706,6 +1706,7 @@ dependencies = [
 name = "minimalsteam"
 version = "1.0.2"
 dependencies = [
+ "ab_glyph",
  "eframe",
  "egui",
  "image",
