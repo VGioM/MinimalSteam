@@ -30,8 +30,9 @@ void main() {
 }
 "#;
 
-/// Pixels capturés sous la zone, pour que le flou prenne aussi ce qui arrive du bas.
-const MARGIN: i32 = 48;
+/// Pixels capturés sous le verre du haut, pour que le flou prenne ce qui arrive du bas.
+pub const GLASS_MARGIN: i32 = 48;
+const PASSES: u32 = 3;
 
 struct Target { texture: glow::Texture, framebuffer: glow::Framebuffer }
 
@@ -99,14 +100,16 @@ unsafe fn build(gl: &glow::Context) -> Option<Gl> {
     })
 }
 
-/// (réduction de l'image, nombre de passes) selon le niveau de flou (1 à 100).
-pub fn strength(level: u8) -> (i32, u32) {
-    let level = level.clamp(1, 100) as i32;
-    (2 + level / 34, 1 + level as u32 / 20)
+/// (réduction de l'image, écart entre les échantillons). Le rayon varie en continu avec
+/// le niveau (1 à 100) pour que le curseur agisse sans à-coups.
+pub fn strength(level: u8, pixels_per_point: f32) -> (i32, f32) {
+    let radius = level.clamp(1, 100) as f32 * 0.5 * pixels_per_point.max(0.5);
+    let scale = ((radius / 3.0).ceil() as i32).clamp(1, 8);
+    (scale, radius / (3.03 * scale as f32))
 }
 
 impl Backdrop {
-    pub fn paint(&mut self, gl: &glow::Context, info: &egui::PaintCallbackInfo, level: u8) {
+    pub fn paint(&mut self, gl: &glow::Context, info: &egui::PaintCallbackInfo, level: u8, margin: i32) {
         if self.failed || level == 0 { return; }
         unsafe {
             if self.gl.is_none() {
@@ -120,9 +123,9 @@ impl Backdrop {
             let view = info.viewport_in_pixels();
             let clip = info.clip_rect_in_pixels();
             if view.width_px <= 0 || view.height_px <= 0 { return; }
-            let below = MARGIN.min(view.from_bottom_px).max(0);
+            let below = margin.min(view.from_bottom_px).max(0);
             let (w, h) = (view.width_px, view.height_px + below);
-            let (scale, passes) = strength(level);
+            let (scale, spread) = strength(level, info.pixels_per_point);
             let (small_w, small_h) = ((w / scale).max(1), (h / scale).max(1));
             if s.size != (w, h, scale) {
                 allocate(gl, s.source, w, h);
@@ -150,8 +153,8 @@ impl Backdrop {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(s.a.framebuffer));
             gl.uniform_2_f32(s.step.as_ref(), 0.0, 0.0);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            let (dx, dy) = (1.0 / small_w as f32, 1.0 / small_h as f32);
-            for _ in 0..passes {
+            let (dx, dy) = (spread / small_w as f32, spread / small_h as f32);
+            for _ in 0..PASSES {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(s.b.framebuffer));
                 gl.bind_texture(glow::TEXTURE_2D, Some(s.a.texture));
                 gl.uniform_2_f32(s.step.as_ref(), dx, 0.0);
@@ -180,8 +183,9 @@ mod tests {
 
     #[test]
     fn stronger_level_blurs_more() {
-        assert_eq!(strength(0), strength(1));
-        assert!(strength(100).0 > strength(1).0);
-        assert!(strength(100).1 > strength(1).1);
+        let radius = |l: u8| { let (s, d) = strength(l, 1.25); s as f32 * d };
+        assert_eq!(strength(0, 1.0), strength(1, 1.0));
+        for l in 1..100 { assert!(radius(l + 1) > radius(l), "{l}"); }
+        assert!((1..=100).all(|l| (1..=8).contains(&strength(l, 2.0).0)));
     }
 }

@@ -255,14 +255,13 @@ impl Textures {
     }
 }
 
-/// Une taille au-delà de cette valeur demande un fond flouté : `BLUR_BASE + niveau`.
-const BLUR_BASE: u32 = 1_000_000;
+/// Un fond flouté n'a pas besoin de toute sa définition.
+const BLURRED: u32 = 1280;
 /// Les fonds sont recadrés pour remplir la zone : on garde toute leur définition.
 const FULL: u32 = 4096;
 
 fn decode(bytes: &[u8], max: u32) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
-    let (img, max) = if max > BLUR_BASE { (img.thumbnail(720, 720).blur((max - BLUR_BASE) as f32 * 0.3), 720) } else { (img, max) };
     let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
     // Un fond plus petit que l'écran est agrandi ici, bien plus proprement que par la carte graphique.
     let img = if max == FULL && img.height() < 1440 {
@@ -369,11 +368,11 @@ struct App {
     compat_edit: Option<(u32, Option<String>)>,
     game_filter: [String; 3],
     settings_zone: Zone,
-    backdrop: Arc<Mutex<blur::Backdrop>>,
+    backdrops: [Arc<Mutex<blur::Backdrop>>; 3],
     fonts: Option<Vec<String>>,
     font_filter: String,
     font_applied: String,
-    /// Flou réellement affiché : suit le curseur une fois relâché.
+    /// Sert à choisir la définition de l'image, une fois le curseur relâché.
     shown_blur: [u8; 3],
     last_back: [Option<egui::TextureHandle>; 3],
     countdown: Option<Instant>,
@@ -409,7 +408,7 @@ impl App {
         let app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), settings_zone: hook.zone, backdrop: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, launched: HashMap::new(), busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.reload(&cc.egui_ctx);
         app
@@ -900,16 +899,7 @@ impl App {
             let area = egui::Rect::from_min_size(screen.min, egui::vec2(screen.width(), TOP_H));
             ui.interact(area, ui.id().with("block"), Sense::click_and_drag());
             ui.expand_to_include_rect(area);
-            let level = self.shown_blur[Zone::Top as usize];
-            if level > 0 {
-                let backdrop = self.backdrop.clone();
-                ui.painter().add(egui::PaintCallback {
-                    rect: area,
-                    callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
-                        if let Ok(mut b) = backdrop.lock() { b.paint(painter.gl(), &info, level); }
-                    })),
-                });
-            }
+            if let Some(pass) = self.blur_pass(Zone::Top, area, blur::GLASS_MARGIN) { ui.painter().add(pass); }
             let (veil, alpha) = (self.cfg.theme.top_color.unwrap_or(self.cfg.theme.panel), (self.cfg.theme.glass as f32 * 2.55).round() as u8);
             ui.painter().rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(veil[0], veil[1], veil[2], alpha));
             let row = |y: f32, h: f32| egui::Rect::from_min_size(egui::pos2(area.left() + 20.0, area.top() + y), egui::vec2(area.width() - 40.0, h));
@@ -920,12 +910,20 @@ impl App {
     }
 
     fn top_row(&mut self, ui: &mut egui::Ui, clear: bool) {
-        let title = RichText::new("MinimalSteam").size(17.0).strong();
-        if clear { pill().inner_margin(Margin::symmetric(10, 3)).show(ui, |ui| ui.label(title)); } else { ui.label(title); }
+        if clear {
+            // Une case ajustée au texte : un cadre classique prendrait toute la hauteur de la barre.
+            let galley = ui.painter().layout_no_wrap("MinimalSteam".to_string(), egui::FontId::proportional(16.0), pal().text);
+            let (r, _) = ui.allocate_exact_size(galley.size() + egui::vec2(16.0, 6.0), Sense::hover());
+            ui.painter().rect(r, 6.0, pal().menu, Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+            ui.painter().galley(r.center() - galley.size() / 2.0, galley, pal().text);
+        } else {
+            ui.label(RichText::new("MinimalSteam").size(17.0).strong());
+        }
         ui.add_space(14.0);
-        let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(260.0).margin(Margin::symmetric(10, 5)));
+        let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(260.0).margin(Margin::symmetric(10, 5)).background_color(pal().menu));
         if self.focus_search { r.request_focus(); self.focus_search = false; }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.visuals_mut().widgets.inactive.weak_bg_fill = pal().menu;
             if ui.add(egui::Button::new(RichText::new("⚙").size(16.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Réglages").clicked() { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
             if fill_button(ui, "+ Ajouter des jeux", egui::vec2(0.0, 30.0), 14.0, pal().accent, true) { self.open_add(); }
         });
@@ -942,6 +940,7 @@ impl App {
             pill().inner_margin(Margin::symmetric(8, 2)).show(ui, |ui| {
                 ui.spacing_mut().interact_size.y = 24.0;
                 ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+                ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
                 let before = self.cfg.sort;
                 egui::ComboBox::from_id_salt("sort").selected_text(RichText::new(self.cfg.sort.label()).size(13.5)).width(112.0).show_ui(ui, |ui| {
                     for s in [Sort::Recent, Sort::Name, Sort::Playtime] { ui.selectable_value(&mut self.cfg.sort, s, s.label()); }
@@ -966,7 +965,7 @@ impl App {
             Back::Chosen => self.game(chosen).and_then(art),
         };
         let Some(path) = path else { self.last_back[z as usize] = None; return None };
-        let max = if blur == 0 { FULL } else { BLUR_BASE + blur as u32 };
+        let max = if blur == 0 { FULL } else { BLURRED };
         let Some(tex) = self.tex.file(&path, max).cloned() else { return self.last_back[z as usize].clone() };
         if let Some(old) = self.last_back[z as usize].take() {
             let used = self.last_back.iter().flatten().any(|o| o.name() == old.name());
@@ -974,6 +973,19 @@ impl App {
         }
         self.last_back[z as usize] = Some(tex.clone());
         Some(tex)
+    }
+
+    /// Le flou d'une zone, calculé par la carte graphique : il suit le curseur en direct.
+    fn blur_pass(&self, z: Zone, rect: egui::Rect, margin: i32) -> Option<egui::PaintCallback> {
+        let level = self.cfg.theme.blur_level(z);
+        if level == 0 { return None; }
+        let backdrop = self.backdrops[z as usize].clone();
+        Some(egui::PaintCallback {
+            rect,
+            callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |info, painter| {
+                if let Ok(mut b) = backdrop.lock() { b.paint(painter.gl(), &info, level, margin); }
+            })),
+        })
     }
 
     fn zone_tex(&mut self, z: Zone) -> Option<egui::TextureHandle> {
@@ -992,7 +1004,7 @@ impl App {
         if t.top_back == Back::Transparent { self.last_back[Zone::Top as usize] = None; return; }
         let color = t.top_color.unwrap_or(t.panel);
         match self.zone_tex(Zone::Top) {
-            Some(tex) => fill_back(&painter, area, &tex, t.top_dim, color),
+            Some(tex) => { let pass = self.blur_pass(Zone::Top, area, 0); fill_back(&painter, area, &tex, t.top_dim, color, pass); }
             None => { painter.rect_filled(area, 0.0, rgb(color)); }
         }
     }
@@ -1001,7 +1013,7 @@ impl App {
         let painter = ctx.layer_painter(egui::LayerId::background());
         painter.rect_filled(area, 0.0, pal().bg);
         let t = self.cfg.theme.clone();
-        if let Some(tex) = self.zone_tex(Zone::Lib) { fill_back(&painter, area, &tex, t.dim, t.bg); }
+        if let Some(tex) = self.zone_tex(Zone::Lib) { let pass = self.blur_pass(Zone::Lib, area, 0); fill_back(&painter, area, &tex, t.dim, t.bg, pass); }
     }
 
     fn grid(&mut self, ctx: &egui::Context) {
@@ -1010,7 +1022,11 @@ impl App {
         let (cover, rad, names) = (self.cfg.cover(), self.cfg.theme.radius, self.cfg.theme.show_names);
         let clear = self.cfg.theme.top_back == Back::Transparent;
         let offset = if clear { TOP_H + 18.0 } else { 0.0 };
-        let over_bar = clear && ctx.pointer_latest_pos().is_some_and(|p| p.y < TOP_H);
+        let over_top = ctx.pointer_latest_pos().is_some_and(|p| p.y < TOP_H);
+        let over_bar = clear && over_top;
+        // La molette sur le haut fait défiler les jeux, sauf si une fenêtre ou un menu est ouvert.
+        let free = self.add.is_none() && self.editor.is_none() && !self.settings && !ctx.memory(|m| m.any_popup_open());
+        let wheel = if over_top && free { ctx.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
         let quality = if cover > 240.0 { 720 } else { 420 };
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin { left: 22, right: 10, top: if clear { 0 } else { 18 }, bottom: 0 })).show(ctx, |ui| {
             if clear && (!self.loaded || self.error.is_some() || visible.is_empty()) { ui.add_space(offset); }
@@ -1023,6 +1039,7 @@ impl App {
             }
             let scroll_to = std::mem::take(&mut self.scroll_to);
             egui::ScrollArea::vertical().auto_shrink(false).show_viewport(ui, |ui, vp| {
+                if wheel != 0.0 { ui.scroll_with_delta_animation(egui::vec2(0.0, wheel), egui::style::ScrollAnimation::none()); }
                 let gap = 18.0;
                 let avail = ui.available_width() - 12.0;
                 let cols = (((avail + gap) / (cover + gap)).floor() as usize).max(1);
@@ -1123,11 +1140,16 @@ impl App {
         let panel_tex = self.zone_tex(Zone::Panel);
         let fade = if panel_tex.is_some() { Color32::from_rgba_unmultiplied(t.panel[0], t.panel[1], t.panel[2], (t.panel_dim as f32 * 2.55).round() as u8) } else { pal().panel };
         let clear = t.top_back == Back::Transparent;
+        let panel_pass = |app: &Self, body: egui::Rect| app.blur_pass(Zone::Panel, body, 0);
+        let panel_blur = { let s = ctx.screen_rect(); panel_pass(self, egui::Rect::from_min_max(egui::pos2(s.right() - 350.0, s.top() + if clear { TOP_H } else { 0.0 }), s.right_bottom())) };
         egui::SidePanel::right("detail").exact_width(350.0).resizable(false).show_separator_line(!clear).frame(egui::Frame::new()).show(ctx, |ui| {
             let mut body = ui.max_rect();
             if clear { body.min.y += TOP_H; ui.add_space(TOP_H); }
             ui.painter().rect_filled(body, 0.0, pal().panel);
-            if let Some(tex) = &panel_tex { fill_back(ui.painter(), body, tex, t.panel_dim, t.panel); }
+            if let Some(tex) = &panel_tex {
+                let pass = panel_blur.clone().map(|mut p| { p.rect = body; p });
+                fill_back(ui.painter(), body, tex, t.panel_dim, t.panel, pass);
+            }
             let (hero, _) = ui.allocate_exact_size(egui::vec2(350.0, 196.0), Sense::hover());
             ui.painter().rect_filled(hero, 0.0, pal().card);
             let src = g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
@@ -1468,7 +1490,7 @@ impl App {
                                 ui.add_space(10.0);
                                 field(ui, "Couleurs");
                                 ui.horizontal_wrapped(|ui| {
-                                    for (i, label) in ["Accent", "Fond", "Panneaux", "Cartes", "Haut", "Texte", "Secondaire", "Menus"].into_iter().enumerate() {
+                                    for (i, label) in ["Accent", "Fond", "Panneaux", "Cartes", "Haut", "Texte", "Secondaire"].into_iter().enumerate() {
                                         let c = t.colors()[i];
                                         if swatch(ui, label, c, self.color_edit == Some(i)) { self.color_edit = if self.color_edit == Some(i) { None } else { Some(i) }; }
                                     }
@@ -1481,8 +1503,6 @@ impl App {
                                         changed = true;
                                     }
                                 }
-                                ui.add_space(8.0);
-                                changed |= slider_row(ui, "Opacité des menus", &mut t.menu_alpha, 100, " %");
                                 ui.add_space(14.0);
                                 if ui.button("Revenir au thème d'origine").clicked() { *t = Theme::default(); self.color_edit = None; changed = true; }
                             }
@@ -1504,6 +1524,17 @@ impl App {
                                 if level != before { *t.blur_mut(zone) = Some(level); changed = true; }
                                 if pick { pick_image = Some(zone); }
                                 if web { pick_sgdb = Some(zone); }
+                                if zone == Zone::Top {
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    field(ui, "Cases du haut (titre, recherche, filtres, tri, réglages)");
+                                    if swatch(ui, "Couleur", t.colors()[7], self.color_edit == Some(7)) { self.color_edit = if self.color_edit == Some(7) { None } else { Some(7) }; }
+                                    if self.color_edit == Some(7) {
+                                        let mut c = rgb(t.colors()[7]);
+                                        if egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque) { t.set_color(7, [c.r(), c.g(), c.b()]); changed = true; }
+                                    }
+                                    changed |= slider_row(ui, "Opacité", &mut t.menu_alpha, 100, " %");
+                                }
                             }
                             2 => {
                                 let mut size = self.cfg.cover() as u16;
@@ -1741,8 +1772,9 @@ fn save_background(panel: Zone, image_id: u64, bytes: &[u8]) -> Result<PathBuf, 
     Ok(target)
 }
 
-fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandle, dim: u8, tint: [u8; 3]) {
+fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandle, dim: u8, tint: [u8; 3], blur: Option<egui::PaintCallback>) {
     painter.image(tex.id(), area, cover_uv(tex.size(), area), Color32::WHITE);
+    if let Some(pass) = blur { painter.add(pass); }
     painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], (dim as f32 * 2.55).round() as u8));
 }
 
