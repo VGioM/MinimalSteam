@@ -88,7 +88,7 @@ pub fn parse_kv(text: &str) -> Kv {
     Kv::M(stack.pop().map(|s| s.1).unwrap_or_default())
 }
 
-fn read_kv(p: &Path) -> Option<Kv> {
+pub(crate) fn read_kv(p: &Path) -> Option<Kv> {
     let bytes = std::fs::read(p).ok()?;
     Some(parse_kv(&String::from_utf8_lossy(&bytes)))
 }
@@ -189,6 +189,13 @@ pub struct Game {
     pub pending: bool,
     pub compat_queued: bool,
     pub art: [Option<PathBuf>; 5],
+    /// Options de lancement d'un jeu non-Steam.
+    pub options: String,
+    /// Connu de MinimalSteam seulement.
+    pub local: bool,
+    pub installed: bool,
+    /// Jaquette en ligne d'un jeu non installé.
+    pub remote: Option<String>,
 }
 
 impl Game {
@@ -239,7 +246,7 @@ fn stats(a: &Account) -> HashMap<u32, Stat> {
     out
 }
 
-fn compat_map(root: &Path) -> HashMap<u32, String> {
+pub(crate) fn compat_map(root: &Path) -> HashMap<u32, String> {
     let mut out = HashMap::new();
     let Some(kv) = read_kv(&root.join("config/config.vdf")) else { return out };
     let Some(m) = kv.path(&["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"]) else { return out };
@@ -300,7 +307,7 @@ pub fn load_games(a: &Account) -> Result<Vec<Game>, String> {
             let folder = m.str("installdir").filter(|d| !d.is_empty()).map(|d| lib.join("steamapps/common").join(d));
             let cached = cache_files(&a.root, id);
             let art = Kind::ALL.map(|k| grid_art(a, id, k).or_else(|| pick_cache(&cached, k)));
-            games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: s.last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: m.str("LastUpdated").and_then(|s| s.parse().ok()).unwrap_or(0), folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
+            games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: s.last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: m.str("LastUpdated").and_then(|s| s.parse().ok()).unwrap_or(0), folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art, options: String::new(), local: false, installed: true, remote: None });
         }
     }
     games.extend(read_shortcuts(a, &st, &compat)?);
@@ -339,7 +346,7 @@ fn read_shortcuts(a: &Account, st: &HashMap<u32, Stat>, compat: &HashMap<u32, St
         let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, id, k) });
         let p = PathBuf::from(&icon);
         if p.is_file() && matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(), Some("png" | "jpg" | "jpeg" | "ico" | "webp" | "bmp")) { art[Kind::Icon.index()] = Some(p); }
-        out.push(Game { id, name: v.str("AppName").unwrap_or_default(), steam: false, exe, icon, size: None, disk: "Non-Steam".into(), last_played: last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: 0, folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art });
+        out.push(Game { id, name: v.str("AppName").unwrap_or_default(), steam: false, exe, icon, size: None, disk: "Non-Steam".into(), last_played: last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: 0, folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art, options: v.str("LaunchOptions").unwrap_or_default().to_string(), local: false, installed: true, remote: None });
     }
     Ok(out)
 }
@@ -685,7 +692,7 @@ pub fn stop_game(id: u32) -> bool {
     true
 }
 
-fn host_command(program: &str) -> Command {
+pub(crate) fn host_command(program: &str) -> Command {
     let mut c = Command::new(program);
     if std::env::var_os("APPIMAGE").is_some() {
         for v in ["LD_LIBRARY_PATH", "LD_PRELOAD", "APPDIR", "APPIMAGE", "ARGV0", "OWD"] { c.env_remove(v); }
@@ -694,7 +701,7 @@ fn host_command(program: &str) -> Command {
     c
 }
 
-fn in_path(program: &str) -> bool {
+pub(crate) fn in_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
 }
 
@@ -710,7 +717,7 @@ fn steam_command(flatpak: bool, launch: bool) -> Command {
     }
 }
 
-fn spawn_detached(mut c: Command) -> std::io::Result<()> {
+pub(crate) fn spawn_detached(mut c: Command) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     unsafe { c.pre_exec(|| { setsid(); Ok(()) }); }
     let mut child = c.spawn()?;
@@ -830,7 +837,29 @@ pub fn pending_game(a: &Account, n: &NewGame) -> Game {
     let id = new_id(&n.name, &n.exe);
     let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, id, k) });
     if !n.icon.is_empty() && Path::new(&n.icon).is_file() { art[Kind::Icon.index()] = Some(PathBuf::from(&n.icon)); }
-    Game { id, name: n.name.clone(), steam: false, exe: n.exe.clone(), icon: n.icon.clone(), size: None, disk: "Non-Steam".into(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: Path::new(&n.exe).parent().map(Path::to_path_buf), compat: n.tool.clone(), pending: true, compat_queued: false, art }
+    Game { id, name: n.name.clone(), steam: false, exe: n.exe.clone(), icon: n.icon.clone(), size: None, disk: "Non-Steam".into(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: Path::new(&n.exe).parent().map(Path::to_path_buf), compat: n.tool.clone(), pending: true, compat_queued: false, art, options: n.options.clone(), local: false, installed: true, remote: None }
+}
+
+/// Un programme ajouté à MinimalSteam seulement.
+pub fn local_game(a: &Account, l: &crate::direct::LocalGame) -> Game {
+    let mut art = Kind::ALL.map(|k| if k == Kind::Icon { None } else { grid_art(a, l.id, k) });
+    if !l.icon.is_empty() && Path::new(&l.icon).is_file() { art[Kind::Icon.index()] = Some(PathBuf::from(&l.icon)); }
+    Game { id: l.id, name: l.name.clone(), steam: false, exe: l.exe.clone(), icon: l.icon.clone(), size: std::fs::metadata(&l.exe).ok().map(|m| m.len()), disk: "Hors Steam".into(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: Path::new(&l.exe).parent().map(Path::to_path_buf), compat: None, pending: false, compat_queued: false, art, options: l.options.clone(), local: true, installed: true, remote: None }
+}
+
+/// Un jeu possédé mais pas installé.
+pub fn owned_game(a: &Account, o: &crate::owned::Owned) -> Game {
+    let cached = cache_files(&a.root, o.id);
+    let art = Kind::ALL.map(|k| grid_art(a, o.id, k).or_else(|| pick_cache(&cached, k)));
+    Game { id: o.id, name: o.name.clone(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: "Non installé".into(), last_played: o.last, playtime: o.minutes, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: None, compat: None, pending: false, compat_queued: false, art, options: String::new(), local: false, installed: false, remote: Some(crate::owned::cover_url(o.id)) }
+}
+
+/// Ouvre la fenêtre d'installation de Steam pour ce jeu.
+pub fn install(a: &Account, id: u32) -> Result<(), String> {
+    let (open, _) = processes();
+    let mut c = steam_command(a.flatpak, !open);
+    c.arg(format!("steam://install/{id}"));
+    spawn_detached(c).map_err(|e| format!("Impossible d'ouvrir l'installation : {e}"))
 }
 
 #[cfg(test)]
@@ -889,7 +918,7 @@ mod tests {
 
     #[test]
     fn game_ids() {
-        let mut g = Game { id: 730, name: "x".into(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: String::new(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: None, compat: None, pending: false, compat_queued: false, art: Default::default() };
+        let mut g = Game { id: 730, name: "x".into(), steam: true, exe: String::new(), icon: String::new(), size: None, disk: String::new(), last_played: 0, playtime: 0, recent: 0, last_launch: 0, last_session: 0, updated: 0, folder: None, compat: None, pending: false, compat_queued: false, art: Default::default(), options: String::new(), local: false, installed: true, remote: None };
         assert_eq!(g.game_id(), 730);
         g.steam = false;
         g.id = 3746397753;

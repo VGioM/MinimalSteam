@@ -11,8 +11,10 @@ use std::time::{Duration, Instant, SystemTime};
 mod blur;
 #[allow(dead_code)]
 mod desktop;
+mod direct;
 mod fonts;
 mod gamepad;
+mod owned;
 mod scan;
 #[allow(dead_code)]
 mod sgdb;
@@ -56,7 +58,7 @@ impl Sort {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Filter { All, Favorites, Steam, Other }
+enum Filter { All, Favorites, Steam, Other, Missing, Running }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Match { id: u64, name: String }
@@ -164,6 +166,12 @@ struct Config {
     pending_games: HashMap<String, Vec<steam::NewGame>>,
     pending_compat: HashMap<String, Vec<(u32, Option<String>)>>,
     pending_names: HashMap<String, Vec<(u32, String)>>,
+    local_games: Vec<direct::LocalGame>,
+    played: HashMap<u32, direct::Played>,
+    /// Jeux non-Steam à lancer quand même par Steam (compte:id).
+    via_steam: HashSet<String>,
+    steam_key: String,
+    owned: HashMap<String, Vec<owned::Owned>>,
 }
 
 fn config_dir(app: &str) -> Option<PathBuf> {
@@ -301,7 +309,8 @@ fn paint_tex(ui: &egui::Ui, rect: egui::Rect, tex: &egui::TextureHandle, fill: b
 
 enum Msg {
     Loaded(Result<Vec<Game>, String>),
-    Poll { steam: bool, running: HashSet<u32>, changed: bool },
+    Poll { steam: bool, running: HashSet<u32>, direct: HashSet<u32>, changed: bool },
+    Owned(String, Result<Vec<owned::Owned>, String>),
     Search { id: u32, result: Result<Vec<SgdbGame>, String> },
     List { game: u64, kind: Kind, page: u32, result: Result<Vec<Img>, String> },
     Applied { id: u32, kind: Kind, result: Result<PathBuf, String> },
@@ -359,6 +368,12 @@ struct App {
     pad: mpsc::Receiver<Pad>,
     steam_on: bool,
     running: HashSet<u32>,
+    /// Sous-ensemble de `running` lancé sans Steam.
+    direct: HashSet<u32>,
+    /// Début des parties directes en cours.
+    sessions: HashMap<u32, u64>,
+    steam_key_input: String,
+    owned_busy: bool,
     launched: HashMap<u32, Instant>,
     stopping: HashMap<u32, Instant>,
     stop_confirm: Option<(u32, Instant)>,
@@ -404,7 +419,10 @@ impl App {
         let key_input = cfg.api_key.clone();
         let watched = Arc::new(Mutex::new(accounts.get(account).map(|a| a.watched()).unwrap_or_default()));
         start_poll(cc.egui_ctx.clone(), tx.clone(), watched.clone());
-        let (steam_on, running) = steam::processes();
+        let (steam_on, mut running) = steam::processes();
+        let direct_now = direct::running();
+        running.extend(direct_now.iter().copied());
+        let steam_key_input = cfg.steam_key.clone();
         if hook.queue {
             if let Some(a) = accounts.get(account) {
                 cfg.pending_games.insert(a.id.clone(), vec![steam::NewGame { name: "Hollow Knight".into(), exe: "/Jeux/Hollow Knight/hollow_knight.exe".into(), options: String::new(), tool: Some("proton_experimental".into()), icon: String::new() }]);
@@ -414,12 +432,17 @@ impl App {
         if let Some(b) = hook.blur { cfg.theme.blur = Some(b); cfg.theme.panel_blur = Some(b); }
         if let Some(b) = hook.top_blur { cfg.theme.top_blur = Some(b); }
         let shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| cfg.theme.blur_level(z));
-        let app = App {
+        let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
+        app.track_direct(direct_now);
+        if std::env::var_os("APP_SCREENSHOT").is_some() {
+            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, _ => {} }
+        }
         app.reload(&cc.egui_ctx);
+        if std::env::var_os("APP_SCREENSHOT").is_none() { app.refresh_owned(&cc.egui_ctx); }
         app
     }
 
@@ -449,10 +472,12 @@ impl App {
         let q = self.query.trim().to_lowercase();
         let mut v: Vec<usize> = self.games.iter().enumerate().filter(|(_, g)| {
             (q.is_empty() || g.name.to_lowercase().contains(&q)) && match self.filter {
-                Filter::All => true,
-                Filter::Favorites => self.is_favorite(g.id),
-                Filter::Steam => g.steam,
+                Filter::All => g.installed,
+                Filter::Favorites => g.installed && self.is_favorite(g.id),
+                Filter::Steam => g.installed && g.steam,
                 Filter::Other => !g.steam,
+                Filter::Missing => !g.installed,
+                Filter::Running => self.running.contains(&g.id) || self.launched.contains_key(&g.id),
             }
         }).map(|(i, _)| i).collect();
         match self.cfg.sort {
@@ -472,8 +497,20 @@ impl App {
         if g.pending { self.set_status("Ce jeu sera disponible une fois enregistré dans Steam.", false); return; }
         // Steam est peut-être en train de redémarrer : un lancement maintenant se perdrait.
         if self.busy.as_deref() == Some(APPLYING) { self.set_status("Steam redémarre : relance le jeu dans un instant.", false); return; }
+        if !g.installed {
+            match steam::install(&a, g.id) {
+                Ok(()) => self.set_status(format!("Installation de {} : confirme dans Steam.", g.name), false),
+                Err(e) => self.set_status(e, true),
+            }
+            return;
+        }
         self.countdown = None;
-        match steam::launch(&a, &g) {
+        // Les jeux Steam gardent Steam (licence, Cloud). Les autres s'en passent si Proton est là.
+        let by_steam = g.steam || self.cfg.via_steam.contains(&gkey(&a.id, id));
+        let started = if by_steam { steam::launch(&a, &g) } else {
+            match direct::launch(&a, &g) { Ok(true) => Ok(()), Ok(false) => steam::launch(&a, &g), Err(e) => Err(e) }
+        };
+        match started {
             Ok(()) => { self.launched.insert(id, Instant::now()); self.set_status(format!("Lancement de {}…", g.name), false); }
             Err(e) => self.set_status(e, true),
         }
@@ -487,12 +524,45 @@ impl App {
             return;
         }
         self.stop_confirm = None;
-        if steam::stop_game(id) {
+        if direct::stop(id) || steam::stop_game(id) {
             self.stopping.insert(id, Instant::now());
             self.set_status(format!("Arrêt de {name}…"), false);
         } else {
             self.set_status("Impossible de trouver le jeu en cours.", true);
         }
+    }
+
+    /// Compte le temps des parties directes. Rend `true` si une partie vient de finir.
+    fn track_direct(&mut self, now: HashSet<u32>) -> bool {
+        let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        for id in &now { self.sessions.entry(*id).or_insert(t); }
+        let ended: Vec<u32> = self.sessions.keys().filter(|i| !now.contains(i)).copied().collect();
+        for id in &ended {
+            let start = self.sessions.remove(id).unwrap_or(t);
+            let p = self.cfg.played.entry(*id).or_default();
+            p.minutes += (t.saturating_sub(start) / 60) as u32;
+            p.last = t;
+        }
+        self.direct = now;
+        if !ended.is_empty() { self.cfg.save(); }
+        !ended.is_empty()
+    }
+
+    fn refresh_owned(&mut self, ctx: &egui::Context) {
+        let key = self.cfg.steam_key.trim().to_string();
+        let Some(id) = self.acc().map(|a| a.id.clone()) else { return };
+        if key.is_empty() || self.owned_busy { return; }
+        self.owned_busy = true;
+        self.spawn(ctx, move || { let r = owned::fetch(&key, &id); Msg::Owned(id, r) });
+    }
+
+    fn remove_local(&mut self, ctx: &egui::Context, id: u32) {
+        if self.running.contains(&id) { self.set_status("Ferme-le d'abord.", false); return; }
+        self.cfg.local_games.retain(|l| l.id != id);
+        self.cfg.save();
+        self.selected = None;
+        self.set_status("Retiré de MinimalSteam. Le fichier n'a pas été touché.", false);
+        self.reload(ctx);
     }
 
     fn pending(&self) -> Vec<(u32, String)> { self.acc().and_then(|a| self.cfg.pending_icons.get(&a.id)).cloned().unwrap_or_default() }
@@ -516,13 +586,21 @@ impl App {
                     if self.selected.is_some_and(|s| !self.games.iter().any(|g| g.id == s)) { self.selected = None; }
                 }
                 Msg::Loaded(Err(e)) => { self.loaded = true; self.error = Some(e); }
-                Msg::Poll { steam, running, changed } => {
+                Msg::Owned(id, result) => {
+                    self.owned_busy = false;
+                    match result {
+                        Ok(list) => { self.cfg.owned.insert(id, list); self.cfg.save(); self.reload(ctx); }
+                        Err(e) => self.set_status(e, true),
+                    }
+                }
+                Msg::Poll { steam, running, direct, changed } => {
+                    let ended = self.track_direct(direct);
                     self.steam_on = steam;
                     self.launched.retain(|id, _| !running.contains(id));
                     self.stopping.retain(|id, _| running.contains(id));
                     if self.stop_confirm.is_some_and(|(id, _)| !running.contains(&id)) { self.stop_confirm = None; }
                     self.running = running;
-                    if changed { self.reload(ctx); }
+                    if changed || ended { self.reload(ctx); }
                 }
                 Msg::Search { id, result } => {
                     let mut pick = None;
@@ -612,6 +690,18 @@ impl App {
                     self.add = None;
                     let n = games.len();
                     self.selected = games.last().map(|g| steam::new_id(&g.name, &g.exe));
+                    // Les programmes Linux restent hors de Steam : aucun redémarrage.
+                    let (native, games): (Vec<_>, Vec<_>) = games.into_iter().partition(|g| g.tool.is_none());
+                    for g in native {
+                        let id = steam::new_id(&g.name, &g.exe);
+                        if !self.cfg.local_games.iter().any(|l| l.id == id || l.exe == g.exe) { self.cfg.local_games.push(direct::LocalGame { id, name: g.name, exe: g.exe, options: g.options, icon: g.icon }); }
+                    }
+                    self.cfg.save();
+                    if games.is_empty() {
+                        self.set_status(if n > 1 { format!("{n} programmes ajoutés.") } else { "Programme ajouté.".to_string() }, false);
+                        self.reload(ctx);
+                        continue;
+                    }
                     if let Some(id) = self.acc().map(|a| a.id.clone()) {
                         let list = self.cfg.pending_games.entry(id).or_default();
                         for g in games { if !list.iter().any(|x| steam::new_id(&x.name, &x.exe) == steam::new_id(&g.name, &g.exe)) { list.push(g); } }
@@ -682,7 +772,7 @@ impl App {
     }
 
     /// Un jeu tourne, ou vient d'être lancé et n'est pas encore détecté.
-    fn game_active(&self) -> bool { !self.running.is_empty() || !self.launched.is_empty() }
+    fn game_active(&self) -> bool { self.running.iter().any(|i| !self.direct.contains(i)) || self.launched.keys().any(|i| !self.direct.contains(i)) }
 
     /// Montre dans la bibliothèque ce qui n'est pas encore écrit dans Steam.
     fn merge_queue(&mut self) {
@@ -697,6 +787,15 @@ impl App {
         for n in &q.games {
             let id = steam::new_id(&n.name, &n.exe);
             if !self.games.iter().any(|g| g.id == id) { self.games.push(steam::pending_game(&a, n)); }
+        }
+        for l in &self.cfg.local_games {
+            if !self.games.iter().any(|g| g.id == l.id) { self.games.push(steam::local_game(&a, l)); }
+        }
+        for g in self.games.iter_mut().filter(|g| !g.steam) {
+            if let Some(p) = self.cfg.played.get(&g.id) { g.playtime += p.minutes; g.last_played = g.last_played.max(p.last); }
+        }
+        for o in self.cfg.owned.get(&a.id).into_iter().flatten() {
+            if !steam::is_tool(o.id, &o.name) && !self.games.iter().any(|g| g.id == o.id) { self.games.push(steam::owned_game(&a, o)); }
         }
         self.games.sort_by_key(|g| g.name.to_lowercase());
     }
@@ -722,6 +821,12 @@ impl App {
     fn queue_name(&mut self, ctx: &egui::Context, g: &Game, name: String) {
         let name = steam::clean_name(&name);
         if name.is_empty() || name == g.name { return; }
+        if g.local {
+            if let Some(l) = self.cfg.local_games.iter_mut().find(|l| l.id == g.id) { l.name = name; }
+            self.cfg.save();
+            self.reload(ctx);
+            return;
+        }
         let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
         let list = self.cfg.pending_names.entry(account).or_default();
         list.retain(|(i, _)| *i != g.id);
@@ -989,7 +1094,9 @@ impl App {
     fn tools_row(&mut self, ui: &mut egui::Ui, _clear: bool) {
         pill().show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
-            for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam")] {
+            let active = self.running.len() + self.launched.keys().filter(|i| !self.running.contains(i)).count();
+            let launched = if active > 0 { format!("Lancés ({active})") } else { "Lancés".to_string() };
+            for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam"), (Filter::Missing, "Non installés"), (Filter::Running, launched.as_str())] {
                 if chip(ui, label, self.filter == f) { self.filter = f; }
             }
         });
@@ -1089,8 +1196,30 @@ impl App {
             if clear && (!self.loaded || self.error.is_some() || visible.is_empty()) { ui.add_space(offset); }
             if !self.loaded { ui.centered_and_justified(|ui| ui.label(RichText::new("Chargement…").color(pal().muted))); return; }
             if let Some(e) = &self.error { ui.colored_label(BAD, e); }
+            let no_key = self.cfg.steam_key.trim().is_empty();
+            let no_list = !self.acc().is_some_and(|a| self.cfg.owned.contains_key(&a.id));
+            if visible.is_empty() && self.filter == Filter::Missing && self.query.is_empty() && !self.owned_busy && (no_key || no_list) {
+                let mut open = false;
+                ui.add_space((ui.available_height() * 0.28).max(20.0));
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(520.0);
+                    ui.label(RichText::new(if no_key { "Affiche les jeux que tu possèdes sans les avoir installés" } else { "Impossible de récupérer la liste de tes jeux" }).size(20.0).strong());
+                    ui.add_space(8.0);
+                    let text = if no_key { "Steam ne donne cette liste qu'avec une clé API personnelle. Elle est gratuite et se crée en quelques minutes : l'onglet Compte des réglages explique chaque étape." } else { "Vérifie ta clé API Steam et la confidentialité de ton profil : l'onglet Compte des réglages explique quoi faire." };
+                    ui.label(RichText::new(text).size(14.0).color(pal().muted));
+                    ui.add_space(14.0);
+                    open = fill_button(ui, if no_key { "Configurer ma clé Steam" } else { "Ouvrir l'onglet Compte" }, egui::vec2(230.0, 38.0), 14.5, pal().accent, true);
+                });
+                if open {
+                    self.settings = true;
+                    self.settings_tab = 3;
+                    self.key_input = self.cfg.api_key.clone();
+                    self.steam_key_input = self.cfg.steam_key.clone();
+                }
+                return;
+            }
             if visible.is_empty() {
-                let t = if self.games.is_empty() { "Aucun jeu installé." } else if self.filter == Filter::Favorites && self.query.is_empty() { "Aucun favori pour l'instant." } else { "Aucun jeu ne correspond." };
+                let t = if self.filter == Filter::Running && self.query.is_empty() { "Aucun jeu lancé." } else if self.filter == Filter::Missing && self.query.is_empty() { if self.owned_busy { "Chargement de tes jeux…" } else { "Tous tes jeux sont installés." } } else if self.games.is_empty() { "Aucun jeu installé." } else if self.filter == Filter::Favorites && self.query.is_empty() { "Aucun favori pour l'instant." } else { "Aucun jeu ne correspond." };
                 ui.centered_and_justified(|ui| ui.label(RichText::new(t).color(pal().muted)));
                 return;
             }
@@ -1146,7 +1275,7 @@ impl App {
                         p.add(shadow.as_shape(shown, rad));
                     }
                     p.rect_filled(shown, rad, pal().card);
-                    let tex = g.art(Kind::Cover).and_then(|f| self.tex.file(f, quality));
+                    let tex = match (g.art(Kind::Cover), &g.remote) { (Some(f), _) => self.tex.file(f, quality), (None, Some(u)) => self.tex.url(u), _ => None };
                     match tex {
                         Some(t) => paint_tex(ui, shown, t, true, rad),
                         None => {
@@ -1203,7 +1332,8 @@ impl App {
         let default_label = if g.steam { "Par défaut de Steam" } else { "Aucune (jeu Linux)" };
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
-        let (mut stop, mut open_dir) = (false, false);
+        let (mut stop, mut open_dir, mut via_toggle, mut remove_local) = (false, false, false, false);
+        let via_key = gkey(self.acc().map_or("", |a| a.id.as_str()), g.id);
         let (mut rename_open, mut rename_save, mut rename_cancel, mut name_undo) = (false, false, false, false);
         let name_queued = self.acc().and_then(|a| self.cfg.pending_names.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
         let halting = self.stopping.get(&g.id).is_some_and(|t| t.elapsed() < Duration::from_secs(20));
@@ -1226,7 +1356,7 @@ impl App {
             }
             // La hauteur suit l'image pour la montrer entière au lieu de couper ses côtés.
             let src = g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned();
-            let art = src.and_then(|f| self.tex.file(&f, 900).cloned());
+            let art = match (&src, &g.remote) { (Some(f), _) => self.tex.file(f, 900).cloned(), (None, Some(u)) => self.tex.url(u).cloned(), _ => None };
             let ratio = art.as_ref().map(|a| a.size()[0] as f32 / a.size()[1].max(1) as f32);
             let hero_h = ratio.map_or(196.0, |r| (350.0 / r).clamp(110.0, 196.0));
             let (hero, _) = ui.allocate_exact_size(egui::vec2(350.0, hero_h), Sense::hover());
@@ -1274,7 +1404,7 @@ impl App {
                         let (label, color, on) = if halting { ("Arrêt en cours…", GOLD, false) } else if confirming { ("Confirmer l'arrêt ?", STOP, true) } else { ("Arrêter le jeu", STOP, true) };
                         stop = fill_button(ui, label, egui::vec2(198.0, 42.0), 16.0, color, on);
                     } else {
-                        let (label, color) = if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else { ("▶  Jouer", pal().accent) };
+                        let (label, color) = if launching { ("Lancement…", GOLD) } else if g.pending { ("En attente", GOLD) } else if !g.installed { ("⬇  Installer", pal().accent) } else { ("▶  Jouer", pal().accent) };
                         play = fill_button(ui, label, egui::vec2(198.0, 42.0), 16.0, color, !launching && !g.pending);
                     }
                     let has_folder = g.folder.as_ref().is_some_and(|f| f.is_dir());
@@ -1300,6 +1430,7 @@ impl App {
                     info(ui, "Emplacement", &g.disk);
                 });
                 ui.add_space(8.0);
+                if g.installed && !g.local {
                 let mut pick = chosen.clone();
                 pill().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1324,13 +1455,23 @@ impl App {
                 } else if g.compat_queued {
                     ui.colored_label(GOLD, "Changement en attente.");
                 }
+                }
+                if !g.steam && !g.local && !g.pending {
+                    ui.add_space(4.0);
+                    let mut by_steam = self.cfg.via_steam.contains(&via_key);
+                    if ui.checkbox(&mut by_steam, "Lancer via Steam").on_hover_text("Pour un jeu qui a besoin de Steam (overlay, Steam Input, anti-triche). Sinon il démarre directement avec Proton, dans le même préfixe.").changed() { via_toggle = true; }
+                }
                 if g.pending {
                     ui.add_space(4.0);
                     ui.colored_label(GOLD, "Pas encore enregistré dans Steam.");
                     cancel_add = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler l'ajout")).clicked();
                 }
                 ui.add_space(10.0);
-                edit = ui.add(egui::Button::new("Modifier les images").min_size(egui::vec2(310.0, 36.0))).clicked();
+                if g.installed { edit = ui.add(egui::Button::new("Modifier les images").min_size(egui::vec2(310.0, 36.0))).clicked(); }
+                if g.local {
+                    ui.add_space(6.0);
+                    remove_local = ui.add(egui::Button::new("Retirer de MinimalSteam").min_size(egui::vec2(310.0, 36.0))).on_hover_text("Le fichier reste sur le disque.").clicked();
+                }
                 if !g.steam {
                     ui.add_space(6.0);
                     if let Some(r) = self.rename.as_mut().filter(|r| r.0 == g.id) {
@@ -1341,7 +1482,7 @@ impl App {
                         let valid = !clean.is_empty() && clean != g.name;
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            let label = if game_running { "Enregistrer (à la fermeture du jeu)" } else if steam_on { "Enregistrer (redémarre Steam)" } else { "Enregistrer" };
+                            let label = if g.local { "Enregistrer" } else if game_running { "Enregistrer (à la fermeture du jeu)" } else if steam_on { "Enregistrer (redémarre Steam)" } else { "Enregistrer" };
                             let saved = fill_button(ui, label, egui::vec2(0.0, 30.0), 13.5, if valid { pal().accent } else { pal().card }, valid);
                             rename_save = valid && (saved || enter);
                             rename_cancel = ui.button("Annuler").clicked();
@@ -1365,6 +1506,11 @@ impl App {
                 match steam::open_folder(f) { Ok(()) => self.set_status("Dossier du jeu ouvert.", false), Err(e) => self.set_status(e, true) }
             }
         }
+        if via_toggle {
+            if !self.cfg.via_steam.remove(&via_key) { self.cfg.via_steam.insert(via_key.clone()); }
+            self.cfg.save();
+        }
+        if remove_local { self.remove_local(ctx, g.id); return; }
         if play { self.launch(g.id); }
         if stop { self.request_stop(g.id, &g.name); }
         if fav { self.toggle_favorite(g.id); }
@@ -1437,9 +1583,10 @@ impl App {
             let count = f.rows.iter().filter(|r| r.on && !r.exists && !r.name.trim().is_empty()).count();
             let needs_tool = f.rows.iter().any(|r| r.on && r.windows) && f.tool.is_none();
             ui.add_space(4.0);
-            if game_running && count > 0 { ui.colored_label(GOLD, "Un jeu est en cours : ils seront ajoutés dès sa fermeture."); }
+            let for_steam = f.rows.iter().filter(|r| r.on && !r.exists && r.windows && !r.name.trim().is_empty()).count();
+            if game_running && for_steam > 0 { ui.colored_label(GOLD, "Un jeu est en cours : ils seront ajoutés dès sa fermeture."); }
             else if needs_tool { ui.colored_label(GOLD, "Installe Proton dans Steam pour ajouter des jeux Windows."); }
-            else if steam_on && count > 0 { ui.label(RichText::new("Steam redémarrera une seule fois, sans afficher sa fenêtre.").size(12.5).color(pal().muted)); }
+            else if steam_on && for_steam > 0 { ui.label(RichText::new("Steam redémarrera une seule fois, sans afficher sa fenêtre.").size(12.5).color(pal().muted)); }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let ready = busy.is_none() && !needs_tool && count > 0;
@@ -1603,6 +1750,7 @@ impl App {
         if !self.settings { return; }
         let mut account = None;
         let (mut save, mut pick_image, mut changed, mut pick_sgdb, mut close, mut need_fonts) = (false, None, false, None, false, false);
+        let mut save_steam = false;
         let screen = ctx.screen_rect();
         let demo = self.hook.demo;
         let width = (screen.width() - 80.0).clamp(640.0, 760.0);
@@ -1732,6 +1880,25 @@ impl App {
                                     ui.hyperlink_to("Obtenir une clé gratuite", sgdb::KEY_PAGE);
                                     save = ui.button("Enregistrer la clé").clicked();
                                 });
+                                ui.add_space(8.0);
+                                field(ui, "Clé API Steam (jeux non installés)");
+                                ui.add(egui::TextEdit::singleline(&mut self.steam_key_input).password(true).desired_width(f32::INFINITY));
+                                ui.horizontal(|ui| {
+                                    ui.hyperlink_to("Obtenir une clé gratuite", owned::KEY_PAGE);
+                                    save_steam = ui.add_enabled(!self.owned_busy, egui::Button::new(if self.owned_busy { "Chargement…" } else { "Enregistrer et actualiser" })).clicked();
+                                });
+                                egui::CollapsingHeader::new("Comment obtenir cette clé ?").default_open(self.cfg.steam_key.trim().is_empty()).show(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.y = 5.0;
+                                    let step = |ui: &mut egui::Ui, t: &str| { ui.add(egui::Label::new(RichText::new(t).size(13.0).color(pal().muted)).wrap()); };
+                                    step(ui, "Elle sert uniquement à afficher les jeux que tu possèdes mais qui ne sont pas installés.");
+                                    step(ui, "1. Ouvre la page de la clé et connecte-toi à Steam :");
+                                    ui.hyperlink_to("steamcommunity.com/dev/apikey", owned::KEY_PAGE);
+                                    step(ui, "2. Dans « Domain Name », écris localhost, accepte les conditions et valide. Steam peut demander une confirmation Steam Guard.");
+                                    step(ui, "3. Copie la clé, colle-la dans le champ ci-dessus, puis clique sur « Enregistrer et actualiser ».");
+                                    step(ui, "4. Si Steam ne donne pas la liste, mets « Détails des jeux » sur Public :");
+                                    ui.hyperlink_to("Paramètres de confidentialité Steam", "https://steamcommunity.com/my/edit/settings");
+                                    step(ui, "Steam peut refuser la clé à un compte limité (moins de 5 $ dépensés). Garde-la pour toi : elle reste sur ce PC.");
+                                });
                                 ui.add_space(12.0);
                                 let (c, s) = if self.steam_on { (OK, "Steam est ouvert en arrière-plan.") } else { (pal().muted, "Steam est fermé : il démarrera sans fenêtre au lancement d'un jeu.") };
                                 ui.colored_label(c, s);
@@ -1769,11 +1936,18 @@ impl App {
                 if let Ok(mut w) = self.watched.lock() { *w = a.watched(); }
             }
             self.reload(ctx);
+            self.refresh_owned(ctx);
         }
         if save {
             self.cfg.api_key = self.key_input.trim().to_string();
             self.cfg.save();
             self.set_status("Clé enregistrée.", false);
+        }
+        if save_steam {
+            self.cfg.steam_key = self.steam_key_input.trim().to_string();
+            self.cfg.save();
+            if self.cfg.steam_key.is_empty() { if let Some(a) = self.acc().map(|a| a.id.clone()) { self.cfg.owned.remove(&a); self.cfg.save(); } self.reload(ctx); }
+            else { self.refresh_owned(ctx); }
         }
         if modal.should_close() { self.settings = false; }
     }
@@ -1795,14 +1969,15 @@ fn start_poll(ctx: egui::Context, tx: mpsc::Sender<Msg>, watched: Arc<Mutex<Vec<
     std::thread::spawn(move || {
         let stamp = |w: &[PathBuf]| -> Vec<Option<SystemTime>> { w.iter().map(|p| std::fs::metadata(p).ok().and_then(|m| m.modified().ok())).collect() };
         let mut last_files = stamp(&watched.lock().map(|w| w.clone()).unwrap_or_default());
-        let mut last = steam::processes();
+        let mut last = (steam::processes(), direct::running());
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let files = stamp(&watched.lock().map(|w| w.clone()).unwrap_or_default());
-            let now = steam::processes();
+            let now = (steam::processes(), direct::running());
             let changed = files != last_files;
             if changed || now != last {
-                if tx.send(Msg::Poll { steam: now.0, running: now.1.clone(), changed }).is_err() { return; }
+                let running = now.0.1.iter().chain(&now.1).copied().collect();
+                if tx.send(Msg::Poll { steam: now.0.0, running, direct: now.1.clone(), changed }).is_err() { return; }
                 ctx.request_repaint();
             }
             last_files = files;
@@ -2104,7 +2279,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tex.poll(ctx);
         self.handle(ctx);
-        if self.hook.demo { self.running.clear(); self.steam_on = true; }
+        if self.hook.demo { self.running.clear(); self.direct.clear(); self.steam_on = true; }
         self.inputs(ctx);
         if !ctx.input(|i| i.pointer.any_down()) { self.shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| self.cfg.theme.blur_level(z)); }
         // Un peu plus grand que la fenêtre : avec un écran mis à l'échelle, le bord tombe entre deux pixels.

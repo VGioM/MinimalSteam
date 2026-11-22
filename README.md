@@ -12,7 +12,10 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Recherche, favoris et tri** par date, nom ou temps de jeu.
 - **Fiche de jeu** : temps de jeu, dernière partie, taille, disque et version de Proton.
 - **Lancement** en un double-clic, avec le bouton Jouer, la touche Entrée ou la manette.
-- **Ajout rapide de jeux non-Steam**, sans passer par Steam.
+- **Jeux non-Steam lancés sans Steam**, avec Proton et dans leur préfixe habituel, donc avec les mêmes sauvegardes.
+- **AppImage et scripts `.sh`** ajoutés directement à MinimalSteam, sans passer par Steam.
+- **Onglet Non installés** pour voir et installer les jeux que tu possèdes.
+- **Onglet Lancés** pour voir et arrêter tout ce qui tourne, Steam ou non.
 - **Images modifiables** depuis [SteamGridDB](https://www.steamgriddb.com/) : couverture, bannière, arrière-plan, logo et icône.
 - **Apparence à ton goût** : thèmes, couleurs, fond, arrondi et taille des jaquettes.
 - **Mises à jour intégrées** depuis les releases GitHub.
@@ -26,7 +29,12 @@ Clique sur **Ajouter des jeux**, puis au choix :
 - **Choisir des fichiers** : sélectionne un ou plusieurs `.exe`, AppImage ou programmes Linux.
 - **Scanner un dossier** : indique ton dossier de jeux. MinimalSteam cherche le programme principal de chaque sous-dossier et écarte les installateurs, désinstalleurs et outils annexes.
 
-Vérifie les noms, choisis la version de Proton pour les jeux Windows, puis valide. Les images sont récupérées automatiquement et Steam ne redémarre qu'une fois, sans afficher sa fenêtre, quel que soit le nombre de jeux.
+Vérifie les noms, choisis la version de Proton pour les jeux Windows, puis valide. Les images sont récupérées automatiquement.
+
+- **Jeux Windows** : ils sont enregistrés une fois dans Steam, qui ne redémarre qu'une fois sans afficher sa fenêtre. Leur préfixe est créé au premier lancement dans `steamapps/compatdata/<id>/pfx`.
+- **AppImage et `.sh`** : ils restent dans MinimalSteam, sans préfixe et sans redémarrage de Steam.
+
+**Attention :** retirer un jeu non-Steam de la bibliothèque Steam efface aussi son préfixe, donc les sauvegardes qu'il contient.
 
 ![L'ajout rapide de jeux](docs/ajout.jpg)
 
@@ -54,8 +62,9 @@ Vérifie les noms, choisis la version de Proton pour les jeux Windows, puis vali
 1. Télécharge `MinimalSteam-x.y.z-linux-x86_64.AppImage` depuis les [Releases](https://github.com/VGioM/MinimalSteam/releases/latest).
 2. Rends-la exécutable (clic droit, Propriétés, « Exécutable », ou `chmod +x MinimalSteam-*.AppImage`), puis lance-la.
 3. Pour modifier les images, ajoute une **clé API SteamGridDB** gratuite dans **Réglages, Compte**. Tu peux l'obtenir sur [la page API de SteamGridDB](https://www.steamgriddb.com/profile/preferences/api).
+4. Pour l'onglet **Non installés**, ajoute une **clé API Steam** gratuite au même endroit. L'app explique chaque étape.
 
-Steam doit être installé (version native ou Flatpak) et connecté à ton compte.
+Steam doit être installé (version native ou Flatpak) et connecté à ton compte. Le lancement sans Steam des jeux Windows demande [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher). Sans lui, ces jeux passent simplement par Steam.
 
 ## Raccourcis
 
@@ -71,7 +80,9 @@ La manette est ignorée quand la fenêtre n'a pas le focus ou qu'un jeu tourne.
 
 ## Comment ça marche
 
-Steam reste nécessaire pour les DRM, Steam Cloud, les succès et Proton. MinimalSteam lui demande de lancer les jeux et, s'il est fermé, le démarre sans fenêtre. Tes réglages de Proton et options de lancement restent donc ceux de Steam.
+Les **jeux Steam** passent toujours par Steam, nécessaire pour les DRM, Steam Cloud et les succès. S'il est fermé, MinimalSteam le démarre sans fenêtre.
+
+Les **jeux non-Steam** se lancent directement, avec la version de Proton, le préfixe et les options de lancement réglés pour eux. Sans Steam, ils n'ont ni overlay ni Steam Input, et un anti-triche peut les bloquer : coche **Lancer via Steam** sur leur fiche dans ce cas.
 
 L'app ne modifie les fichiers de Steam que pour ajouter un jeu ou appliquer une icône :
 
@@ -81,11 +92,12 @@ L'app ne modifie les fichiers de Steam que pour ajouter un jeu ou appliquer une 
 | `config/config.vdf` | Version de Proton des jeux ajoutés |
 | `userdata/<compte>/config/grid/` | Images personnalisées |
 
-Ces écritures se font Steam fermé et **jamais pendant qu'un jeu tourne**. Tu peux ajouter un jeu ou changer de Proton en pleine partie : le changement passe en **file d'attente**, puis Steam redémarre discrètement quelques secondes après la fermeture du dernier jeu. Une copie `*.minimalsteam-sauvegarde` est créée avant la première modification. Les réglages de l'app sont dans `~/.config/Minimalsteam/`.
+Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Steam tourne**. Tu peux ajouter un jeu ou changer de Proton en pleine partie : le changement passe en **file d'attente**, puis Steam redémarre discrètement quelques secondes après la fermeture du dernier jeu. Une copie `*.minimalsteam-sauvegarde` est créée avant la première modification. Les réglages de l'app sont dans `~/.config/Minimalsteam/`.
 
 ## Limites
 
-- Seuls les jeux **installés** sont affichés. L'installation d'un jeu se fait toujours dans Steam.
+- L'installation d'un jeu Steam se fait toujours dans Steam : MinimalSteam ouvre sa fenêtre d'installation.
+- Le temps de jeu sans Steam n'est compté que si MinimalSteam reste ouvert jusqu'à la fermeture du jeu.
 - MinimalSteam ne gère pas les ROM ni les émulateurs.
 
 ## Remplace Biblijeu sur Linux
