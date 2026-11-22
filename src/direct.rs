@@ -15,6 +15,7 @@ pub struct LocalGame { pub id: u32, pub name: String, pub exe: String, pub optio
 pub struct Played { pub minutes: u32, pub last: u64 }
 
 const UNIT: &str = "minimalsteam-game-";
+pub const DEFAULT_TOOL: &str = "proton_experimental";
 const OFFICIAL: [(u32, &str); 5] = [(1493710, "proton_experimental"), (2180100, "proton_hotfix"), (4628710, "proton_11"), (3658110, "proton_10"), (2805730, "proton_9")];
 
 extern "C" { fn getuid() -> u32; }
@@ -72,6 +73,16 @@ fn prefix(a: &Account, id: u32) -> Result<PathBuf, String> {
     Ok(at(&a.root))
 }
 
+fn script_prefix_version(script: &str) -> Option<&str> {
+    script.lines().find_map(|l| l.strip_prefix("CURRENT_PREFIX_VERSION=")).map(|v| v.trim().trim_matches('"'))
+}
+
+/// Sans version choisie, Experimental ne doit pas convertir un préfixe existant.
+fn same_prefix_version(pfx: &Path, proton: &Path) -> bool {
+    let Ok(old) = std::fs::read_to_string(pfx.join("version")) else { return !pfx.join("pfx").is_dir() };
+    std::fs::read_to_string(proton.join("proton")).is_ok_and(|s| script_prefix_version(&s) == Some(old.trim()))
+}
+
 /// Applique les options de lancement au format Steam (`VAR=1 %command% -arg`).
 fn script(options: &str) -> String {
     let o = options.trim();
@@ -93,10 +104,19 @@ pub fn launch(a: &Account, g: &Game) -> Result<bool, String> {
     if !exe.is_file() { return Err(format!("Programme introuvable : {}", g.exe)); }
     let dir = g.folder.clone().filter(|d| d.is_dir()).or_else(|| exe.parent().map(Path::to_path_buf));
     let mut c = if is_windows(&g.exe) {
-        let Some(tool) = g.compat.clone().or_else(|| steam::compat_map(&a.root).remove(&0)) else { return Ok(false) };
-        let Some(proton) = proton_dir(a, &tool) else { return Ok(false) };
         if !steam::in_path("umu-run") { return Ok(false); }
+        let chosen = g.compat.clone().or_else(|| steam::compat_map(&a.root).remove(&0));
+        let by_default = chosen.is_none();
+        let tool = chosen.unwrap_or_else(|| DEFAULT_TOOL.to_string());
+        let Some(proton) = proton_dir(a, &tool) else {
+            if by_default { return Ok(false); }
+            // Steam le retéléchargerait sans prévenir, et un autre Proton convertirait le préfixe.
+            return Err(format!("La version de Proton de ce jeu ({tool}) n'est plus installée : choisis-en une autre dans Compatibilité."));
+        };
         let pfx = prefix(a, g.id)?;
+        if by_default && !same_prefix_version(&pfx, &proton) {
+            return Err("Ce préfixe vient d'une autre version de Proton : choisis sa version dans Compatibilité.".into());
+        }
         // Un vrai dossier `pfx`, comme Steam : sans lui, umu-run en fait un lien vers `.`.
         std::fs::create_dir_all(pfx.join("pfx")).map_err(|e| format!("Préfixe impossible à créer : {e}"))?;
         let mut c = scoped(g.id, &g.options, &["umu-run", &g.exe]);
@@ -123,6 +143,22 @@ mod tests {
         assert_eq!(script(""), "exec \"$@\"");
         assert_eq!(script("A=1 %command% -w"), "A=1 \"$@\" -w");
         assert_eq!(script("-windowed"), "\"$@\" -windowed");
+    }
+
+    #[test]
+    fn default_proton_keeps_existing_prefixes() {
+        assert_eq!(script_prefix_version("#!/usr/bin/python\nCURRENT_PREFIX_VERSION=\"11.0-100\"\n"), Some("11.0-100"));
+        let d = std::env::temp_dir().join(format!("minimalsteam-version-{}", std::process::id()));
+        let (pfx, proton) = (d.join("p"), d.join("t"));
+        std::fs::create_dir_all(&pfx).unwrap();
+        std::fs::create_dir_all(&proton).unwrap();
+        std::fs::write(proton.join("proton"), "CURRENT_PREFIX_VERSION=\"11.0-100\"\n").unwrap();
+        assert!(same_prefix_version(&pfx, &proton));
+        std::fs::write(pfx.join("version"), "11.0-100\n").unwrap();
+        assert!(same_prefix_version(&pfx, &proton));
+        std::fs::write(pfx.join("version"), "10.1000-105\n").unwrap();
+        assert!(!same_prefix_version(&pfx, &proton));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

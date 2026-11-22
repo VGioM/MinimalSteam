@@ -1385,7 +1385,8 @@ impl App {
         let favorite = self.is_favorite(g.id);
         let running = self.running.contains(&g.id);
         let chosen = self.compat_edit.as_ref().filter(|e| e.0 == g.id).map_or_else(|| g.compat.clone(), |e| e.1.clone());
-        let default_label = if g.steam { "Par défaut de Steam" } else { "Aucune (jeu Linux)" };
+        let default_label = if g.steam { "Par défaut de Steam" } else if direct::is_windows(&g.exe) { "Proton Experimental (par défaut)" } else { "Aucune (jeu Linux)" };
+        let proton_gone = !g.steam && g.compat.as_ref().is_some_and(|k| !self.tools.iter().any(|t| &t.0 == k));
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
         let (mut stop, mut open_dir, mut via_toggle, mut remove_local, mut sync_one) = (false, false, false, false, false);
@@ -1502,6 +1503,10 @@ impl App {
                         if let Some(k) = g.compat.as_ref().filter(|k| !self.tools.iter().any(|t| &t.0 == *k)) { ui.selectable_value(&mut pick, Some(k.clone()), k); }
                     });
                 });
+                if proton_gone && chosen == g.compat {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new("Cette version de Proton n'est plus installée. Choisis-en une autre pour lancer le jeu.").size(13.0).color(GOLD)).wrap());
+                }
                 if pick != chosen { compat_pick = Some(pick); }
                 if chosen != g.compat {
                     ui.add_space(4.0);

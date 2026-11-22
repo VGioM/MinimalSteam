@@ -83,7 +83,7 @@ La manette est ignorée quand la fenêtre n'a pas le focus ou qu'un jeu tourne.
 
 Les **jeux Steam** passent toujours par Steam, nécessaire pour les DRM, Steam Cloud et les succès. S'il est fermé, MinimalSteam le démarre sans fenêtre.
 
-Les **jeux non-Steam** se lancent directement, avec la version de Proton, le préfixe et les options de lancement réglés pour eux. Sans Steam, ils n'ont ni overlay ni Steam Input, et un anti-triche peut les bloquer : coche **Lancer via Steam** sur leur fiche dans ce cas.
+Les **jeux non-Steam** se lancent directement, avec la version de Proton, le préfixe et les options de lancement réglés pour eux. Sans version choisie, ils utilisent Proton Experimental. Si leur version de Proton a été désinstallée, l'app te prévient au lieu de lancer le jeu avec une autre. Sans Steam, ils n'ont ni overlay ni Steam Input, et un anti-triche peut les bloquer : coche **Lancer via Steam** sur leur fiche dans ce cas.
 
 L'app ne modifie les fichiers de Steam que pour ajouter un jeu ou appliquer une icône :
 
