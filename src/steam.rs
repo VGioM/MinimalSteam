@@ -119,6 +119,7 @@ impl Account {
     pub fn watched(&self) -> Vec<PathBuf> {
         let mut w = vec![self.shortcuts(), self.localconfig(), self.root.join("steamapps/libraryfolders.vdf")];
         w.extend(libraries(&self.root).into_iter().map(|l| l.join("steamapps")));
+        w.push(self.config().join("cloudstorage/cloud-storage-namespace-1.json"));
         w
     }
 }
@@ -419,6 +420,12 @@ fn new_entry(id: u32, name: &str, exe: &str, dir: &str, options: &str, icon: &st
 /// Ajoute des raccourcis à shortcuts.vdf (ceux déjà présents sont ignorés) et rend
 /// les identifiants ajoutés.
 pub fn add_shortcuts_to(path: &Path, games: &[NewGame]) -> Result<Vec<u32>, String> {
+    let list: Vec<(u32, NewGame)> = games.iter().map(|g| (new_id(&g.name, &g.exe), g.clone())).collect();
+    insert_shortcuts(path, &list)
+}
+
+/// Écrit les raccourcis avec l'identifiant donné : un programme renommé garde le sien.
+fn insert_shortcuts(path: &Path, games: &[(u32, NewGame)]) -> Result<Vec<u32>, String> {
     let (mut root, end) = match std::fs::read(path) {
         Ok(data) => {
             let (root, end) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
@@ -430,8 +437,8 @@ pub fn add_shortcuts_to(path: &Path, games: &[NewGame]) -> Result<Vec<u32>, Stri
     };
     let list = root.as_map_mut().and_then(|m| m.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"shortcuts"))).and_then(|(_, v)| v.as_map_mut()).ok_or("shortcuts.vdf ne contient pas de raccourcis.")?;
     let mut added = Vec::new();
-    for g in games {
-        let id = new_id(&g.name, &g.exe);
+    for (id, g) in games {
+        let id = *id;
         if list.iter().any(|(_, v)| shortcut_id(v) == Some(id)) { continue; }
         let dir = Path::new(&g.exe).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
         let index = list.iter().filter_map(|(k, _)| std::str::from_utf8(k).ok()?.parse::<u32>().ok()).max().map_or(0, |n| n + 1);
@@ -797,13 +804,15 @@ fn with_steam_closed<T>(a: &Account, work: impl FnOnce() -> Result<T, String>) -
 
 /// Ce qui attend que Steam puisse être fermé.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)>, pub names: Vec<(u32, String)> }
+pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)>, pub names: Vec<(u32, String)>, /// Programmes hors Steam à y ajouter, et s'ils vont dans la collection.
+    pub sync: Vec<(crate::direct::LocalGame, bool)>, /// Jeux à mettre dans la collection (true) ou à en retirer (false).
+    pub collection: Vec<(u32, bool)> }
 
 impl Queue {
-    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() }
-    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() }
+    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() && self.sync.is_empty() && self.collection.is_empty() }
+    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() + self.sync.len() + self.collection.len() }
     /// Une icône seule ne vaut pas un redémarrage de Steam.
-    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() }
+    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() || !self.sync.is_empty() || !self.collection.is_empty() }
 }
 
 fn shortcut_ids(path: &Path) -> Result<HashSet<u32>, String> {
@@ -817,7 +826,7 @@ fn shortcut_ids(path: &Path) -> Result<HashSet<u32>, String> {
 }
 
 /// Écrit la file. Rejouer une file déjà écrite ne change rien.
-fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<(), String> {
+fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<Option<String>, String> {
     let existing = shortcut_ids(shortcuts)?;
     let new: Vec<NewGame> = q.games.iter().filter(|g| !existing.contains(&new_id(&g.name, &g.exe))).cloned().collect();
     if !new.is_empty() { add_shortcuts_to(shortcuts, &new)?; }
@@ -825,10 +834,62 @@ fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<(), String>
     for (id, tool) in &q.compat { set_compat(config, *id, tool.as_deref())?; }
     if !q.names.is_empty() && shortcuts.exists() { write_names_to(shortcuts, &q.names)?; }
     if !q.icons.is_empty() && shortcuts.exists() { write_icons_to(shortcuts, &q.icons)?; }
-    Ok(())
+    let present = shortcut_ids(shortcuts)?;
+    let missing: Vec<(u32, NewGame)> = q.sync.iter().filter(|(l, _)| !present.contains(&l.id)).map(|(l, _)| (l.id, NewGame { name: l.name.clone(), exe: l.exe.clone(), options: l.options.clone(), tool: None, icon: l.icon.clone() })).collect();
+    if !missing.is_empty() { insert_shortcuts(shortcuts, &missing)?; }
+    let remove: Vec<u32> = q.collection.iter().filter(|(_, on)| !*on).map(|(i, _)| *i).collect();
+    let add: Vec<u32> = q.sync.iter().filter(|(_, c)| *c).map(|(l, _)| l.id).chain(q.collection.iter().filter(|(_, on)| *on).map(|(i, _)| *i)).filter(|i| !remove.contains(i)).collect();
+    // Le reste est déjà dans Steam : une collection impossible à écrire ne doit pas bloquer la file.
+    let warning = if add.is_empty() && remove.is_empty() { None } else {
+        shortcuts.parent().map(|d| d.join("cloudstorage")).and_then(|d| update_collection(&d, &add, &remove).err())
+    };
+    Ok(warning)
 }
 
-pub fn apply_queue(a: &Account, q: &Queue) -> Result<(), String> {
+const COLLECTION_ID: &str = "ms-minimalsteam";
+
+/// Les jeux rangés dans la collection MinimalSteam.
+pub fn collection_ids(a: &Account) -> HashSet<u32> {
+    use serde_json::Value;
+    let key = format!("user-collections.{COLLECTION_ID}");
+    let Some(root) = std::fs::read(a.config().join("cloudstorage/cloud-storage-namespace-1.json")).ok().and_then(|d| serde_json::from_slice::<Value>(&d).ok()) else { return HashSet::new() };
+    let entry = root.as_array().and_then(|l| l.iter().find(|e| e.get(0).and_then(Value::as_str) == Some(key.as_str())));
+    let value = entry.filter(|e| !e[1].get("is_deleted").and_then(Value::as_bool).unwrap_or(false)).and_then(|e| e[1].get("value")?.as_str()).and_then(|v| serde_json::from_str::<Value>(v).ok());
+    value.and_then(|v| v.get("added")?.as_array().map(|l| l.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect())).unwrap_or_default()
+}
+
+/// Ajoute et retire des jeux de la collection MinimalSteam, au format de Steam.
+fn update_collection(dir: &Path, ids: &[u32], remove: &[u32]) -> Result<(), String> {
+    use serde_json::{json, Value};
+    let key = format!("user-collections.{COLLECTION_ID}");
+    let (path, modified) = (dir.join("cloud-storage-namespace-1.json"), dir.join("cloud-storage-namespace-1.modified.json"));
+    let fail = || "Steam est à jour, mais la collection MinimalSteam n'a pas pu être écrite.".to_string();
+    let mut root: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|_| fail())?).map_err(|_| fail())?;
+    let list = root.as_array_mut().ok_or_else(fail)?;
+    let pos = list.iter().position(|e| e.get(0).and_then(Value::as_str) == Some(key.as_str()));
+    let old = pos.map(|i| list[i][1].clone());
+    let live = old.as_ref().filter(|o| !o.get("is_deleted").and_then(Value::as_bool).unwrap_or(false));
+    // Rien à retirer d'une collection qui n'existe pas.
+    if ids.is_empty() && live.is_none() { return Ok(()); }
+    let mut value: Value = live.and_then(|o| o.get("value")?.as_str()).and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_else(|| json!({ "id": COLLECTION_ID, "name": "MinimalSteam", "added": [], "removed": [] }));
+    let added = value.get_mut("added").and_then(Value::as_array_mut).ok_or_else(fail)?;
+    for id in ids { if !added.iter().any(|x| x.as_u64() == Some(*id as u64)) { added.push(json!(id)); } }
+    added.retain(|x| !x.as_u64().is_some_and(|n| remove.iter().any(|i| *i as u64 == n)));
+    if let Some(r) = value.get_mut("removed").and_then(Value::as_array_mut) { r.retain(|x| !x.as_u64().is_some_and(|n| ids.iter().any(|i| *i as u64 == n))); }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let version = old.as_ref().and_then(|o| o.get("version")).cloned().unwrap_or_else(|| json!("0"));
+    let entry = json!([key, { "key": key, "timestamp": now, "value": value.to_string(), "version": version }]);
+    match pos { Some(i) => list[i] = entry, None => list.push(entry) }
+    backup(&path).map_err(|_| fail())?;
+    write_atomic(&path, serde_json::to_string(&root).map_err(|_| fail())?.as_bytes()).map_err(|_| fail())?;
+    // Signale le changement à Steam pour qu'il l'envoie à ses serveurs.
+    let mut changed: Vec<Value> = std::fs::read(&modified).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
+    if !changed.iter().any(|k| k.as_str() == Some(key.as_str())) { changed.push(json!(key)); }
+    write_atomic(&modified, serde_json::to_string(&changed).map_err(|_| fail())?.as_bytes()).map_err(|_| fail())
+}
+
+pub fn apply_queue(a: &Account, q: &Queue) -> Result<Option<String>, String> {
     with_steam_closed(a, || write_queue(&a.shortcuts(), &a.steam_config(), q))
 }
 
@@ -890,6 +951,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn collection_keeps_other_entries_and_can_be_replayed() {
+        let d = temp("collection");
+        let other = serde_json::json!([["user-collections.favorite", {"key": "user-collections.favorite", "timestamp": 1, "value": "{\"id\":\"favorite\",\"name\":\"Favoris\",\"added\":[730],\"removed\":[]}", "version": "12"}]]);
+        std::fs::write(d.join("cloud-storage-namespace-1.json"), other.to_string()).unwrap();
+        std::fs::write(d.join("cloud-storage-namespace-1.modified.json"), "[]").unwrap();
+        update_collection(&d, &[], &[5]).unwrap();
+        assert!(!d.join("cloud-storage-namespace-1.json.minimalsteam-sauvegarde").exists());
+        update_collection(&d, &[2897399556, 7], &[]).unwrap();
+        update_collection(&d, &[2897399556, 42], &[7]).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(d.join("cloud-storage-namespace-1.json")).unwrap()).unwrap();
+        let l = v.as_array().unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0], other[0]);
+        let c: serde_json::Value = serde_json::from_str(l[1][1]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(c["name"], "MinimalSteam");
+        assert_eq!(c["added"], serde_json::json!([2897399556u32, 42]));
+        let m: Vec<String> = serde_json::from_slice(&std::fs::read(d.join("cloud-storage-namespace-1.modified.json")).unwrap()).unwrap();
+        assert_eq!(m, vec!["user-collections.ms-minimalsteam"]);
+        assert!(d.join("cloud-storage-namespace-1.json.minimalsteam-sauvegarde").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn synced_program_keeps_its_id() {
+        let d = temp("sync");
+        let (p, c) = (d.join("shortcuts.vdf"), d.join("config.vdf"));
+        let l = crate::direct::LocalGame { id: 2897399556, name: "Nouveau nom".into(), exe: "/j/Recomp.appimage".into(), options: String::new(), icon: String::new() };
+        let q = Queue { sync: vec![(l, false)], ..Default::default() };
+        assert_eq!(write_queue(&p, &c, &q).unwrap(), None);
+        write_queue(&p, &c, &q).unwrap();
+        assert_eq!(shortcut_ids(&p).unwrap(), HashSet::from([2897399556]));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1057,7 +1153,7 @@ mod tests {
         std::fs::write(&c, "\"CompatToolMapping\"\n{\n\t\"10\"\n\t{\n\t\t\"name\"\t\t\"old\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}\n}\n").unwrap();
         let g = NewGame { name: "Jeu".into(), exe: "/j/jeu.exe".into(), options: String::new(), tool: Some("proton_11".into()), icon: String::new() };
         let id = new_id(&g.name, &g.exe);
-        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![] };
+        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![], sync: vec![], collection: vec![] };
         write_queue(&s, &c, &q).unwrap();
         write_queue(&s, &c, &q).unwrap();
         let (v, _) = vdf::parse_file(&std::fs::read(&s).unwrap()).unwrap();

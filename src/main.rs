@@ -19,6 +19,7 @@ mod scan;
 #[allow(dead_code)]
 mod sgdb;
 mod selfupdate;
+mod single;
 mod steam;
 mod vdf;
 
@@ -167,6 +168,11 @@ struct Config {
     pending_compat: HashMap<String, Vec<(u32, Option<String>)>>,
     pending_names: HashMap<String, Vec<(u32, String)>>,
     local_games: Vec<direct::LocalGame>,
+    /// Programmes à ajouter à Steam (id, dans la collection MinimalSteam).
+    pending_sync: HashMap<String, Vec<(u32, bool)>>,
+    steam_collection: bool,
+    /// Jeux à mettre dans la collection ou à en retirer.
+    pending_collection: HashMap<String, Vec<(u32, bool)>>,
     played: HashMap<u32, direct::Played>,
     /// Jeux non-Steam à lancer quand même par Steam (compte:id).
     via_steam: HashSet<String>,
@@ -321,7 +327,7 @@ enum Msg {
     BackSaved(Zone, Result<PathBuf, String>),
     Progress(String),
     Queued(Vec<steam::NewGame>),
-    QueueDone { applied: steam::Queue, result: Result<(), String> },
+    QueueDone { applied: steam::Queue, result: Result<Option<String>, String> },
 }
 
 struct Row { on: bool, exists: bool, name: String, exe: String, options: String, windows: bool }
@@ -374,6 +380,9 @@ struct App {
     sessions: HashMap<u32, u64>,
     steam_key_input: String,
     owned_busy: bool,
+    /// Programmes décochés dans la liste d'ajout à Steam.
+    sync_off: HashSet<u32>,
+    in_collection: HashSet<u32>,
     launched: HashMap<u32, Instant>,
     stopping: HashMap<u32, Instant>,
     stop_confirm: Option<(u32, Instant)>,
@@ -435,7 +444,7 @@ impl App {
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.track_direct(direct_now);
         if std::env::var_os("APP_SCREENSHOT").is_some() {
@@ -556,9 +565,46 @@ impl App {
         self.spawn(ctx, move || { let r = owned::fetch(&key, &id); Msg::Owned(id, r) });
     }
 
+    /// Ce qui n'est pas encore dans la bibliothèque Steam de ce compte.
+    fn unsynced(&self) -> Vec<u32> {
+        let waiting = self.acc().and_then(|a| self.cfg.pending_sync.get(&a.id));
+        self.games.iter().filter(|g| g.local && !waiting.is_some_and(|l| l.iter().any(|(i, _)| *i == g.id))).map(|g| g.id).collect()
+    }
+
+    /// Ce que la collection sera une fois la file appliquée.
+    fn wants_collection(&self, id: u32) -> bool {
+        self.acc().and_then(|a| self.cfg.pending_collection.get(&a.id)).and_then(|l| l.iter().find(|(i, _)| *i == id)).map_or_else(|| self.in_collection.contains(&id), |x| x.1)
+    }
+
+    /// Passe par la file : plusieurs changements de suite ne redémarrent Steam qu'une fois.
+    fn toggle_collection(&mut self, id: u32) {
+        let want = !self.wants_collection(id);
+        let already = self.in_collection.contains(&id);
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        let list = self.cfg.pending_collection.entry(account.clone()).or_default();
+        list.retain(|(i, _)| *i != id);
+        if want != already { list.push((id, want)); }
+        if list.is_empty() { self.cfg.pending_collection.remove(&account); }
+        self.hold = false;
+        self.cfg.save();
+    }
+
+    fn queue_sync(&mut self, ctx: &egui::Context, ids: Vec<u32>) {
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        if ids.is_empty() { return; }
+        let grouped = self.cfg.steam_collection;
+        let list = self.cfg.pending_sync.entry(account).or_default();
+        for id in ids { list.retain(|(i, _)| *i != id); list.push((id, grouped)); }
+        self.cfg.save();
+        if self.game_active() { self.set_status("Ajout à Steam en attente : appliqué à la fermeture du jeu.", false); }
+        else { self.apply_queue(ctx); }
+    }
+
     fn remove_local(&mut self, ctx: &egui::Context, id: u32) {
         if self.running.contains(&id) { self.set_status("Ferme-le d'abord.", false); return; }
         self.cfg.local_games.retain(|l| l.id != id);
+        for l in self.cfg.pending_sync.values_mut() { l.retain(|(i, _)| *i != id); }
+        self.cfg.pending_sync.retain(|_, l| !l.is_empty());
         self.cfg.save();
         self.selected = None;
         self.set_status("Retiré de MinimalSteam. Le fichier n'a pas été touché.", false);
@@ -716,15 +762,17 @@ impl App {
                     self.busy = None;
                     self.countdown = None;
                     match result {
-                        Ok(()) => {
+                        Ok(warning) => {
                             if let Some(id) = self.acc().map(|a| a.id.clone()) {
+                                if let Some(l) = self.cfg.pending_collection.get_mut(&id) { l.retain(|x| !applied.collection.contains(x)); if l.is_empty() { self.cfg.pending_collection.remove(&id); } }
+                                if let Some(l) = self.cfg.pending_sync.get_mut(&id) { l.retain(|(i, _)| !applied.sync.iter().any(|(x, _)| x.id == *i)); if l.is_empty() { self.cfg.pending_sync.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_games.get_mut(&id) { l.retain(|x| !applied.games.contains(x)); if l.is_empty() { self.cfg.pending_games.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_compat.get_mut(&id) { l.retain(|x| !applied.compat.contains(x)); if l.is_empty() { self.cfg.pending_compat.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_icons.get_mut(&id) { l.retain(|x| !applied.icons.contains(x)); if l.is_empty() { self.cfg.pending_icons.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_names.get_mut(&id) { l.retain(|x| !applied.names.contains(x)); if l.is_empty() { self.cfg.pending_names.remove(&id); } }
                                 self.cfg.save();
                             }
-                            self.set_status("Changements enregistrés dans Steam.", false);
+                            match warning { Some(w) => self.set_status(w, true), None => self.set_status("Changements enregistrés dans Steam.", false) }
                         }
                         // Pas de nouvel essai automatique avant la fin de la prochaine partie.
                         Err(e) => { self.hold = true; self.set_status(e, true); }
@@ -768,6 +816,8 @@ impl App {
             compat: self.cfg.pending_compat.get(id).cloned().unwrap_or_default(),
             icons: self.pending(),
             names: self.cfg.pending_names.get(id).cloned().unwrap_or_default(),
+            collection: self.cfg.pending_collection.get(id).cloned().unwrap_or_default(),
+            sync: self.cfg.pending_sync.get(id).into_iter().flatten().filter_map(|(i, c)| Some((self.cfg.local_games.iter().find(|l| l.id == *i)?.clone(), *c))).collect(),
         }
     }
 
@@ -777,6 +827,7 @@ impl App {
     /// Montre dans la bibliothèque ce qui n'est pas encore écrit dans Steam.
     fn merge_queue(&mut self) {
         let Some(a) = self.acc().cloned() else { return };
+        self.in_collection = steam::collection_ids(&a);
         let q = self.queue();
         for (id, tool) in &q.compat {
             if let Some(g) = self.games.iter_mut().find(|g| g.id == *id) { g.compat = tool.clone(); g.compat_queued = true; }
@@ -828,6 +879,8 @@ impl App {
             return;
         }
         let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        // Un programme synchronisé garde ce nom s'il est retiré de Steam plus tard.
+        if let Some(l) = self.cfg.local_games.iter_mut().find(|l| l.id == g.id) { l.name = name.clone(); }
         let list = self.cfg.pending_names.entry(account).or_default();
         list.retain(|(i, _)| *i != g.id);
         list.push((g.id, name.clone()));
@@ -1332,7 +1385,10 @@ impl App {
         let default_label = if g.steam { "Par défaut de Steam" } else { "Aucune (jeu Linux)" };
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
-        let (mut stop, mut open_dir, mut via_toggle, mut remove_local) = (false, false, false, false);
+        let (mut stop, mut open_dir, mut via_toggle, mut remove_local, mut sync_one) = (false, false, false, false, false);
+        let (collection_on, mut collection_toggle) = (self.wants_collection(g.id), false);
+        let collection_waiting = collection_on != self.in_collection.contains(&g.id);
+        let sync_waiting = self.acc().and_then(|a| self.cfg.pending_sync.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
         let via_key = gkey(self.acc().map_or("", |a| a.id.as_str()), g.id);
         let (mut rename_open, mut rename_save, mut rename_cancel, mut name_undo) = (false, false, false, false);
         let name_queued = self.acc().and_then(|a| self.cfg.pending_names.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
@@ -1467,8 +1523,22 @@ impl App {
                     cancel_add = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler l'ajout")).clicked();
                 }
                 ui.add_space(10.0);
+                if g.installed && !g.local && !g.pending {
+                    let mut on = collection_on;
+                    if ui.checkbox(&mut on, "Dans la collection MinimalSteam").on_hover_text("Range ce jeu dans la collection MinimalSteam de Steam, ou l'en retire. Le jeu reste dans ta bibliothèque.").changed() { collection_toggle = true; }
+                    if collection_waiting { ui.colored_label(GOLD, "Changement de collection en attente."); }
+                    ui.add_space(6.0);
+                }
                 if g.installed { edit = ui.add(egui::Button::new("Modifier les images").min_size(egui::vec2(310.0, 36.0))).clicked(); }
                 if g.local {
+                    ui.add_space(6.0);
+                    if sync_waiting {
+                        ui.colored_label(GOLD, "Ajout à Steam en attente.");
+                    } else {
+                        let label = if game_running { "Ajouter à Steam (à la fermeture du jeu)" } else if steam_on { "Ajouter à Steam (redémarre Steam)" } else { "Ajouter à Steam" };
+                        sync_one = ui.add_enabled(busy.is_none(), egui::Button::new(label).min_size(egui::vec2(310.0, 36.0))).clicked();
+                        if ui.checkbox(&mut self.cfg.steam_collection, "Dans une collection MinimalSteam").on_hover_text("Décoché, le jeu arrive dans ta bibliothèque Steam sans collection.").changed() { self.dirty = true; }
+                    }
                     ui.add_space(6.0);
                     remove_local = ui.add(egui::Button::new("Retirer de MinimalSteam").min_size(egui::vec2(310.0, 36.0))).on_hover_text("Le fichier reste sur le disque.").clicked();
                 }
@@ -1511,6 +1581,8 @@ impl App {
             self.cfg.save();
         }
         if remove_local { self.remove_local(ctx, g.id); return; }
+        if sync_one { self.queue_sync(ctx, vec![g.id]); }
+        if collection_toggle { self.toggle_collection(g.id); }
         if play { self.launch(g.id); }
         if stop { self.request_stop(g.id, &g.name); }
         if fav { self.toggle_favorite(g.id); }
@@ -1751,6 +1823,9 @@ impl App {
         let mut account = None;
         let (mut save, mut pick_image, mut changed, mut pick_sgdb, mut close, mut need_fonts) = (false, None, false, None, false, false);
         let mut save_steam = false;
+        let mut sync_all = false;
+        let to_sync = self.unsynced();
+        let sync_rows: Vec<(u32, String)> = to_sync.iter().filter_map(|i| Some((*i, self.game(*i)?.name.clone()))).collect();
         let screen = ctx.screen_rect();
         let demo = self.hook.demo;
         let width = (screen.width() - 80.0).clamp(640.0, 760.0);
@@ -1900,6 +1975,25 @@ impl App {
                                     step(ui, "Steam peut refuser la clé à un compte limité (moins de 5 $ dépensés). Garde-la pour toi : elle reste sur ce PC.");
                                 });
                                 ui.add_space(12.0);
+                                field(ui, "Synchroniser avec Steam");
+                                let text = match to_sync.len() { 0 => "Tous tes programmes hors Steam sont déjà dans Steam.".to_string(), 1 => "1 programme (AppImage ou .sh) n'est que dans MinimalSteam.".to_string(), n => format!("{n} programmes (AppImage ou .sh) ne sont que dans MinimalSteam.") };
+                                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(pal().muted)).wrap());
+                                if ui.checkbox(&mut self.cfg.steam_collection, "Les ranger dans une collection MinimalSteam").on_hover_text("Décoché, ils arrivent dans ta bibliothèque Steam sans collection.").changed() { self.dirty = true; }
+                                if sync_rows.len() > 1 {
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Tout cocher").clicked() { self.sync_off.clear(); }
+                                        if ui.button("Tout décocher").clicked() { self.sync_off.extend(to_sync.iter().copied()); }
+                                    });
+                                }
+                                for (id, name) in &sync_rows {
+                                    let mut on = !self.sync_off.contains(id);
+                                    if ui.checkbox(&mut on, name).changed() { if on { self.sync_off.remove(id); } else { self.sync_off.insert(*id); } }
+                                }
+                                let chosen = to_sync.iter().filter(|i| !self.sync_off.contains(i)).count();
+                                let what = match chosen { 0 | 1 => "Ajouter à Steam".to_string(), n => format!("Ajouter ces {n} programmes à Steam") };
+                                let label = if self.game_active() { format!("{what} (à la fermeture du jeu)") } else if self.steam_on { format!("{what} (redémarre Steam)") } else { what };
+                                sync_all = ui.add_enabled(chosen > 0 && self.busy.is_none(), egui::Button::new(label)).clicked();
+                                ui.add_space(12.0);
                                 let (c, s) = if self.steam_on { (OK, "Steam est ouvert en arrière-plan.") } else { (pal().muted, "Steam est fermé : il démarrera sans fenêtre au lancement d'un jeu.") };
                                 ui.colored_label(c, s);
                                 ui.add_space(12.0);
@@ -1942,6 +2036,10 @@ impl App {
             self.cfg.api_key = self.key_input.trim().to_string();
             self.cfg.save();
             self.set_status("Clé enregistrée.", false);
+        }
+        if sync_all {
+            let chosen: Vec<u32> = to_sync.into_iter().filter(|i| !self.sync_off.contains(i)).collect();
+            self.queue_sync(ctx, chosen);
         }
         if save_steam {
             self.cfg.steam_key = self.steam_key_input.trim().to_string();
@@ -2379,6 +2477,10 @@ impl TestHook {
 }
 
 fn main() -> eframe::Result {
+    // Les captures de test tournent à côté de la vraie fenêtre.
+    let instance = if std::env::var_os("APP_SCREENSHOT").is_some() { None } else {
+        match single::acquire() { single::Start::AlreadyOpen => return Ok(()), single::Start::Run(l) => l }
+    };
     let icon_png = include_bytes!("../resources/icon.png");
     let app_id = if std::env::var_os("APP_SCREENSHOT").is_none() {
         desktop::ensure(&desktop::Entry { app_id: "minimalsteam", name: "MinimalSteam", comment: "Un lanceur épuré pour les jeux Steam et non-Steam", categories: "Game;", icon_png })
@@ -2391,5 +2493,5 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id(app_id).with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 560.0]).with_transparent(false);
     if let Some(i) = icon { viewport = viewport.with_icon(i); }
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, vsync: true, ..Default::default() };
-    eframe::run_native("MinimalSteam", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("MinimalSteam", options, Box::new(move |cc| { single::listen(instance, cc.egui_ctx.clone()); Ok(Box::new(App::new(cc))) }))
 }
