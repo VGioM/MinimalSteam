@@ -802,6 +802,9 @@ impl App {
 
     fn queue_icon(&mut self, ctx: &egui::Context, id: u32, path: String) {
         let Some(a) = self.acc().cloned() else { return };
+        // Un programme hors Steam garde son icône : elle partira avec lui s'il y est ajouté.
+        if let Some(l) = self.cfg.local_games.iter_mut().find(|l| l.id == id) { l.icon = path.clone(); }
+        if self.game(id).is_some_and(|g| g.local) { self.cfg.save(); self.reload(ctx); return; }
         let list = self.cfg.pending_icons.entry(a.id.clone()).or_default();
         list.retain(|(i, _)| *i != id);
         list.push((id, path));

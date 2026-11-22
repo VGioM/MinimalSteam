@@ -833,10 +833,11 @@ fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<Option<Stri
     for g in &q.games { if let Some(t) = g.tool.as_deref() { set_compat(config, new_id(&g.name, &g.exe), Some(t))?; } }
     for (id, tool) in &q.compat { set_compat(config, *id, tool.as_deref())?; }
     if !q.names.is_empty() && shortcuts.exists() { write_names_to(shortcuts, &q.names)?; }
-    if !q.icons.is_empty() && shortcuts.exists() { write_icons_to(shortcuts, &q.icons)?; }
     let present = shortcut_ids(shortcuts)?;
     let missing: Vec<(u32, NewGame)> = q.sync.iter().filter(|(l, _)| !present.contains(&l.id)).map(|(l, _)| (l.id, NewGame { name: l.name.clone(), exe: l.exe.clone(), options: l.options.clone(), tool: None, icon: l.icon.clone() })).collect();
     if !missing.is_empty() { insert_shortcuts(shortcuts, &missing)?; }
+    // Après les ajouts, pour que l'icône d'un programme tout juste synchronisé soit écrite.
+    if !q.icons.is_empty() && shortcuts.exists() { write_icons_to(shortcuts, &q.icons)?; }
     let remove: Vec<u32> = q.collection.iter().filter(|(_, on)| !*on).map(|(i, _)| *i).collect();
     let add: Vec<u32> = q.sync.iter().filter(|(_, c)| *c).map(|(l, _)| l.id).chain(q.collection.iter().filter(|(_, on)| *on).map(|(i, _)| *i)).filter(|i| !remove.contains(i)).collect();
     // Le reste est déjà dans Steam : une collection impossible à écrire ne doit pas bloquer la file.
@@ -985,6 +986,20 @@ mod tests {
         assert_eq!(write_queue(&p, &c, &q).unwrap(), None);
         write_queue(&p, &c, &q).unwrap();
         assert_eq!(shortcut_ids(&p).unwrap(), HashSet::from([2897399556]));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn synced_program_gets_its_icons() {
+        let d = temp("sync-icon");
+        let (p, c) = (d.join("shortcuts.vdf"), d.join("config.vdf"));
+        let l = |icon: &str| crate::direct::LocalGame { id: 2897399556, name: "Recomp".into(), exe: "/j/Recomp.appimage".into(), options: String::new(), icon: icon.into() };
+        let icon_of = || { let (v, _) = vdf::parse_file(&std::fs::read(&p).unwrap()).unwrap(); v.get("shortcuts").unwrap().get("0").unwrap().str("icon") };
+        write_queue(&p, &c, &Queue { sync: vec![(l("/i/garde.png"), false)], ..Default::default() }).unwrap();
+        assert_eq!(icon_of().as_deref(), Some("/i/garde.png"));
+        let _ = std::fs::remove_file(&p);
+        write_queue(&p, &c, &Queue { sync: vec![(l(""), false)], icons: vec![(2897399556, "/i/file.png".into())], ..Default::default() }).unwrap();
+        assert_eq!(icon_of().as_deref(), Some("/i/file.png"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
