@@ -300,7 +300,7 @@ pub fn load_games(a: &Account) -> Result<Vec<Game>, String> {
             let Some(kv) = read_kv(&e.path()) else { continue };
             let Some(m) = kv.get("AppState") else { continue };
             let Some(name) = m.str("name") else { continue };
-            if is_tool(id, name) { continue; }
+            if !crate::appinfo::is_placeholder(name, id) && is_tool(id, name) { continue; }
             let flags: u32 = m.str("StateFlags").and_then(|s| s.parse().ok()).unwrap_or(0);
             if flags & 4 == 0 { continue; }
             let s = st.get(&id).copied().unwrap_or_default();
@@ -310,6 +310,13 @@ pub fn load_games(a: &Account) -> Result<Vec<Game>, String> {
             let art = Kind::ALL.map(|k| grid_art(a, id, k).or_else(|| pick_cache(&cached, k)));
             games.push(Game { id, name: name.to_string(), steam: true, exe: String::new(), icon: String::new(), size: m.str("SizeOnDisk").and_then(|s| s.parse().ok()), disk: disk_label(&a.root, &lib), last_played: s.last, playtime: s.time, recent: s.recent, last_launch, last_session, updated: m.str("LastUpdated").and_then(|s| s.parse().ok()).unwrap_or(0), folder, compat: compat.get(&id).cloned(), pending: false, compat_queued: false, art, options: String::new(), local: false, installed: true, remote: None });
         }
+    }
+    // Steam laisse parfois « appid_730 » comme nom : le vrai est dans son cache.
+    let unknown: Vec<u32> = games.iter().filter(|g| crate::appinfo::is_placeholder(&g.name, g.id)).map(|g| g.id).collect();
+    if !unknown.is_empty() {
+        let names = crate::appinfo::names(&a.root, &unknown);
+        for g in games.iter_mut() { if let Some(n) = names.get(&g.id) { g.name = n.clone(); } }
+        games.retain(|g| !is_tool(g.id, &g.name));
     }
     games.extend(read_shortcuts(a, &st, &compat)?);
     games.sort_by_key(|g| g.name.to_lowercase());
@@ -576,6 +583,21 @@ fn write_names_to(path: &Path, names: &[(u32, String)]) -> Result<(), String> {
     write_atomic(path, &vdf::write(&root, end))
 }
 
+/// Retire ces jeux de shortcuts.vdf. Les fichiers du jeu ne sont pas touchés.
+fn remove_shortcuts_from(path: &Path, ids: &[u32]) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|e| format!("Lecture de shortcuts.vdf impossible : {e}"))?;
+    let (mut root, end) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
+    if vdf::write(&root, end) != data { return Err("shortcuts.vdf a un format inattendu : il n'a pas été modifié.".into()); }
+    let list = root.as_map_mut().and_then(|m| m.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"shortcuts"))).and_then(|(_, v)| v.as_map_mut()).ok_or("shortcuts.vdf ne contient pas de raccourcis.")?;
+    let before = list.len();
+    list.retain(|(_, e)| !shortcut_id(e).is_some_and(|id| ids.contains(&id)));
+    if list.len() == before { return Ok(()); }
+    // Steam numérote ses raccourcis 0, 1, 2… sans trou.
+    for (i, (k, _)) in list.iter_mut().enumerate() { *k = i.to_string().into_bytes(); }
+    backup(path)?;
+    write_atomic(path, &vdf::write(&root, end))
+}
+
 pub fn save_art(a: &Account, id: u32, kind: Kind, bytes: &[u8]) -> Result<PathBuf, String> {
     let (ext, data): (&str, std::borrow::Cow<[u8]>) = match image::guess_format(bytes) {
         Ok(image::ImageFormat::Png) => ("png", bytes.into()),
@@ -806,13 +828,14 @@ fn with_steam_closed<T>(a: &Account, work: impl FnOnce() -> Result<T, String>) -
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)>, pub names: Vec<(u32, String)>, /// Programmes hors Steam à y ajouter, et s'ils vont dans la collection.
     pub sync: Vec<(crate::direct::LocalGame, bool)>, /// Jeux à mettre dans la collection (true) ou à en retirer (false).
-    pub collection: Vec<(u32, bool)> }
+    pub collection: Vec<(u32, bool)>, /// Jeux non-Steam à retirer de Steam.
+    pub remove: Vec<u32> }
 
 impl Queue {
-    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() && self.sync.is_empty() && self.collection.is_empty() }
-    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() + self.sync.len() + self.collection.len() }
+    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() && self.sync.is_empty() && self.collection.is_empty() && self.remove.is_empty() }
+    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() + self.sync.len() + self.collection.len() + self.remove.len() }
     /// Une icône seule ne vaut pas un redémarrage de Steam.
-    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() || !self.sync.is_empty() || !self.collection.is_empty() }
+    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() || !self.sync.is_empty() || !self.collection.is_empty() || !self.remove.is_empty() }
 }
 
 fn shortcut_ids(path: &Path) -> Result<HashSet<u32>, String> {
@@ -838,7 +861,8 @@ fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<Option<Stri
     if !missing.is_empty() { insert_shortcuts(shortcuts, &missing)?; }
     // Après les ajouts, pour que l'icône d'un programme tout juste synchronisé soit écrite.
     if !q.icons.is_empty() && shortcuts.exists() { write_icons_to(shortcuts, &q.icons)?; }
-    let remove: Vec<u32> = q.collection.iter().filter(|(_, on)| !*on).map(|(i, _)| *i).collect();
+    if !q.remove.is_empty() && shortcuts.exists() { remove_shortcuts_from(shortcuts, &q.remove)?; }
+    let remove: Vec<u32> = q.collection.iter().filter(|(_, on)| !*on).map(|(i, _)| *i).chain(q.remove.iter().copied()).collect();
     let add: Vec<u32> = q.sync.iter().filter(|(_, c)| *c).map(|(l, _)| l.id).chain(q.collection.iter().filter(|(_, on)| *on).map(|(i, _)| *i)).filter(|i| !remove.contains(i)).collect();
     // Le reste est déjà dans Steam : une collection impossible à écrire ne doit pas bloquer la file.
     let warning = if add.is_empty() && remove.is_empty() { None } else {
@@ -930,6 +954,24 @@ mod tests {
 
     fn add_shortcut_to(p: &Path, name: &str, exe: &str, options: &str) -> Result<u32, String> {
         add_shortcuts_to(p, &[NewGame { name: name.into(), exe: exe.into(), options: options.into(), tool: None, icon: String::new() }]).map(|v| v[0])
+    }
+
+    #[test]
+    fn removes_shortcut_and_renumbers() {
+        let d = temp("remove");
+        let p = d.join("shortcuts.vdf");
+        let g = |n: &str| NewGame { name: n.into(), exe: format!("/j/{n}.exe"), options: String::new(), tool: None, icon: String::new() };
+        add_shortcuts_to(&p, &[g("A"), g("B"), g("C")]).unwrap();
+        let q = Queue { remove: vec![new_id("B", "/j/B.exe")], ..Default::default() };
+        write_queue(&p, &d.join("config.vdf"), &q).unwrap();
+        let (v, _) = vdf::parse_file(&std::fs::read(&p).unwrap()).unwrap();
+        let l = v.get("shortcuts").unwrap().as_map().unwrap();
+        assert_eq!(l.iter().map(|(k, e)| (String::from_utf8_lossy(k).into_owned(), e.str("AppName").unwrap())).collect::<Vec<_>>(), vec![("0".into(), "A".into()), ("1".into(), "C".to_string())]);
+        // Rejouée, la file ne change plus rien.
+        let once = std::fs::read(&p).unwrap();
+        write_queue(&p, &d.join("config.vdf"), &q).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), once);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1168,7 +1210,7 @@ mod tests {
         std::fs::write(&c, "\"CompatToolMapping\"\n{\n\t\"10\"\n\t{\n\t\t\"name\"\t\t\"old\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}\n}\n").unwrap();
         let g = NewGame { name: "Jeu".into(), exe: "/j/jeu.exe".into(), options: String::new(), tool: Some("proton_11".into()), icon: String::new() };
         let id = new_id(&g.name, &g.exe);
-        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![], sync: vec![], collection: vec![] };
+        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![], sync: vec![], collection: vec![], remove: vec![] };
         write_queue(&s, &c, &q).unwrap();
         write_queue(&s, &c, &q).unwrap();
         let (v, _) = vdf::parse_file(&std::fs::read(&s).unwrap()).unwrap();

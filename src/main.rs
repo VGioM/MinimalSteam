@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+mod appinfo;
 mod blur;
 #[allow(dead_code)]
 mod desktop;
@@ -59,7 +60,7 @@ impl Sort {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Filter { All, Favorites, Steam, Other, Missing, Running }
+enum Filter { All, Favorites, Steam, Other, Missing, Running, Hidden }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Match { id: u64, name: String }
@@ -178,6 +179,10 @@ struct Config {
     via_steam: HashSet<String>,
     steam_key: String,
     owned: HashMap<String, Vec<owned::Owned>>,
+    /// Jeux cachés (compte:id) : visibles seulement dans l'onglet « Cachés ».
+    hidden: HashSet<String>,
+    /// Jeux non-Steam à retirer de Steam.
+    pending_remove: HashMap<String, Vec<u32>>,
 }
 
 fn config_dir(app: &str) -> Option<PathBuf> {
@@ -386,6 +391,7 @@ struct App {
     launched: HashMap<u32, Instant>,
     stopping: HashMap<u32, Instant>,
     stop_confirm: Option<(u32, Instant)>,
+    remove_confirm: Option<(u32, Instant)>,
     busy: Option<String>,
     status: Option<(String, bool, Instant)>,
     add: Option<AddForm>,
@@ -444,11 +450,11 @@ impl App {
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.track_direct(direct_now);
         if std::env::var_os("APP_SCREENSHOT").is_some() {
-            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, _ => {} }
+            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
         }
         app.reload(&cc.egui_ctx);
         if std::env::var_os("APP_SCREENSHOT").is_none() { app.refresh_owned(&cc.egui_ctx); }
@@ -477,10 +483,51 @@ impl App {
         self.cfg.save();
     }
 
+    fn is_hidden(&self, id: u32) -> bool { self.acc().is_some_and(|a| self.cfg.hidden.contains(&gkey(&a.id, id))) }
+
+    fn toggle_hidden(&mut self, id: u32, name: &str) {
+        let Some(k) = self.acc().map(|a| gkey(&a.id, id)) else { return };
+        let msg = if self.cfg.hidden.remove(&k) { format!("{name} est de nouveau visible.") } else { self.cfg.hidden.insert(k); format!("{name} est caché : retrouve-le dans l'onglet « Cachés ».") };
+        self.cfg.save();
+        if self.filter != Filter::Hidden { self.selected = None; }
+        self.set_status(msg, false);
+    }
+
+    /// Retire un jeu non-Steam de Steam, au premier moment où Steam peut être fermé.
+    fn request_remove(&mut self, ctx: &egui::Context, g: &Game) {
+        if self.running.contains(&g.id) || self.launched.contains_key(&g.id) { self.set_status("Ferme-le d'abord.", false); return; }
+        if !self.remove_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM) {
+            self.remove_confirm = Some((g.id, Instant::now()));
+            return;
+        }
+        self.remove_confirm = None;
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        let id = g.id;
+        let list = self.cfg.pending_remove.entry(account.clone()).or_default();
+        if !list.contains(&id) { list.push(id); }
+        // Rien d'autre ne doit le remettre dans Steam ou dans la liste.
+        self.cfg.local_games.retain(|l| l.id != id);
+        for m in [&mut self.cfg.pending_names, &mut self.cfg.pending_icons] { if let Some(l) = m.get_mut(&account) { l.retain(|(i, _)| *i != id); } }
+        if let Some(l) = self.cfg.pending_compat.get_mut(&account) { l.retain(|(i, _)| *i != id); }
+        if let Some(l) = self.cfg.pending_sync.get_mut(&account) { l.retain(|(i, _)| *i != id); }
+        if let Some(l) = self.cfg.pending_collection.get_mut(&account) { l.retain(|(i, _)| *i != id); }
+        let k = gkey(&account, id);
+        self.cfg.hidden.remove(&k);
+        self.cfg.favorites.remove(&k);
+        self.cfg.via_steam.remove(&k);
+        self.cfg.save();
+        self.selected = None;
+        if self.game_active() { self.set_status(format!("{} sera retiré de Steam à la fermeture du jeu.", g.name), false); }
+        else { self.set_status(format!("{} retiré. Les fichiers du jeu n'ont pas été touchés.", g.name), false); self.apply_queue(ctx); }
+        self.reload(ctx);
+    }
+
     fn visible(&self) -> Vec<usize> {
         let q = self.query.trim().to_lowercase();
         let mut v: Vec<usize> = self.games.iter().enumerate().filter(|(_, g)| {
-            (q.is_empty() || g.name.to_lowercase().contains(&q)) && match self.filter {
+            let hidden = self.is_hidden(g.id);
+            (q.is_empty() || g.name.to_lowercase().contains(&q)) && (hidden == (self.filter == Filter::Hidden)) && match self.filter {
+                Filter::Hidden => true,
                 Filter::All => g.installed,
                 Filter::Favorites => g.installed && self.is_favorite(g.id),
                 Filter::Steam => g.installed && g.steam,
@@ -770,6 +817,7 @@ impl App {
                                 if let Some(l) = self.cfg.pending_compat.get_mut(&id) { l.retain(|x| !applied.compat.contains(x)); if l.is_empty() { self.cfg.pending_compat.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_icons.get_mut(&id) { l.retain(|x| !applied.icons.contains(x)); if l.is_empty() { self.cfg.pending_icons.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_names.get_mut(&id) { l.retain(|x| !applied.names.contains(x)); if l.is_empty() { self.cfg.pending_names.remove(&id); } }
+                                if let Some(l) = self.cfg.pending_remove.get_mut(&id) { l.retain(|x| !applied.remove.contains(x)); if l.is_empty() { self.cfg.pending_remove.remove(&id); } }
                                 self.cfg.save();
                             }
                             match warning { Some(w) => self.set_status(w, true), None => self.set_status("Changements enregistrés dans Steam.", false) }
@@ -821,6 +869,7 @@ impl App {
             names: self.cfg.pending_names.get(id).cloned().unwrap_or_default(),
             collection: self.cfg.pending_collection.get(id).cloned().unwrap_or_default(),
             sync: self.cfg.pending_sync.get(id).into_iter().flatten().filter_map(|(i, c)| Some((self.cfg.local_games.iter().find(|l| l.id == *i)?.clone(), *c))).collect(),
+            remove: self.cfg.pending_remove.get(id).cloned().unwrap_or_default(),
         }
     }
 
@@ -851,6 +900,7 @@ impl App {
         for o in self.cfg.owned.get(&a.id).into_iter().flatten() {
             if !steam::is_tool(o.id, &o.name) && !self.games.iter().any(|g| g.id == o.id) { self.games.push(steam::owned_game(&a, o)); }
         }
+        self.games.retain(|g| g.steam || !q.remove.contains(&g.id));
         self.games.sort_by_key(|g| g.name.to_lowercase());
     }
 
@@ -1152,7 +1202,9 @@ impl App {
             ui.spacing_mut().item_spacing.x = 1.0;
             let active = self.running.len() + self.launched.keys().filter(|i| !self.running.contains(i)).count();
             let launched = if active > 0 { format!("Lancés ({active})") } else { "Lancés".to_string() };
-            for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam"), (Filter::Missing, "Non installés"), (Filter::Running, launched.as_str())] {
+            let hidden = self.acc().map_or(0, |a| { let p = format!("{}:", a.id); self.games.iter().filter(|g| self.cfg.hidden.contains(&format!("{p}{}", g.id))).count() });
+            let hidden_label = if hidden > 0 { format!("Cachés ({hidden})") } else { "Cachés".to_string() };
+            for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam"), (Filter::Missing, "Non installés"), (Filter::Running, launched.as_str()), (Filter::Hidden, hidden_label.as_str())] {
                 if chip(ui, label, self.filter == f) { self.filter = f; }
             }
         });
@@ -1275,7 +1327,7 @@ impl App {
                 return;
             }
             if visible.is_empty() {
-                let t = if self.filter == Filter::Running && self.query.is_empty() { "Aucun jeu lancé." } else if self.filter == Filter::Missing && self.query.is_empty() { if self.owned_busy { "Chargement de tes jeux…" } else { "Tous tes jeux sont installés." } } else if self.games.is_empty() { "Aucun jeu installé." } else if self.filter == Filter::Favorites && self.query.is_empty() { "Aucun favori pour l'instant." } else { "Aucun jeu ne correspond." };
+                let t = if self.filter == Filter::Hidden && self.query.is_empty() { "Aucun jeu caché." } else if self.filter == Filter::Running && self.query.is_empty() { "Aucun jeu lancé." } else if self.filter == Filter::Missing && self.query.is_empty() { if self.owned_busy { "Chargement de tes jeux…" } else { "Tous tes jeux sont installés." } } else if self.games.is_empty() { "Aucun jeu installé." } else if self.filter == Filter::Favorites && self.query.is_empty() { "Aucun favori pour l'instant." } else { "Aucun jeu ne correspond." };
                 ui.centered_and_justified(|ui| ui.label(RichText::new(t).color(pal().muted)));
                 return;
             }
@@ -1390,6 +1442,9 @@ impl App {
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
         let (mut stop, mut open_dir, mut via_toggle, mut remove_local, mut sync_one) = (false, false, false, false, false);
+        let (hidden, mut hide_toggle, mut remove_steam) = (self.is_hidden(g.id), false, false);
+        let removing = self.remove_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
+        if removing { ctx.request_repaint_after(Duration::from_millis(250)); }
         let (collection_on, mut collection_toggle) = (self.wants_collection(g.id), false);
         let collection_waiting = collection_on != self.in_collection.contains(&g.id);
         let sync_waiting = self.acc().and_then(|a| self.cfg.pending_sync.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
@@ -1576,6 +1631,18 @@ impl App {
                         });
                     }
                 }
+                if !g.pending {
+                    ui.add_space(6.0);
+                    let (label, tip) = if hidden { ("Ne plus cacher", "Le remet dans la bibliothèque.") } else { ("Cacher", "Ne s'affiche plus que dans l'onglet « Cachés ». Rien n'est changé dans Steam.") };
+                    hide_toggle = ui.add(egui::Button::new(label).min_size(egui::vec2(310.0, 36.0))).on_hover_text(tip).clicked();
+                }
+                if !g.steam && !g.local && !g.pending {
+                    ui.add_space(6.0);
+                    let can = busy.is_none() && !running && !launching;
+                    let label = if removing { "Confirmer la suppression ?" } else if game_running { "Supprimer de Steam (à la fermeture du jeu)" } else if steam_on { "Supprimer de Steam (redémarre Steam)" } else { "Supprimer de Steam" };
+                    let b = egui::Button::new(RichText::new(label).color(if can { STOP } else { pal().muted })).min_size(egui::vec2(310.0, 36.0));
+                    remove_steam = ui.add_enabled(can, b).on_hover_text("Retire ce jeu de ta bibliothèque Steam et de MinimalSteam. Les fichiers du jeu restent sur le disque.").on_disabled_hover_text("Ferme d'abord le jeu").clicked();
+                }
             });
             });
         });
@@ -1589,6 +1656,8 @@ impl App {
             self.cfg.save();
         }
         if remove_local { self.remove_local(ctx, g.id); return; }
+        if remove_steam { self.request_remove(ctx, &g); if self.selected.is_none() { return; } }
+        if hide_toggle { self.toggle_hidden(g.id, &g.name); }
         if sync_one { self.queue_sync(ctx, vec![g.id]); }
         if collection_toggle { self.toggle_collection(g.id); }
         if play { self.launch(g.id); }

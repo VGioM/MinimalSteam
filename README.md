@@ -17,6 +17,8 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Synchronisation avec Steam** : envoie un ou plusieurs programmes dans Steam, avec ou sans collection MinimalSteam, et range chaque jeu dans la collection ou retire-le depuis sa fiche.
 - **Onglet Non installés** pour voir et installer les jeux que tu possèdes.
 - **Onglet Lancés** pour voir et arrêter tout ce qui tourne, Steam ou non.
+- **Jeux cachés** : cache un jeu depuis sa fiche, il ne s'affiche plus que dans l'onglet **Cachés**. Rien n'est changé dans Steam.
+- **Suppression d'un jeu non-Steam** de ta bibliothèque Steam, depuis sa fiche. Les fichiers du jeu restent sur le disque.
 - **Images modifiables** depuis [SteamGridDB](https://www.steamgriddb.com/) : couverture, bannière, arrière-plan, logo et icône.
 - **Apparence à ton goût** : thèmes, couleurs, fond, arrondi et taille des jaquettes.
 - **Mises à jour intégrées** depuis les releases GitHub.
@@ -85,7 +87,9 @@ Les **jeux Steam** passent toujours par Steam, nécessaire pour les DRM, Steam C
 
 Les **jeux non-Steam** se lancent directement, avec la version de Proton, le préfixe et les options de lancement réglés pour eux. Sans version choisie, ils utilisent Proton Experimental. Si leur version de Proton a été désinstallée, l'app te prévient au lieu de lancer le jeu avec une autre. Sans Steam, ils n'ont ni overlay ni Steam Input, et un anti-triche peut les bloquer : coche **Lancer via Steam** sur leur fiche dans ce cas.
 
-L'app ne modifie les fichiers de Steam que pour ajouter un jeu ou appliquer une icône :
+Si Steam a laissé un nom provisoire comme `appid_730` dans le manifeste d'un jeu, MinimalSteam affiche le vrai nom, lu dans le cache de Steam (`appcache/appinfo.vdf`).
+
+L'app ne modifie les fichiers de Steam que pour ajouter, renommer ou supprimer un jeu non-Steam, changer de Proton ou appliquer une icône :
 
 | Fichier | Rôle |
 |---|---|
@@ -94,7 +98,7 @@ L'app ne modifie les fichiers de Steam que pour ajouter un jeu ou appliquer une 
 | `userdata/<compte>/config/grid/` | Images personnalisées |
 | `userdata/<compte>/config/cloudstorage/` | Collection MinimalSteam, si tu l'utilises |
 
-Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Steam tourne**. Tu peux ajouter un jeu ou changer de Proton en pleine partie : le changement passe en **file d'attente**, puis Steam redémarre discrètement quelques secondes après la fermeture du dernier jeu. Une copie `*.minimalsteam-sauvegarde` est créée avant la première modification. Les réglages de l'app sont dans `~/.config/Minimalsteam/`.
+Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Steam tourne**. Tu peux ajouter ou supprimer un jeu, ou changer de Proton, en pleine partie : le changement passe en **file d'attente**, puis Steam redémarre discrètement quelques secondes après la fermeture du dernier jeu. Une copie `*.minimalsteam-sauvegarde` est créée avant la première modification. Les réglages de l'app sont dans `~/.config/Minimalsteam/`.
 
 ## Limites
 
