@@ -40,9 +40,14 @@ const APPLYING: &str = "Application des changements…";
 #[derive(Clone, Copy)]
 struct Pal { bg: Color32, panel: Color32, card: Color32, hover: Color32, line: Color32, text: Color32, muted: Color32, accent: Color32, on_accent: Color32, input: Color32, menu: Color32 }
 
-thread_local! { static PAL: Cell<Pal> = Cell::new(Theme::default().palette()); }
+thread_local! {
+    static PAL: Cell<Pal> = Cell::new(Theme::default().palette());
+    static SOFT: Cell<bool> = const { Cell::new(true) };
+}
 
 fn pal() -> Pal { PAL.with(|p| p.get()) }
+/// Rendu « Lumière » choisi.
+fn soft() -> bool { SOFT.with(|s| s.get()) }
 
 const OK: Color32 = Color32::from_rgb(0x4C, 0xC2, 0x6B);
 const BAD: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
@@ -83,14 +88,18 @@ const PRESETS: [(&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]); 7] = [
     ("Clair", [0x2F, 0x6F, 0xED], [0xF2, 0xF3, 0xF5], [0xFF, 0xFF, 0xFF], [0xE4, 0xE7, 0xEC]),
 ];
 
+/// Le rendu des commandes : « Lumière » (arrondi, reflets, halos) ou « Legacy » (plat).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Look { #[default] Soft, Legacy }
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-struct Theme { preset: String, accent: [u8; 3], bg: [u8; 3], panel: [u8; 3], card: [u8; 3], background: Back, image: String, game: u32, dim: u8, panel_back: Back, panel_image: String, panel_game: u32, panel_dim: u8, top_back: Back, top_image: String, top_game: u32, top_dim: u8, top_color: Option<[u8; 3]>, blur: Option<u8>, panel_blur: Option<u8>, top_blur: Option<u8>, text_color: Option<[u8; 3]>, muted_color: Option<[u8; 3]>, font: String, menu_color: Option<[u8; 3]>, menu_alpha: u8, glass: u8, radius: u8, show_names: bool }
+struct Theme { preset: String, accent: [u8; 3], bg: [u8; 3], panel: [u8; 3], card: [u8; 3], background: Back, image: String, game: u32, dim: u8, panel_back: Back, panel_image: String, panel_game: u32, panel_dim: u8, top_back: Back, top_image: String, top_game: u32, top_dim: u8, top_color: Option<[u8; 3]>, blur: Option<u8>, panel_blur: Option<u8>, top_blur: Option<u8>, text_color: Option<[u8; 3]>, muted_color: Option<[u8; 3]>, font: String, menu_color: Option<[u8; 3]>, menu_alpha: u8, glass: u8, radius: u8, show_names: bool, look: Look }
 
 impl Default for Theme {
     fn default() -> Self {
         let (n, accent, bg, panel, card) = PRESETS[0];
-        Theme { preset: n.into(), accent, bg, panel, card, background: Back::Color, image: String::new(), game: 0, dim: 70, panel_back: Back::Color, panel_image: String::new(), panel_game: 0, panel_dim: 80, top_back: Back::Color, top_image: String::new(), top_game: 0, top_dim: 70, top_color: None, blur: None, panel_blur: None, top_blur: None, text_color: None, muted_color: None, font: String::new(), menu_color: None, menu_alpha: 60, glass: 25, radius: 10, show_names: true }
+        Theme { preset: n.into(), accent, bg, panel, card, background: Back::Color, image: String::new(), game: 0, dim: 70, panel_back: Back::Color, panel_image: String::new(), panel_game: 0, panel_dim: 80, top_back: Back::Color, top_image: String::new(), top_game: 0, top_dim: 70, top_color: None, blur: None, panel_blur: None, top_blur: None, text_color: None, muted_color: None, font: String::new(), menu_color: None, menu_alpha: 60, glass: 25, radius: 10, show_names: true, look: Look::Soft }
     }
 }
 
@@ -214,6 +223,61 @@ impl Config {
 
 impl Config {
     fn cover(&self) -> f32 { if self.cover_size == 0 { 172.0 } else { (self.cover_size as f32).clamp(110.0, 340.0) } }
+}
+
+/// Ce que le menu clic droit doit savoir d'un jeu, en plus du jeu lui-même.
+struct MenuState { favorite: bool, hidden: bool, running: bool, launching: bool, folder: bool, via_steam: bool, collection: bool, sync_waiting: bool, busy: bool }
+
+/// Le menu clic droit d'une jaquette. Rend le choix fait, s'il y en a un.
+fn game_menu(ui: &mut egui::Ui, g: &Game, st: &MenuState, tools: &[(String, String)]) -> Option<Menu> {
+    let mut out = None;
+    ui.set_min_width(230.0);
+    fn item(ui: &mut egui::Ui, out: &mut Option<Menu>, on: bool, label: &str, m: Menu) {
+        if ui.add_enabled(on, egui::Button::new(label)).clicked() { *out = Some(m); ui.close_menu(); }
+    }
+    let named = g.name.chars().count() > 34;
+    ui.label(RichText::new(if named { format!("{}…", g.name.chars().take(33).collect::<String>()) } else { g.name.clone() }).strong());
+    ui.separator();
+    if st.running { item(ui, &mut out, true, "■  Arrêter le jeu", Menu::Stop); }
+    else if g.installed { item(ui, &mut out, !g.pending && !st.launching, "▶  Jouer", Menu::Play); }
+    else { item(ui, &mut out, true, "⬇  Installer", Menu::Play); }
+    item(ui, &mut out, true, "Afficher la fiche", Menu::Details);
+    item(ui, &mut out, true, if st.favorite { "★  Retirer des favoris" } else { "☆  Ajouter aux favoris" }, Menu::Favorite);
+    ui.separator();
+    if !g.steam { item(ui, &mut out, !g.pending, "Renommer…", Menu::Rename); }
+    if g.installed { item(ui, &mut out, true, "Modifier les images…", Menu::Images); }
+    item(ui, &mut out, st.folder, "Ouvrir le dossier du jeu", Menu::Folder);
+    if g.installed && !g.local && !g.pending {
+        ui.menu_button("Compatibilité", |ui| {
+            let default_label = if g.steam { "Par défaut de Steam" } else if direct::is_windows(&g.exe) { "Proton Experimental (par défaut)" } else { "Aucune (jeu Linux)" };
+            let on = !st.busy;
+            if ui.add_enabled(on, egui::RadioButton::new(g.compat.is_none(), default_label)).clicked() { out = Some(Menu::Compat(None)); ui.close_menu(); }
+            for (k, l) in tools {
+                if ui.add_enabled(on, egui::RadioButton::new(g.compat.as_deref() == Some(k.as_str()), l)).clicked() { out = Some(Menu::Compat(Some(k.clone()))); ui.close_menu(); }
+            }
+            if let Some(k) = g.compat.as_ref().filter(|k| !tools.iter().any(|t| &t.0 == *k)) { ui.add_enabled(false, egui::RadioButton::new(true, k)); }
+        });
+        let mut c = st.collection;
+        if ui.checkbox(&mut c, "Dans la collection MinimalSteam").clicked() { out = Some(Menu::Collection); ui.close_menu(); }
+    }
+    if !g.steam && !g.local && !g.pending {
+        let mut v = st.via_steam;
+        if ui.checkbox(&mut v, "Lancer via Steam").clicked() { out = Some(Menu::ViaSteam); ui.close_menu(); }
+    }
+    if g.local { item(ui, &mut out, !st.busy && !st.sync_waiting, if st.sync_waiting { "Ajout à Steam en attente" } else { "Ajouter à Steam" }, Menu::Sync); }
+    ui.separator();
+    if !g.pending { item(ui, &mut out, true, if st.hidden { "Ne plus cacher" } else { "Cacher" }, Menu::Hide); }
+    if g.pending { item(ui, &mut out, !st.busy, "Annuler l'ajout", Menu::CancelAdd); }
+    if g.local { item(ui, &mut out, !st.running, "Retirer de MinimalSteam", Menu::RemoveLocal); }
+    if !g.steam && !g.local && !g.pending {
+        ui.add_enabled_ui(!st.busy && !st.running && !st.launching, |ui| {
+            ui.menu_button(RichText::new("Supprimer de Steam").color(STOP), |ui| {
+                ui.label(RichText::new("Les fichiers du jeu restent sur le disque.").size(12.5).color(pal().muted));
+                if ui.button(RichText::new("Confirmer la suppression").color(STOP)).clicked() { out = Some(Menu::Remove); ui.close_menu(); }
+            });
+        });
+    }
+    out
 }
 
 fn gkey(account: &str, id: u32) -> String { format!("{account}:{id}") }
@@ -357,7 +421,11 @@ struct Editor {
     back_for: Option<Zone>,
 }
 
-enum Act { Select(u32), Launch(u32) }
+enum Act { Select(u32), Launch(u32), Menu(u32, Menu) }
+
+/// Les choix du menu clic droit d'un jeu.
+#[derive(Clone, Debug, PartialEq)]
+enum Menu { Play, Details, Stop, Favorite, Rename, Images, Folder, Compat(Option<String>), ViaSteam, Collection, Sync, Hide, CancelAdd, RemoveLocal, Remove }
 
 struct App {
     cfg: Config,
@@ -1378,7 +1446,13 @@ impl App {
                     let running = self.running.contains(&g.id);
                     let blocked = running || g.pending || self.launched.contains_key(&g.id);
                     let p = ui.painter();
-                    if lift > 0.0 {
+                    let soft = soft();
+                    if soft {
+                        // Ombre douce au repos, qui se creuse au survol ; halo de l'accent si sélectionné.
+                        let shadow = egui::Shadow { offset: [0, (4.0 + 6.0 * lift) as i8], blur: (12.0 + 16.0 * lift) as u8, spread: 0, color: Color32::from_black_alpha((70.0 + 90.0 * lift) as u8) };
+                        p.add(shadow.as_shape(shown, rad));
+                        if selected { glow(p, shown, rad as f32, pal().accent, 0.9); }
+                    } else if lift > 0.0 {
                         let shadow = egui::Shadow { offset: [0, 6], blur: 20, spread: 0, color: Color32::from_black_alpha((130.0 * lift) as u8) };
                         p.add(shadow.as_shape(shown, rad));
                     }
@@ -1392,7 +1466,24 @@ impl App {
                             p.galley(egui::pos2(inner.left(), rect.center().y - galley.size().y / 2.0), galley, pal().muted);
                         }
                     }
-                    if selected { p.rect_stroke(shown, rad, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside); }
+                    if soft {
+                        // Reflet de vitre au survol et fin liseré de lumière sur le bord.
+                        if lift > 0.0 {
+                            let sheen = egui::Rect::from_min_size(shown.min, egui::vec2(shown.width(), shown.height() * 0.45));
+                            let mut m = egui::Mesh::default();
+                            let a = white((34.0 * lift) as u8);
+                            m.colored_vertex(sheen.left_top(), a);
+                            m.colored_vertex(sheen.right_top(), white((12.0 * lift) as u8));
+                            m.colored_vertex(sheen.right_bottom(), Color32::TRANSPARENT);
+                            m.colored_vertex(sheen.left_bottom(), Color32::TRANSPARENT);
+                            m.add_triangle(0, 1, 2);
+                            m.add_triangle(0, 2, 3);
+                            p.with_clip_rect(shown.shrink(rad as f32 * 0.3)).add(m);
+                        }
+                        let edge = if selected { Stroke::new(2.0_f32, blend(pal().accent, Color32::WHITE, 0.25)) } else { Stroke::new(1.0_f32, white((18.0 + 50.0 * lift) as u8)) };
+                        p.rect_stroke(shown, rad, edge, egui::StrokeKind::Inside);
+                    }
+                    else if selected { p.rect_stroke(shown, rad, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside); }
                     else if hovered { p.rect_stroke(shown, rad, Stroke::new(1.5_f32, Color32::from_gray(170)), egui::StrokeKind::Outside); }
                     let center = rect.right_bottom() - egui::vec2(30.0, 30.0);
                     if hovered && !blocked { play_icon(p, center, 21.0); }
@@ -1413,8 +1504,22 @@ impl App {
                     if names {
                         let title = titles[n].clone();
                         let border = if selected { Stroke::new(1.0_f32, pal().accent) } else { Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7)) };
-                        ui.painter().rect(name_box, 6.0, pal().menu, border, egui::StrokeKind::Inside);
+                        ui.painter().rect(name_box, if soft { 10.0 } else { 6.0 }, pal().menu, border, egui::StrokeKind::Inside);
                         ui.painter().galley(egui::pos2(name_box.left() + 7.0, name_box.center().y - title.size().y / 2.0), title, pal().text);
+                    }
+                    if !over_bar {
+                        let st = MenuState {
+                            favorite: self.is_favorite(g.id),
+                            hidden: self.is_hidden(g.id),
+                            running,
+                            launching: self.launched.contains_key(&g.id),
+                            folder: g.folder.as_ref().is_some_and(|f| f.is_dir()),
+                            via_steam: self.acc().is_some_and(|a| self.cfg.via_steam.contains(&gkey(&a.id, g.id))),
+                            collection: self.wants_collection(g.id),
+                            sync_waiting: self.acc().and_then(|a| self.cfg.pending_sync.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id)),
+                            busy: self.busy.is_some(),
+                        };
+                        resp.context_menu(|ui| { if let Some(m) = game_menu(ui, g, &st, &self.tools) { acts.push(Act::Menu(g.id, m)); } });
                     }
                     if over_bar {}
                     else if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
@@ -1426,7 +1531,42 @@ impl App {
             });
         });
         for a in acts {
-            match a { Act::Select(id) => self.selected = Some(id), Act::Launch(id) => { self.selected = Some(id); self.launch(id); } }
+            match a {
+                Act::Select(id) => self.selected = Some(id),
+                Act::Launch(id) => { self.selected = Some(id); self.launch(id); }
+                Act::Menu(id, m) => self.menu_action(ctx, id, m),
+            }
+        }
+    }
+
+    fn menu_action(&mut self, ctx: &egui::Context, id: u32, m: Menu) {
+        let Some(g) = self.game(id).cloned() else { return };
+        match m {
+            Menu::Play => { self.selected = Some(id); self.launch(id); }
+            Menu::Details => { self.selected = Some(id); self.scroll_to = true; }
+            Menu::Stop => {
+                // Le menu vaut confirmation : il a déjà fallu deux clics.
+                self.stop_confirm = Some((id, Instant::now()));
+                self.request_stop(id, &g.name);
+            }
+            Menu::Favorite => self.toggle_favorite(id),
+            Menu::Rename => { self.selected = Some(id); self.rename = Some((id, g.name.clone())); self.rename_focus = true; }
+            Menu::Images => { self.selected = Some(id); self.open_editor(ctx, id); }
+            Menu::Folder => if let Some(f) = &g.folder {
+                match steam::open_folder(f) { Ok(()) => self.set_status("Dossier du jeu ouvert.", false), Err(e) => self.set_status(e, true) }
+            },
+            Menu::Compat(tool) => if tool != g.compat { self.compat_edit = None; self.queue_compat(ctx, &g, tool); },
+            Menu::ViaSteam => {
+                let Some(k) = self.acc().map(|a| gkey(&a.id, id)) else { return };
+                if !self.cfg.via_steam.remove(&k) { self.cfg.via_steam.insert(k); }
+                self.cfg.save();
+            }
+            Menu::Collection => self.toggle_collection(id),
+            Menu::Sync => self.queue_sync(ctx, vec![id]),
+            Menu::Hide => self.toggle_hidden(id, &g.name),
+            Menu::CancelAdd => self.cancel_pending(ctx, id),
+            Menu::RemoveLocal => self.remove_local(ctx, id),
+            Menu::Remove => { self.remove_confirm = Some((id, Instant::now())); self.request_remove(ctx, &g); }
         }
     }
 
@@ -1996,6 +2136,15 @@ impl App {
                                     if ui.add(egui::Slider::new(&mut size, 110..=340).suffix(" px")).changed() { self.cfg.cover_size = size; self.dirty = true; }
                                 });
                                 let t = &mut self.cfg.theme;
+                                field(ui, "Rendu");
+                                ui.horizontal(|ui| {
+                                    for (l, label, tip) in [(Look::Soft, "Lumière", "Commandes arrondies, reflets, halos et ombres douces."), (Look::Legacy, "Legacy", "Le rendu plat d'origine.")] {
+                                        if chip(ui, label, t.look == l) && t.look != l { t.look = l; changed = true; }
+                                        ui.label(RichText::new(tip).size(12.5).color(pal().muted));
+                                        ui.add_space(6.0);
+                                    }
+                                });
+                                ui.add_space(8.0);
                                 changed |= slider_row(ui, "Arrondi", &mut t.radius, 24, " px");
                                 ui.add_space(8.0);
                                 changed |= ui.checkbox(&mut t.show_names, "Afficher le nom sous les jaquettes").changed();
@@ -2165,6 +2314,7 @@ fn start_poll(ctx: egui::Context, tx: mpsc::Sender<Msg>, watched: Arc<Mutex<Vec<
 
 fn apply_theme(ctx: &egui::Context, t: &Theme) {
     PAL.with(|p| p.set(t.palette()));
+    SOFT.with(|s| s.set(t.look == Look::Soft));
     style(ctx, t.light());
 }
 
@@ -2182,20 +2332,33 @@ fn style(ctx: &egui::Context, light: bool) {
     v.selection.stroke = Stroke::new(1.0_f32, pal().accent);
     v.hyperlink_color = pal().accent;
     v.clip_rect_margin = 0.0;
-    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] { w.corner_radius = CornerRadius::same(8); }
+    let r = if soft() { 12 } else { 8 };
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] { w.corner_radius = CornerRadius::same(r); }
+    if soft() {
+        v.window_corner_radius = CornerRadius::same(20);
+        v.menu_corner_radius = CornerRadius::same(14);
+        v.window_shadow = egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: Color32::from_black_alpha(110) };
+        v.popup_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(90) };
+        v.window_stroke = Stroke::new(1.0_f32, blend(pal().line, Color32::WHITE, 0.08));
+    }
     v.widgets.inactive.bg_fill = pal().hover;
     v.widgets.inactive.weak_bg_fill = pal().card;
     v.widgets.inactive.bg_stroke = Stroke::NONE;
     v.widgets.hovered.bg_fill = pal().hover;
     v.widgets.hovered.weak_bg_fill = pal().hover;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal().accent.gamma_multiply(0.55));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, pal().accent.gamma_multiply(if soft() { 0.8 } else { 0.55 }));
+    if soft() {
+        // Un liseré clair donne du relief aux boutons au repos.
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, white(14));
+        v.widgets.hovered.expansion = 1.0;
+    }
     v.interact_cursor = Some(egui::CursorIcon::PointingHand);
     v.widgets.active.bg_fill = pal().line;
     v.widgets.active.weak_bg_fill = pal().line;
     v.widgets.active.bg_stroke = Stroke::new(1.0_f32, pal().accent);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, pal().line);
     s.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    s.spacing.button_padding = egui::vec2(12.0, 6.0);
+    s.spacing.button_padding = if soft() { egui::vec2(14.0, 7.0) } else { egui::vec2(12.0, 6.0) };
     s.spacing.interact_size.y = 28.0;
     for (ts, size) in [(egui::TextStyle::Body, 14.5), (egui::TextStyle::Button, 14.5), (egui::TextStyle::Small, 12.0), (egui::TextStyle::Heading, 20.0)] {
         if let Some(f) = s.text_styles.get_mut(&ts) { f.size = size; }
@@ -2204,7 +2367,34 @@ fn style(ctx: &egui::Context, light: bool) {
 }
 
 fn modal_frame(ctx: &egui::Context) -> egui::Frame {
-    egui::Frame::popup(&ctx.style()).fill(pal().panel).inner_margin(Margin::same(22)).corner_radius(14)
+    egui::Frame::popup(&ctx.style()).fill(pal().panel).inner_margin(Margin::same(22)).corner_radius(if soft() { 20 } else { 14 })
+}
+
+/// Reflet du rendu « Lumière » : le haut s'éclaircit, le bas s'assombrit, un fil de lumière
+/// court le long du bord supérieur. `radius` est celui de la forme déjà peinte.
+fn gloss(p: &egui::Painter, r: egui::Rect, radius: f32, strength: f32) {
+    let steps = 12;
+    let half = (r.height() / 2.0).min(r.height() - radius).max(1.0);
+    let rad = radius.min(half).round() as u8;
+    for i in 0..steps {
+        let f = 1.0 - i as f32 / steps as f32;
+        let top = egui::Rect::from_min_size(r.min, egui::vec2(r.width(), half * f));
+        p.rect_filled(top, CornerRadius { nw: rad, ne: rad, sw: 0, se: 0 }, white((2.6 * strength) as u8));
+        let bottom = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - half * f * 0.8), r.max);
+        p.rect_filled(bottom, CornerRadius { nw: 0, ne: 0, sw: rad, se: rad }, Color32::from_black_alpha((3.0 * strength) as u8));
+    }
+    let inset = radius.max(4.0);
+    p.line_segment([egui::pos2(r.left() + inset, r.top() + 0.75), egui::pos2(r.right() - inset, r.top() + 0.75)], Stroke::new(1.0_f32, white((40.0 * strength) as u8)));
+}
+
+/// Blanc translucide. `Color32::from_white_alpha` d'egui donne un blanc bien trop fort.
+fn white(a: u8) -> Color32 { Color32::from_rgba_premultiplied(a, a, a, a) }
+
+/// Halo coloré sous une forme (rendu « Lumière »).
+fn glow(p: &egui::Painter, r: egui::Rect, radius: f32, color: Color32, amount: f32) {
+    if amount <= 0.01 { return; }
+    let c = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (110.0 * amount) as u8);
+    p.add(egui::Shadow { offset: [0, 4], blur: (10.0 + 10.0 * amount) as u8, spread: 0, color: c }.as_shape(r, radius));
 }
 
 fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -2214,7 +2404,12 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 
 /// Le fond arrondi qui garde les commandes lisibles, même sur une jaquette.
 fn pill() -> egui::Frame {
-    egui::Frame::new().fill(pal().menu).stroke(Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7))).corner_radius(8).inner_margin(Margin::same(2))
+    if soft() {
+        egui::Frame::new().fill(pal().menu).stroke(Stroke::new(1.0_f32, blend(pal().line, Color32::WHITE, 0.10).gamma_multiply(0.8))).corner_radius(14).inner_margin(Margin::same(3))
+            .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(45) })
+    } else {
+        egui::Frame::new().fill(pal().menu).stroke(Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7))).corner_radius(8).inner_margin(Margin::same(2))
+    }
 }
 
 fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool {
@@ -2227,7 +2422,14 @@ fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool {
     } else {
         (pal().hover.gamma_multiply(hover), blend(pal().muted, pal().text, hover))
     };
-    ui.painter().rect_filled(r, 6.0, fill);
+    if soft() {
+        let rad = r.height() / 2.0;
+        if on { glow(ui.painter(), r, rad, pal().accent, 0.55 + 0.45 * hover); }
+        ui.painter().rect_filled(r, rad, fill);
+        if on { gloss(ui.painter(), r, rad, 1.0); } else if hover > 0.0 { gloss(ui.painter(), r, rad, 0.5 * hover); }
+    } else {
+        ui.painter().rect_filled(r, 6.0, fill);
+    }
     ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, text, font, color);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
@@ -2243,7 +2445,15 @@ fn fill_button(ui: &mut egui::Ui, text: &str, min: egui::Vec2, size: f32, color:
     let fill = if !enabled && color != pal().card { color.gamma_multiply(0.8) }
         else if enabled && resp.is_pointer_button_down_on() { blend(color, Color32::BLACK, 0.14) }
         else { blend(color, Color32::WHITE, 0.14 * hover) };
-    ui.painter().rect_filled(r, 8.0, fill);
+    if soft() {
+        let rad = (r.height() / 2.0).min(16.0);
+        let lit = color != pal().card && enabled;
+        if lit { glow(ui.painter(), r, rad, color, 0.35 + 0.65 * hover); }
+        ui.painter().rect_filled(r, rad, fill);
+        gloss(ui.painter(), r, rad, if lit { 1.0 } else { 0.5 });
+    } else {
+        ui.painter().rect_filled(r, 8.0, fill);
+    }
     let at = r.center() - galley.size() / 2.0;
     ui.painter().galley(at, galley, ink);
     let resp = if enabled { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
@@ -2282,8 +2492,13 @@ fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandl
 fn nav_item(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
     let (r, resp) = ui.allocate_exact_size(egui::vec2(128.0, 36.0), Sense::click());
     if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
-    if on { ui.painter().rect_filled(r, 8.0, pal().accent); }
-    else if resp.hovered() { ui.painter().rect_filled(r, 8.0, pal().hover); }
+    let rad = if soft() { 12.0 } else { 8.0 };
+    if on {
+        if soft() { glow(ui.painter(), r, rad, pal().accent, 0.6); }
+        ui.painter().rect_filled(r, rad, pal().accent);
+        if soft() { gloss(ui.painter(), r, rad, 1.0); }
+    }
+    else if resp.hovered() { ui.painter().rect_filled(r, rad, pal().hover); }
     ui.painter().text(r.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), if on { pal().on_accent } else { pal().text });
     resp.clicked()
 }

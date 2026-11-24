@@ -20,7 +20,8 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Jeux cachés** : cache un jeu depuis sa fiche, il ne s'affiche plus que dans l'onglet **Cachés**. Rien n'est changé dans Steam.
 - **Suppression d'un jeu non-Steam** de ta bibliothèque Steam, depuis sa fiche. Les fichiers du jeu restent sur le disque.
 - **Images modifiables** depuis [SteamGridDB](https://www.steamgriddb.com/) : couverture, bannière, arrière-plan, logo et icône.
-- **Apparence à ton goût** : thèmes, couleurs, fond, arrondi et taille des jaquettes.
+- **Menu clic droit** sur chaque jaquette : jouer, favori, renommer, images, dossier, Proton, collection, cacher, supprimer…
+- **Apparence à ton goût** : thèmes, couleurs, fond, arrondi et taille des jaquettes, avec le rendu **Lumière** (arrondi, reflets et halos) ou **Legacy** (plat).
 - **Mises à jour intégrées** depuis les releases GitHub.
 
 ![La fiche d'un jeu, avec le fond du jeu sélectionné](docs/fiche.jpg)
