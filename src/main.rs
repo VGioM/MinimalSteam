@@ -35,6 +35,10 @@ const LAUNCH_GUARD: Duration = Duration::from_secs(25);
 const TOP_H: f32 = 102.0;
 /// Espace entre une jaquette et la case de son nom.
 const NAME_GAP: f32 = 6.0;
+/// Plus petite taille de case : celle d'une icône.
+const MIN_COVER: f32 = 40.0;
+/// En dessous, la grille montre l'icône du jeu dans une case carrée.
+const ICON_BELOW: f32 = 100.0;
 const APPLYING: &str = "Application des changements…";
 
 #[derive(Clone, Copy)]
@@ -171,6 +175,8 @@ struct Config {
     sort: Sort,
     theme: Theme,
     cover_size: u16,
+    /// Bibliothèque en liste plutôt qu'en grille.
+    list_view: bool,
     favorites: HashSet<String>,
     matches: HashMap<String, Match>,
     pending_icons: HashMap<String, Vec<(u32, String)>>,
@@ -222,7 +228,7 @@ impl Config {
 }
 
 impl Config {
-    fn cover(&self) -> f32 { if self.cover_size == 0 { 172.0 } else { (self.cover_size as f32).clamp(110.0, 340.0) } }
+    fn cover(&self) -> f32 { if self.cover_size == 0 { 172.0 } else { (self.cover_size as f32).clamp(MIN_COVER, 340.0) } }
 }
 
 /// Ce que le menu clic droit doit savoir d'un jeu, en plus du jeu lui-même.
@@ -1289,8 +1295,13 @@ impl App {
                 ui.add_space(6.0);
                 let mut size = self.cfg.cover() as u16;
                 ui.spacing_mut().slider_width = 110.0;
-                if ui.add(egui::Slider::new(&mut size, 110..=340).show_value(false)).on_hover_text("Taille des jaquettes").changed() { self.cfg.cover_size = size; self.dirty = true; }
+                let size_tip = if self.cfg.list_view { "Hauteur des lignes" } else { "Taille des jaquettes (à gauche : icônes)" };
+                if ui.add(egui::Slider::new(&mut size, MIN_COVER as u16..=340).show_value(false)).on_hover_text(size_tip).changed() { self.cfg.cover_size = size; self.dirty = true; }
                 ui.label(RichText::new("Taille").size(13.0).color(pal().muted));
+                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if chip(ui, "Liste", self.cfg.list_view) && !self.cfg.list_view { self.cfg.list_view = true; self.cfg.save(); self.scroll_to = true; }
+                if chip(ui, "Grille", !self.cfg.list_view) && self.cfg.list_view { self.cfg.list_view = false; self.cfg.save(); self.scroll_to = true; }
             });
         });
     }
@@ -1368,6 +1379,7 @@ impl App {
         let free = self.add.is_none() && self.editor.is_none() && !self.settings && !ctx.memory(|m| m.any_popup_open());
         let wheel = if over_top && free { ctx.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
         let quality = if cover > 240.0 { 720 } else { 420 };
+        let list = self.cfg.list_view;
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin { left: 22, right: 10, top: if clear { 0 } else { 18 }, bottom: 0 })).show(ctx, |ui| {
             if clear && (!self.loaded || self.error.is_some() || visible.is_empty()) { ui.add_space(offset); }
             if !self.loaded { ui.centered_and_justified(|ui| ui.label(RichText::new("Chargement…").color(pal().muted))); return; }
@@ -1402,15 +1414,25 @@ impl App {
             let scroll_to = std::mem::take(&mut self.scroll_to);
             egui::ScrollArea::vertical().auto_shrink(false).show_viewport(ui, |ui, vp| {
                 if wheel != 0.0 { ui.scroll_with_delta_animation(egui::vec2(0.0, wheel), egui::style::ScrollAnimation::none()); }
-                let gap = 18.0;
+                if list { self.list_rows(ui, vp, &visible, offset, over_bar, scroll_to, &mut acts); return; }
+                let icons = cover < ICON_BELOW;
+                let gap = if icons { 10.0 } else { 18.0 };
                 let avail = ui.available_width() - 12.0;
                 let cols = (((avail + gap) / (cover + gap)).floor() as usize).max(1);
                 self.columns = cols;
                 let w = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
-                let h = w * 1.5;
+                let h = if icons { w } else { w * 1.5 };
+                let rad = if icons { rad.min((w * 0.22) as u8) } else { rad };
                 let rows = visible.len().div_ceil(cols);
                 // Les noms passent à la ligne : chaque rangée prend la hauteur de son nom le plus long.
-                let titles: Vec<_> = if names { visible.iter().map(|i| ui.painter().layout(self.games[*i].name.clone(), egui::FontId::proportional(13.5), pal().text, (w - 14.0).max(20.0))).collect() } else { vec![] };
+                let name_size = if icons { 11.5 } else { 13.5 };
+                // Sous une icône, deux lignes au plus ; trop petite, le nom passe en info-bulle.
+                let names = names && (!icons || w >= 64.0);
+                let titles: Vec<_> = if names { visible.iter().map(|i| {
+                    let mut job = egui::text::LayoutJob::single_section(self.games[*i].name.clone(), egui::TextFormat::simple(egui::FontId::proportional(name_size), pal().text));
+                    job.wrap = egui::text::TextWrapping { max_width: (w - 10.0).max(20.0), max_rows: if icons { 2 } else { usize::MAX }, break_anywhere: false, overflow_character: Some('…') };
+                    ui.painter().layout_job(job)
+                }).collect() } else { vec![] };
                 let mut label_h = vec![0.0_f32; rows];
                 for (n, t) in titles.iter().enumerate() { label_h[n / cols] = label_h[n / cols].max(t.size().y + 8.0); }
                 let mut tops = Vec::with_capacity(rows + 1);
@@ -1438,6 +1460,7 @@ impl App {
                     let name_box = egui::Rect::from_min_size(rect.left_bottom() + egui::vec2(0.0, NAME_GAP), egui::vec2(w, label_h[n / cols]));
                     let hit = if names { rect.union(name_box) } else { rect };
                     let resp = ui.interact(hit, ui.id().with(("card", g.id)), Sense::click());
+                    let resp = if icons { resp.on_hover_text(&g.name) } else { resp };
                     let hovered = resp.contains_pointer() && !over_bar;
                     let lift = ui.ctx().animate_bool_with_time(resp.id.with("lift"), hovered, 0.12);
                     let shown = rect.expand(lift * 3.0);
@@ -1457,12 +1480,14 @@ impl App {
                         p.add(shadow.as_shape(shown, rad));
                     }
                     p.rect_filled(shown, rad, pal().card);
-                    let tex = match (g.art(Kind::Cover), &g.remote) { (Some(f), _) => self.tex.file(f, quality), (None, Some(u)) => self.tex.url(u), _ => None };
+                    let art = if icons { g.art(Kind::Icon).or(g.art(Kind::Cover)) } else { g.art(Kind::Cover) };
+                    let tex = match (art, &g.remote) { (Some(f), _) => self.tex.file(f, quality), (None, Some(u)) => self.tex.url(u), _ => None };
                     match tex {
                         Some(t) => paint_tex(ui, shown, t, true, rad),
                         None => {
                             let inner = rect.shrink(12.0);
-                            let galley = p.layout(g.name.clone(), egui::FontId::proportional(15.0), pal().muted, inner.width());
+                            let inner = if icons { rect.shrink(4.0) } else { inner };
+                            let galley = p.layout(g.name.clone(), egui::FontId::proportional(if icons { 10.0 } else { 15.0 }), pal().muted, inner.width());
                             p.galley(egui::pos2(inner.left(), rect.center().y - galley.size().y / 2.0), galley, pal().muted);
                         }
                     }
@@ -1485,46 +1510,43 @@ impl App {
                     }
                     else if selected { p.rect_stroke(shown, rad, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside); }
                     else if hovered { p.rect_stroke(shown, rad, Stroke::new(1.5_f32, Color32::from_gray(170)), egui::StrokeKind::Outside); }
-                    let center = rect.right_bottom() - egui::vec2(30.0, 30.0);
-                    if hovered && !blocked { play_icon(p, center, 21.0); }
-                    if running {
+                    let play_r = if icons { (w * 0.22).clamp(9.0, 21.0) } else { 21.0 };
+                    let center = if icons { rect.center() } else { rect.right_bottom() - egui::vec2(30.0, 30.0) };
+                    if hovered && !blocked { play_icon(p, center, play_r); }
+                    if icons {
+                        // Trop petit pour une étiquette : une pastille de couleur.
+                        let dot = if running { Some(OK) } else if g.pending || self.launched.contains_key(&g.id) { Some(GOLD) } else { None };
+                        if let Some(c) = dot { p.circle(rect.left_top() + egui::vec2(7.0, 7.0), 4.5, c, Stroke::new(1.5_f32, Color32::from_black_alpha(160))); }
+                    }
+                    else if running {
                         let b = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(72.0, 22.0));
                         p.rect_filled(b, 11.0, OK);
                         p.text(b.center(), egui::Align2::CENTER_CENTER, "En cours", egui::FontId::proportional(12.0), pal().on_accent);
                     }
-                    if !running && (g.pending || self.launched.contains_key(&g.id)) {
+                    if !icons && !running && (g.pending || self.launched.contains_key(&g.id)) {
                         let (label, width) = if g.pending { ("En attente", 82.0) } else { ("Lancement…", 88.0) };
                         let b = egui::Rect::from_min_size(rect.left_top() + egui::vec2(8.0, 8.0), egui::vec2(width, 22.0));
                         p.rect_filled(b, 11.0, GOLD);
                         p.text(b.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), Color32::from_rgb(0x24, 0x18, 0x04));
                     }
                     if self.cfg.favorites.contains(&gkey(self.accounts.get(self.account).map_or("", |a| &a.id), g.id)) {
-                        p.text(rect.right_top() + egui::vec2(-16.0, 16.0), egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(17.0), GOLD);
+                        let (at, fs) = if icons { (egui::vec2(-7.0, 7.0), 11.0) } else { (egui::vec2(-16.0, 16.0), 17.0) };
+                        p.text(rect.right_top() + at, egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(fs), GOLD);
                     }
                     if names {
                         let title = titles[n].clone();
                         let border = if selected { Stroke::new(1.0_f32, pal().accent) } else { Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7)) };
                         ui.painter().rect(name_box, if soft { 10.0 } else { 6.0 }, pal().menu, border, egui::StrokeKind::Inside);
-                        ui.painter().galley(egui::pos2(name_box.left() + 7.0, name_box.center().y - title.size().y / 2.0), title, pal().text);
+                        ui.painter().galley(egui::pos2(name_box.left() + if icons { 5.0 } else { 7.0 }, name_box.center().y - title.size().y / 2.0), title, pal().text);
                     }
                     if !over_bar {
-                        let st = MenuState {
-                            favorite: self.is_favorite(g.id),
-                            hidden: self.is_hidden(g.id),
-                            running,
-                            launching: self.launched.contains_key(&g.id),
-                            folder: g.folder.as_ref().is_some_and(|f| f.is_dir()),
-                            via_steam: self.acc().is_some_and(|a| self.cfg.via_steam.contains(&gkey(&a.id, g.id))),
-                            collection: self.wants_collection(g.id),
-                            sync_waiting: self.acc().and_then(|a| self.cfg.pending_sync.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id)),
-                            busy: self.busy.is_some(),
-                        };
+                        let st = self.menu_state(g);
                         resp.context_menu(|ui| { if let Some(m) = game_menu(ui, g, &st, &self.tools) { acts.push(Act::Menu(g.id, m)); } });
                     }
                     if over_bar {}
                     else if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
                     else if resp.clicked() {
-                        let on_play = hovered && !blocked && resp.interact_pointer_pos().is_some_and(|q| q.distance(center) <= 22.0);
+                        let on_play = hovered && !blocked && resp.interact_pointer_pos().is_some_and(|q| q.distance(center) <= play_r + 1.0);
                         acts.push(if on_play { Act::Launch(g.id) } else { Act::Select(g.id) });
                     }
                 }
@@ -1536,6 +1558,20 @@ impl App {
                 Act::Launch(id) => { self.selected = Some(id); self.launch(id); }
                 Act::Menu(id, m) => self.menu_action(ctx, id, m),
             }
+        }
+    }
+
+    fn menu_state(&self, g: &Game) -> MenuState {
+        MenuState {
+            favorite: self.is_favorite(g.id),
+            hidden: self.is_hidden(g.id),
+            running: self.running.contains(&g.id),
+            launching: self.launched.contains_key(&g.id),
+            folder: g.folder.as_ref().is_some_and(|f| f.is_dir()),
+            via_steam: self.acc().is_some_and(|a| self.cfg.via_steam.contains(&gkey(&a.id, g.id))),
+            collection: self.wants_collection(g.id),
+            sync_waiting: self.acc().and_then(|a| self.cfg.pending_sync.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id)),
+            busy: self.busy.is_some(),
         }
     }
 
@@ -1567,6 +1603,108 @@ impl App {
             Menu::CancelAdd => self.cancel_pending(ctx, id),
             Menu::RemoveLocal => self.remove_local(ctx, id),
             Menu::Remove => { self.remove_confirm = Some((id, Instant::now())); self.request_remove(ctx, &g); }
+        }
+    }
+
+    /// La bibliothèque en liste : une ligne par jeu, avec ses infos en colonnes.
+    #[allow(clippy::too_many_arguments)]
+    fn list_rows(&mut self, ui: &mut egui::Ui, vp: egui::Rect, visible: &[usize], offset: f32, over_bar: bool, scroll_to: bool, acts: &mut Vec<Act>) {
+        let row_h = (34.0 + (self.cfg.cover() - MIN_COVER) / (340.0 - MIN_COVER) * 62.0).round();
+        let gap = 6.0;
+        let step = row_h + gap;
+        let avail = ui.available_width() - 12.0;
+        self.columns = 1;
+        let soft = soft();
+        let rad = if soft { 12.0 } else { 7.0 };
+        ui.add_space(offset);
+        let (full, _) = ui.allocate_exact_size(egui::vec2(avail, visible.len() as f32 * step + 8.0), Sense::hover());
+        let rect_of = |n: usize| egui::Rect::from_min_size(full.min + egui::vec2(0.0, n as f32 * step), egui::vec2(avail, row_h));
+        if scroll_to {
+            if let Some(n) = self.selected.and_then(|s| visible.iter().position(|i| self.games[*i].id == s)) {
+                let mut target = rect_of(n).expand2(egui::vec2(0.0, 12.0));
+                target.min.y -= offset;
+                ui.scroll_to_rect(target, None);
+            }
+        }
+        let first = (((vp.min.y - offset) / step).floor().max(0.0) as usize).min(visible.len());
+        let last = ((((vp.max.y - offset) / step).ceil() as usize) + 1).min(visible.len());
+        // Colonnes d'infos, de droite à gauche ; elles s'effacent quand la place manque.
+        let cols: [(f32, &str); 3] = [(190.0, "Emplacement"), (120.0, "Dernière partie"), (100.0, "Temps de jeu")];
+        let name_min = 220.0;
+        let thumb = row_h - 8.0;
+        let mut room = avail - (thumb + 24.0) - name_min - 56.0;
+        let shown: Vec<usize> = (0..cols.len()).filter(|i| { let ok = room >= cols[*i].0; if ok { room -= cols[*i].0; } ok }).collect();
+        for n in first..last {
+            let g = &self.games[visible[n]];
+            let rect = rect_of(n);
+            let resp = ui.interact(rect, ui.id().with(("row", g.id)), Sense::click());
+            let hovered = resp.contains_pointer() && !over_bar;
+            let lift = ui.ctx().animate_bool_with_time(resp.id.with("lift"), hovered, 0.12);
+            let selected = self.selected == Some(g.id);
+            let running = self.running.contains(&g.id);
+            let launching = self.launched.contains_key(&g.id);
+            let blocked = running || g.pending || launching;
+            if hovered { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+            let p = ui.painter();
+            let base = if selected { blend(pal().card, pal().accent, 0.22) } else { pal().menu };
+            let fill = blend(base, pal().hover, 0.6 * lift);
+            if soft {
+                p.add(egui::Shadow { offset: [0, 2], blur: (8.0 + 8.0 * lift) as u8, spread: 0, color: Color32::from_black_alpha((40.0 + 50.0 * lift) as u8) }.as_shape(rect, rad));
+                if selected { glow(p, rect, rad, pal().accent, 0.6); }
+            }
+            p.rect_filled(rect, rad, fill);
+            if soft { gloss(p, rect, rad, 0.35 + 0.4 * lift); }
+            let edge = if selected { Stroke::new(1.5_f32, pal().accent) } else if soft { Stroke::new(1.0_f32, white((14.0 + 30.0 * lift) as u8)) } else { Stroke::NONE };
+            if edge != Stroke::NONE { p.rect_stroke(rect, rad, edge, egui::StrokeKind::Inside); }
+            let tr = egui::Rect::from_min_size(rect.left_top() + egui::vec2(4.0, 4.0), egui::vec2(thumb, thumb));
+            let art = g.art(Kind::Icon).or(g.art(Kind::Cover));
+            let tex = match (art, &g.remote) { (Some(f), _) => self.tex.file(f, 240), (None, Some(u)) => self.tex.url(u), _ => None };
+            let p = ui.painter();
+            p.rect_filled(tr, rad - 3.0, pal().card);
+            if let Some(t) = tex { paint_tex(ui, tr, t, true, (rad - 3.0) as u8); }
+            let p = ui.painter();
+            let x = tr.right() + 14.0;
+            let mut right = rect.right() - 14.0;
+            let center = egui::pos2(rect.right() - 24.0, rect.center().y);
+            let play_r = (row_h * 0.32).clamp(10.0, 18.0);
+            right -= 40.0;
+            if hovered && !blocked { play_icon(p, center, play_r); }
+            let info = |v: String, x_right: f32, w: f32, color: Color32| {
+                let gal = p.layout(v, egui::FontId::proportional(13.0), color, w - 8.0);
+                p.galley(egui::pos2(x_right - gal.size().x, rect.center().y - gal.size().y / 2.0), gal, color);
+            };
+            for i in &shown {
+                let (w, _) = cols[*i];
+                let v = match i { 0 => g.size.map_or_else(|| g.disk.clone(), |s| format!("{} · {}", g.disk, size(s))), 1 => last_played(g.last_played), _ => playtime(g.playtime) };
+                info(v, right, w, pal().muted);
+                right -= w;
+            }
+            let status = if running { Some(("En cours", OK)) } else if launching { Some(("Lancement…", GOLD)) } else if g.pending { Some(("En attente", GOLD)) } else { None };
+            if let Some((label, c)) = status {
+                let b = egui::Rect::from_min_size(egui::pos2(right - 92.0, rect.center().y - 11.0), egui::vec2(88.0, 22.0));
+                p.rect_filled(b, 11.0, c);
+                p.text(b.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), Color32::from_rgb(0x14, 0x14, 0x14));
+                right -= 96.0;
+            }
+            let star = self.cfg.favorites.contains(&gkey(self.accounts.get(self.account).map_or("", |a| &a.id), g.id));
+            let name_w = (right - x - if star { 24.0 } else { 6.0 }).max(40.0);
+            let mut job = egui::text::LayoutJob::simple_singleline(g.name.clone(), egui::FontId::proportional(if row_h >= 50.0 { 16.0 } else { 14.5 }), pal().text);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+            let gal = p.layout_job(job);
+            let name_y = rect.center().y - gal.size().y / 2.0;
+            let name_end = x + gal.size().x;
+            p.galley(egui::pos2(x, name_y), gal, pal().text);
+            if star { p.text(egui::pos2(name_end + 12.0, rect.center().y), egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(14.0), GOLD); }
+            if !over_bar {
+                let st = self.menu_state(g);
+                resp.context_menu(|ui| { if let Some(m) = game_menu(ui, g, &st, &self.tools) { acts.push(Act::Menu(g.id, m)); } });
+            }
+            if over_bar {}
+            else if resp.double_clicked() { acts.push(Act::Launch(g.id)); }
+            else if resp.clicked() {
+                let on_play = hovered && !blocked && resp.interact_pointer_pos().is_some_and(|q| q.distance(center) <= play_r + 1.0);
+                acts.push(if on_play { Act::Launch(g.id) } else { Act::Select(g.id) });
+            }
         }
     }
 
@@ -2133,7 +2271,7 @@ impl App {
                                 ui.spacing_mut().slider_width = 240.0;
                                 ui.horizontal(|ui| {
                                     ui.add_sized([120.0, 24.0], egui::Label::new(RichText::new("Taille").size(13.5)));
-                                    if ui.add(egui::Slider::new(&mut size, 110..=340).suffix(" px")).changed() { self.cfg.cover_size = size; self.dirty = true; }
+                                    if ui.add(egui::Slider::new(&mut size, MIN_COVER as u16..=340).suffix(" px")).changed() { self.cfg.cover_size = size; self.dirty = true; }
                                 });
                                 let t = &mut self.cfg.theme;
                                 field(ui, "Rendu");

@@ -10,6 +10,7 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 
 - **Tes jeux installés et non-Steam** réunis dans une seule grille, sans Proton ni les autres outils de Steam.
 - **Recherche, favoris et tri** par date, nom ou temps de jeu.
+- **Grille ou liste** : jaquettes de toutes tailles jusqu'aux simples icônes, ou une ligne par jeu avec temps de jeu, dernière partie et emplacement.
 - **Fiche de jeu** : temps de jeu, dernière partie, taille, disque et version de Proton.
 - **Lancement** en un double-clic, avec le bouton Jouer, la touche Entrée ou la manette.
 - **Jeux non-Steam lancés sans Steam**, avec Proton et dans leur préfixe habituel, donc avec les mêmes sauvegardes.
