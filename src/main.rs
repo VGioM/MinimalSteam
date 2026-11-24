@@ -33,6 +33,8 @@ use steam::{Account, Game, Kind};
 const LAUNCH_GUARD: Duration = Duration::from_secs(25);
 /// Hauteur des deux barres du haut.
 const TOP_H: f32 = 102.0;
+/// La largeur des options d'affichage complètes, dans la barre.
+const FULL_BAR_W: f32 = 440.0;
 /// Espace entre une jaquette et la case de son nom.
 const NAME_GAP: f32 = 6.0;
 /// Plus petite taille de case : celle d'une icône.
@@ -68,8 +70,19 @@ impl Sort {
     fn label(self) -> &'static str { match self { Sort::Recent => "Récents", Sort::Name => "A à Z", Sort::Playtime => "Temps de jeu" } }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Filter { All, Favorites, Steam, Other, Missing, Running, Hidden }
+
+impl Filter {
+    const ALL: [Filter; 7] = [Filter::All, Filter::Favorites, Filter::Steam, Filter::Other, Filter::Missing, Filter::Running, Filter::Hidden];
+    fn label(self) -> &'static str {
+        match self { Filter::All => "Tous", Filter::Favorites => "Favoris", Filter::Steam => "Steam", Filter::Other => "Non-Steam", Filter::Missing => "Non installés", Filter::Running => "Lancés", Filter::Hidden => "Cachés" }
+    }
+}
+
+/// Les options d'affichage de la barre (tri, taille, grille ou liste).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Bar { #[default] Full, Compact, Off }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Match { id: u64, name: String }
@@ -198,6 +211,10 @@ struct Config {
     hidden: HashSet<String>,
     /// Jeux non-Steam à retirer de Steam.
     pending_remove: HashMap<String, Vec<u32>>,
+    /// Les onglets dans l'ordre choisi, et s'ils sont affichés.
+    tabs: Vec<(Filter, bool)>,
+    /// Options d'affichage dans la barre : complètes, réduites à un bouton, ou retirées.
+    view_bar: Bar,
 }
 
 fn config_dir(app: &str) -> Option<PathBuf> {
@@ -229,6 +246,14 @@ impl Config {
 
 impl Config {
     fn cover(&self) -> f32 { if self.cover_size == 0 { 172.0 } else { (self.cover_size as f32).clamp(MIN_COVER, 340.0) } }
+    /// Tous les onglets dans l'ordre choisi : un onglet inconnu de la config arrive à la fin, affiché.
+    fn tab_list(&self) -> Vec<(Filter, bool)> {
+        let mut out: Vec<(Filter, bool)> = Vec::new();
+        for t in &self.tabs { if !out.iter().any(|o| o.0 == t.0) { out.push(*t); } }
+        for f in Filter::ALL { if !out.iter().any(|o| o.0 == f) { out.push((f, true)); } }
+        if !out.iter().any(|o| o.1) { out[0].1 = true; }
+        out
+    }
 }
 
 /// Ce que le menu clic droit doit savoir d'un jeu, en plus du jeu lui-même.
@@ -473,6 +498,8 @@ struct App {
     settings: bool,
     key_input: String,
     settings_tab: u8,
+    /// L'onglet qu'on déplace dans les réglages (sa place actuelle).
+    tab_drag: Option<usize>,
     color_edit: Option<usize>,
     dirty: bool,
     tools: Vec<(String, String)>,
@@ -524,7 +551,7 @@ impl App {
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
         };
         app.track_direct(direct_now);
         if std::env::var_os("APP_SCREENSHOT").is_some() {
@@ -1252,37 +1279,100 @@ impl App {
     }
 
     fn top_row(&mut self, ui: &mut egui::Ui, clear: bool) {
-        if clear {
-            // Une case ajustée au texte : un cadre classique prendrait toute la hauteur de la barre.
-            let galley = ui.painter().layout_no_wrap("MinimalSteam".to_string(), egui::FontId::proportional(16.0), pal().text);
-            let (r, _) = ui.allocate_exact_size(galley.size() + egui::vec2(16.0, 6.0), Sense::hover());
-            ui.painter().rect(r, 6.0, pal().menu, Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7)), egui::StrokeKind::Inside);
-            ui.painter().galley(r.center() - galley.size() / 2.0, galley, pal().text);
-        } else {
-            ui.label(RichText::new("MinimalSteam").size(17.0).strong());
+        // Fenêtre étroite : le titre disparaît, le bouton d'ajout se réduit à « + », la recherche rétrécit.
+        let avail = ui.available_width();
+        let narrow = avail < 620.0;
+        let add_label = if narrow { "+" } else { "+ Ajouter des jeux" };
+        let add_w = text_w(ui, add_label, 14.0) + 28.0;
+        let show_title = avail >= 560.0;
+        let title_w = if show_title { text_w(ui, "MinimalSteam", 17.0) + 30.0 } else { 0.0 };
+        if show_title {
+            if clear {
+                // Une case ajustée au texte : un cadre classique prendrait toute la hauteur de la barre.
+                let galley = ui.painter().layout_no_wrap("MinimalSteam".to_string(), egui::FontId::proportional(16.0), pal().text);
+                let (r, _) = ui.allocate_exact_size(galley.size() + egui::vec2(16.0, 6.0), Sense::hover());
+                ui.painter().rect(r, 6.0, pal().menu, Stroke::new(1.0_f32, pal().line.gamma_multiply(0.7)), egui::StrokeKind::Inside);
+                ui.painter().galley(r.center() - galley.size() / 2.0, galley, pal().text);
+            } else {
+                ui.label(RichText::new("MinimalSteam").size(17.0).strong());
+            }
+            ui.add_space(14.0);
         }
-        ui.add_space(14.0);
-        let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(260.0).margin(Margin::symmetric(10, 5)).background_color(pal().menu));
+        let search_w = (avail - title_w - add_w - 32.0 - 40.0).clamp(90.0, 260.0);
+        let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(search_w).margin(Margin::symmetric(10, 5)).background_color(pal().menu));
         if self.focus_search { r.request_focus(); self.focus_search = false; }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.visuals_mut().widgets.inactive.weak_bg_fill = pal().menu;
             if ui.add(egui::Button::new(RichText::new("⚙").size(16.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Réglages").clicked() { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
-            if fill_button(ui, "+ Ajouter des jeux", egui::vec2(0.0, 30.0), 14.0, pal().accent, true) { self.open_add(); }
+            let min = egui::vec2(if narrow { 34.0 } else { 0.0 }, 30.0);
+            if fill_button(ui, add_label, min, 14.0, pal().accent, true) { self.open_add(); }
         });
     }
 
+    fn tab_label(&self, f: Filter) -> String {
+        let n = match f {
+            Filter::Running => self.running.len() + self.launched.keys().filter(|i| !self.running.contains(i)).count(),
+            Filter::Hidden => self.acc().map_or(0, |a| { let p = format!("{}:", a.id); self.games.iter().filter(|g| self.cfg.hidden.contains(&format!("{p}{}", g.id))).count() }),
+            _ => 0,
+        };
+        if n > 0 { format!("{} ({n})", f.label()) } else { f.label().to_string() }
+    }
+
     fn tools_row(&mut self, ui: &mut egui::Ui, _clear: bool) {
-        pill().show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 1.0;
-            let active = self.running.len() + self.launched.keys().filter(|i| !self.running.contains(i)).count();
-            let launched = if active > 0 { format!("Lancés ({active})") } else { "Lancés".to_string() };
-            let hidden = self.acc().map_or(0, |a| { let p = format!("{}:", a.id); self.games.iter().filter(|g| self.cfg.hidden.contains(&format!("{p}{}", g.id))).count() });
-            let hidden_label = if hidden > 0 { format!("Cachés ({hidden})") } else { "Cachés".to_string() };
-            for (f, label) in [(Filter::All, "Tous"), (Filter::Favorites, "Favoris"), (Filter::Steam, "Steam"), (Filter::Other, "Non-Steam"), (Filter::Missing, "Non installés"), (Filter::Running, launched.as_str()), (Filter::Hidden, hidden_label.as_str())] {
-                if chip(ui, label, self.filter == f) { self.filter = f; }
-            }
-        });
+        let tabs: Vec<Filter> = self.cfg.tab_list().into_iter().filter(|t| t.1).map(|t| t.0).collect();
+        if !tabs.contains(&self.filter) { self.filter = tabs[0]; self.selected = None; }
+        let labels: Vec<String> = tabs.iter().map(|f| self.tab_label(*f)).collect();
+        let widths: Vec<f32> = labels.iter().map(|l| chip_w(ui, l)).collect();
+        let tabs_w = widths.iter().sum::<f32>() + (tabs.len() as f32 - 1.0).max(0.0) + 8.0;
+        let avail = ui.available_width();
+        // Options complètes si la place le permet, sinon un seul bouton « Affichage ».
+        let mut bar = self.cfg.view_bar;
+        if bar == Bar::Full && tabs_w + 16.0 + FULL_BAR_W > avail { bar = Bar::Compact; }
+        let right_w = match bar { Bar::Full => FULL_BAR_W, Bar::Compact => chip_w(ui, "Affichage ▾") + 8.0, Bar::Off => 0.0 };
+        let room = avail - right_w - 16.0;
+        // Les onglets qui ne tiennent pas passent dans un menu « Plus ».
+        let mut shown = tabs.len();
+        if tabs_w > room {
+            let more_w = chip_w(ui, "Plus ▾").max(self.filter_more_w(ui, &tabs, &labels));
+            let mut used = 8.0 + more_w;
+            shown = 0;
+            for w in &widths { if used + w + 1.0 > room { break; } used += w + 1.0; shown += 1; }
+        }
+        if shown > 0 || shown < tabs.len() {
+            pill().show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 1.0;
+                for i in 0..shown {
+                    if chip(ui, &labels[i], self.filter == tabs[i]) { self.filter = tabs[i]; }
+                }
+                if shown < tabs.len() {
+                    let cur = (shown..tabs.len()).find(|i| tabs[*i] == self.filter);
+                    let title = cur.map_or("Plus ▾".to_string(), |i| format!("{} ▾", labels[i]));
+                    let resp = chip_resp(ui, &title, cur.is_some());
+                    let id = ui.id().with("more_tabs");
+                    if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(id)); }
+                    egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(150.0);
+                        for i in shown..tabs.len() {
+                            if ui.selectable_label(self.filter == tabs[i], &labels[i]).clicked() { self.filter = tabs[i]; }
+                        }
+                    });
+                }
+            });
+        }
+        if bar == Bar::Off { return; }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if bar == Bar::Compact {
+                pill().show(ui, |ui| {
+                    let resp = chip_resp(ui, "Affichage ▾", false).on_hover_text("Tri, taille, grille ou liste");
+                    let id = ui.id().with("view_menu");
+                    if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(id)); }
+                    egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                        ui.set_min_width(250.0);
+                        self.view_options(ui);
+                    });
+                });
+                return;
+            }
             pill().inner_margin(Margin::symmetric(8, 2)).show(ui, |ui| {
                 ui.spacing_mut().interact_size.y = 24.0;
                 ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
@@ -1300,9 +1390,81 @@ impl App {
                 ui.label(RichText::new("Taille").size(13.0).color(pal().muted));
                 ui.add_space(8.0);
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if chip(ui, "Liste", self.cfg.list_view) && !self.cfg.list_view { self.cfg.list_view = true; self.cfg.save(); self.scroll_to = true; }
-                if chip(ui, "Grille", !self.cfg.list_view) && self.cfg.list_view { self.cfg.list_view = false; self.cfg.save(); self.scroll_to = true; }
+                if chip(ui, "Liste", self.cfg.list_view) && !self.cfg.list_view { self.set_list(true); }
+                if chip(ui, "Grille", !self.cfg.list_view) && self.cfg.list_view { self.set_list(false); }
             });
+        });
+    }
+
+    /// La largeur du bouton « Plus » quand il porte le nom de l'onglet choisi.
+    fn filter_more_w(&self, ui: &egui::Ui, tabs: &[Filter], labels: &[String]) -> f32 {
+        tabs.iter().position(|f| *f == self.filter).map_or(0.0, |i| chip_w(ui, &format!("{} ▾", labels[i])))
+    }
+
+    /// La liste des onglets dans les réglages : case à cocher et glisser-déposer.
+    fn tabs_editor(&mut self, ui: &mut egui::Ui) {
+        let mut tabs = self.cfg.tab_list();
+        let shown = tabs.iter().filter(|t| t.1).count();
+        let width = ui.available_width().min(340.0);
+        let mut rects = Vec::with_capacity(tabs.len());
+        let mut changed = false;
+        let pointer = ui.ctx().pointer_interact_pos();
+        if self.tab_drag.is_some() && !ui.input(|i| i.pointer.any_down()) { self.tab_drag = None; changed = true; }
+        ui.spacing_mut().item_spacing.y = 3.0;
+        for i in 0..tabs.len() {
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(width, 30.0), Sense::drag());
+            rects.push(r);
+            let dragging = self.tab_drag == Some(i);
+            if resp.drag_started() { self.tab_drag = Some(i); }
+            let hover = resp.hovered() || dragging;
+            let fill = if dragging { blend(pal().card, pal().accent, 0.18) } else if hover { pal().hover } else { pal().card };
+            let rad = if soft() { 10.0 } else { 6.0 };
+            if dragging && soft() { glow(ui.painter(), r, rad, pal().accent, 0.6); }
+            ui.painter().rect_filled(r, rad, fill);
+            if dragging { ui.painter().rect_stroke(r, rad, Stroke::new(1.0_f32, pal().accent), egui::StrokeKind::Inside); }
+            // Poignée : trois traits.
+            let h = egui::pos2(r.left() + 16.0, r.center().y);
+            for dy in [-4.0, 0.0, 4.0] { ui.painter().line_segment([h + egui::vec2(-5.0, dy), h + egui::vec2(5.0, dy)], Stroke::new(1.5_f32, pal().muted)); }
+            resp.on_hover_cursor(if dragging { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            let box_rect = egui::Rect::from_min_size(egui::pos2(r.left() + 32.0, r.top()), egui::vec2(width - 40.0, r.height()));
+            let mut on = tabs[i].1;
+            let last = on && shown == 1;
+            let cb = ui.scope_builder(egui::UiBuilder::new().max_rect(box_rect).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| ui.checkbox(&mut on, RichText::new(tabs[i].0.label()).size(13.5))).inner;
+            let cb = if last { cb.on_hover_text("Il faut garder au moins un onglet.") } else { cb };
+            if cb.changed() && !last { tabs[i].1 = on; changed = true; }
+        }
+        // Pendant le glissement, l'onglet prend la place de son voisin dès qu'on passe son milieu.
+        if let (Some(d), Some(p)) = (self.tab_drag, pointer) {
+            if d > 0 && p.y < rects[d - 1].center().y { tabs.swap(d, d - 1); self.tab_drag = Some(d - 1); changed = true; }
+            else if d + 1 < tabs.len() && p.y > rects[d + 1].center().y { tabs.swap(d, d + 1); self.tab_drag = Some(d + 1); changed = true; }
+            ui.ctx().request_repaint();
+        }
+        if changed { self.cfg.tabs = tabs; self.cfg.save(); }
+    }
+
+    fn set_list(&mut self, on: bool) { self.cfg.list_view = on; self.cfg.save(); self.scroll_to = true; }
+
+    /// Tri, vue et taille : dans le menu « Affichage » et dans les réglages.
+    fn view_options(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let row = |ui: &mut egui::Ui, t: &str| { ui.add_sized([64.0, 26.0], egui::Label::new(RichText::new(t).size(13.0).color(pal().muted))); };
+        ui.horizontal(|ui| {
+            row(ui, "Tri");
+            for s in [Sort::Recent, Sort::Name, Sort::Playtime] {
+                if chip(ui, s.label(), self.cfg.sort == s) && self.cfg.sort != s { self.cfg.sort = s; self.cfg.save(); }
+            }
+        });
+        ui.horizontal(|ui| {
+            row(ui, "Vue");
+            if chip(ui, "Grille", !self.cfg.list_view) && self.cfg.list_view { self.set_list(false); }
+            if chip(ui, "Liste", self.cfg.list_view) && !self.cfg.list_view { self.set_list(true); }
+        });
+        ui.horizontal(|ui| {
+            row(ui, "Taille");
+            let mut size = self.cfg.cover() as u16;
+            ui.spacing_mut().slider_width = 160.0;
+            let tip = if self.cfg.list_view { "Hauteur des lignes" } else { "Taille des jaquettes (à gauche : icônes)" };
+            if ui.add(egui::Slider::new(&mut size, MIN_COVER as u16..=340).suffix(" px")).on_hover_text(tip).changed() { self.cfg.cover_size = size; self.dirty = true; }
         });
     }
 
@@ -2183,7 +2345,7 @@ impl App {
         let sync_rows: Vec<(u32, String)> = to_sync.iter().filter_map(|i| Some((*i, self.game(*i)?.name.clone()))).collect();
         let screen = ctx.screen_rect();
         let demo = self.hook.demo;
-        let width = (screen.width() - 80.0).clamp(640.0, 760.0);
+        let width = (screen.width() - 120.0).clamp(440.0, 760.0);
         let height = (screen.height() - 150.0).clamp(340.0, 540.0);
         // Fond peu assombri : on voit le résultat pendant qu'on règle.
         let modal = egui::Modal::new(egui::Id::new("settings")).backdrop_color(Color32::from_black_alpha(60)).frame(modal_frame(ctx)).show(ctx, |ui| {
@@ -2266,22 +2428,32 @@ impl App {
                                 }
                             }
                             2 => {
-                                let mut size = self.cfg.cover() as u16;
-                                field(ui, "Jaquettes");
-                                ui.spacing_mut().slider_width = 240.0;
+                                field(ui, "Bibliothèque");
+                                self.view_options(ui);
+                                ui.add_space(10.0);
+                                field(ui, "Options d'affichage dans la barre");
                                 ui.horizontal(|ui| {
-                                    ui.add_sized([120.0, 24.0], egui::Label::new(RichText::new("Taille").size(13.5)));
-                                    if ui.add(egui::Slider::new(&mut size, MIN_COVER as u16..=340).suffix(" px")).changed() { self.cfg.cover_size = size; self.dirty = true; }
-                                });
-                                let t = &mut self.cfg.theme;
-                                field(ui, "Rendu");
-                                ui.horizontal(|ui| {
-                                    for (l, label, tip) in [(Look::Soft, "Lumière", "Commandes arrondies, reflets, halos et ombres douces."), (Look::Legacy, "Legacy", "Le rendu plat d'origine.")] {
-                                        if chip(ui, label, t.look == l) && t.look != l { t.look = l; changed = true; }
-                                        ui.label(RichText::new(tip).size(12.5).color(pal().muted));
-                                        ui.add_space(6.0);
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    for (b, label) in [(Bar::Full, "Complètes"), (Bar::Compact, "Bouton « Affichage »"), (Bar::Off, "Cachées")] {
+                                        if chip(ui, label, self.cfg.view_bar == b) && self.cfg.view_bar != b { self.cfg.view_bar = b; self.cfg.save(); }
                                     }
                                 });
+                                ui.label(RichText::new("Quand la fenêtre est étroite, elles passent d'elles-mêmes dans le bouton « Affichage ».").size(12.5).color(pal().muted));
+                                ui.add_space(10.0);
+                                field(ui, "Onglets");
+                                ui.label(RichText::new("Coche ceux à montrer, glisse-les pour changer leur ordre.").size(12.5).color(pal().muted));
+                                ui.add_space(4.0);
+                                self.tabs_editor(ui);
+                                ui.add_space(12.0);
+                                let t = &mut self.cfg.theme;
+                                field(ui, "Rendu");
+                                for (l, label, tip) in [(Look::Soft, "Lumière", "Commandes arrondies, reflets, halos et ombres douces."), (Look::Legacy, "Legacy", "Le rendu plat d'origine.")] {
+                                    ui.horizontal(|ui| {
+                                        ui.allocate_ui(egui::vec2(80.0, 26.0), |ui| { if chip(ui, label, t.look == l) && t.look != l { t.look = l; changed = true; } });
+                                        ui.add_space(86.0 - ui.min_rect().width());
+                                        ui.add(egui::Label::new(RichText::new(tip).size(12.5).color(pal().muted)).wrap());
+                                    });
+                                }
                                 ui.add_space(8.0);
                                 changed |= slider_row(ui, "Arrondi", &mut t.radius, 24, " px");
                                 ui.add_space(8.0);
@@ -2550,10 +2722,18 @@ fn pill() -> egui::Frame {
     }
 }
 
-fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool {
+fn text_w(ui: &egui::Ui, text: &str, size: f32) -> f32 { ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(size), pal().text).size().x }
+
+/// Un texte qui finit par « ▾ » ouvre un menu : la flèche est dessinée, la police ne l'a pas.
+fn chip_w(ui: &egui::Ui, text: &str) -> f32 {
+    match text.strip_suffix(" ▾") { Some(t) => text_w(ui, t, 13.5) + 34.0, None => text_w(ui, text, 13.5) + 20.0 }
+}
+
+fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool { chip_resp(ui, text, on).clicked() }
+
+fn chip_resp(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     let font = egui::FontId::proportional(13.5);
-    let width = ui.painter().layout_no_wrap(text.to_string(), font.clone(), pal().text).size().x;
-    let (r, resp) = ui.allocate_exact_size(egui::vec2(width + 20.0, 26.0), Sense::click());
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(chip_w(ui, text), 26.0), Sense::click());
     let hover = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.12);
     let (fill, color) = if on {
         (blend(pal().accent, Color32::WHITE, 0.12 * hover), pal().on_accent)
@@ -2568,8 +2748,15 @@ fn chip(ui: &mut egui::Ui, text: &str, on: bool) -> bool {
     } else {
         ui.painter().rect_filled(r, 6.0, fill);
     }
-    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, text, font, color);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    match text.strip_suffix(" ▾") {
+        Some(t) => {
+            ui.painter().text(egui::pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, t, font, color);
+            let c = egui::pos2(r.right() - 13.0, r.center().y + 1.0);
+            ui.painter().add(egui::Shape::line(vec![c + egui::vec2(-3.5, -2.0), c + egui::vec2(0.0, 1.5), c + egui::vec2(3.5, -2.0)], Stroke::new(1.5_f32, color)));
+        }
+        None => { ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, text, font, color); }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Bouton plein : s'éclaircit au survol et s'assombrit à l'appui.
@@ -2659,7 +2846,7 @@ fn theme_card(ui: &mut egui::Ui, p: (&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]), 
 
 fn slider_row(ui: &mut egui::Ui, label: &str, value: &mut u8, max: u8, suffix: &str) -> bool {
     let mut changed = false;
-    ui.spacing_mut().slider_width = 240.0;
+    ui.spacing_mut().slider_width = (ui.available_width() - 200.0).clamp(100.0, 240.0);
     ui.horizontal(|ui| {
         ui.add_sized([120.0, 24.0], egui::Label::new(RichText::new(label).size(13.5)));
         changed = ui.add(egui::Slider::new(value, 0..=max).suffix(suffix)).changed();
@@ -2906,6 +3093,13 @@ impl TestHook {
     }
 }
 
+/// Pour les tests : la taille de la fenêtre (« largeur,hauteur »).
+fn test_size() -> Option<[f32; 2]> {
+    let v = std::env::var("APP_WINDOW_SIZE").ok()?;
+    let (w, h) = v.split_once(',')?;
+    Some([w.trim().parse().ok()?, h.trim().parse().ok()?])
+}
+
 fn main() -> eframe::Result {
     // Les captures de test tournent à côté de la vraie fenêtre.
     let instance = if std::env::var_os("APP_SCREENSHOT").is_some() { None } else {
@@ -2920,7 +3114,7 @@ fn main() -> eframe::Result {
         let (w, h) = i.dimensions();
         egui::IconData { rgba: i.into_raw(), width: w, height: h }
     });
-    let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id(app_id).with_inner_size([1360.0, 860.0]).with_min_inner_size([900.0, 560.0]).with_transparent(false);
+    let mut viewport = egui::ViewportBuilder::default().with_title("MinimalSteam").with_app_id(app_id).with_inner_size(test_size().unwrap_or([1360.0, 860.0])).with_min_inner_size([640.0, 460.0]).with_transparent(false);
     if let Some(i) = icon { viewport = viewport.with_icon(i); }
     let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Glow, vsync: true, ..Default::default() };
     eframe::run_native("MinimalSteam", options, Box::new(move |cc| { single::listen(instance, cc.egui_ctx.clone()); Ok(Box::new(App::new(cc))) }))
