@@ -36,7 +36,7 @@ pub(crate) struct Overview { total: u32, played: usize, played_m: usize, fig: Fi
 #[derive(PartialEq)]
 struct CacheKey { rev: u64, query: String, hidden: usize, account: usize, minute: u64 }
 
-pub(crate) struct StatsCache { key: CacheKey, ranges: Rc<Ranges>, list: Rc<Vec<(u32, String, u32)>>, games: HashMap<u32, Rc<GameData>>, overview: Option<Rc<Overview>>, day: Option<((u64, Option<u32>), Rc<DayData>)>, reports: HashMap<(Option<u32>, Period, i32, i32), Rc<Report>>, data_months: Option<Rc<Vec<((i32, u32), u32)>>>, months: HashMap<(Option<u32>, i32), Rc<(Vec<u32>, Vec<u64>)>> }
+pub(crate) struct StatsCache { key: CacheKey, ranges: Rc<Ranges>, list: Rc<Vec<(u32, String, u32)>>, games: HashMap<u32, Rc<GameData>>, overview: Option<Rc<Overview>>, day: Option<((u64, Option<u32>), Rc<DayData>)>, reports: HashMap<(Option<u32>, Period, i32, i32), Rc<Report>>, views: HashMap<(u64, usize, usize), Rc<StackView>>, data_months: Option<Rc<Vec<((i32, u32), u32)>>>, months: HashMap<(Option<u32>, i32), Rc<(Vec<u32>, Vec<u64>)>> }
 
 /// La période du rapport.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -47,7 +47,76 @@ pub(crate) struct Report {
     total: u32, sessions: usize, longest: Option<(u32, u64, String)>, days: usize, span: usize, best: Option<(u64, u32)>,
     by_game: Vec<(u32, String, u32)>, hours: Vec<u32>, weekdays: Vec<u32>, weekday_n: Vec<u32>,
     months: Vec<u32>, month_starts: Vec<u64>, heat_days: Vec<u64>, heat: Vec<u32>,
+    /// Temps de la période d'avant, de même longueur (sauf « Tout »), et son nom.
+    prev: Option<(u32, &'static str)>,
+    /// Par heure (total, moyenne par jour, aujourd'hui) et par jour de la semaine : le temps de chaque jeu.
+    hour_views: [Rc<StackView>; 3], week_view: Rc<StackView>,
+    /// Par heure et par jour de la semaine : le temps de chaque jeu et les dernières parties.
+    hours_by: Vec<Vec<(u32, u32)>>, week_by: Vec<Vec<(u32, u32)>>,
+    hour_sessions: Vec<Vec<Played>>, week_sessions: Vec<Vec<Played>>,
+    /// Moments de la journée : nuit, matin, après-midi, soir.
+    moments: [u32; 4],
+    records: Records,
+    /// Rang de chaque jeu dans la période : il donne sa couleur partout sur la page.
+    rank: Rc<HashMap<u32, usize>>,
 }
+
+/// Une partie, pour les listes : (début, durée, jeu).
+type Played = (u64, u32, String);
+
+/// Les records, sur tout l'historique.
+#[derive(Default)]
+pub(crate) struct Records { longest: Option<(u32, u64, String)>, best_day: Option<(u64, u32)>, streak: usize, best_month: Option<(u64, u32)>, latest: Option<u64>, night: u32, total: u32, sessions: usize }
+
+/// Des barres découpées par jeu : pour chaque barre, ses morceaux (couleur, secondes) et le
+/// texte du survol (un jeu par ligne).
+#[derive(Default)]
+pub(crate) struct StackView { segs: Vec<Vec<(Color32, u32)>>, lines: Vec<String> }
+
+const MOMENTS: [&str; 4] = ["Nuit (0h – 6h)", "Matin (6h – 12h)", "Après-midi (12h – 18h)", "Soirée (18h – 24h)"];
+
+/// Le rang des jeux (couleur) et leur nom ; les jeux sans rang sont regroupés en gris.
+fn stack_view(parts: &[Vec<(u32, u32)>], rank: &HashMap<u32, usize>, names: &HashMap<u32, String>, scale: u32) -> StackView {
+    let mut v = StackView::default();
+    for bar in parts {
+        let mut ranked: Vec<(usize, u32)> = Vec::new();
+        let mut other = 0;
+        for (id, secs) in bar {
+            match rank.get(id).filter(|r| **r < LANES.len()) { Some(r) => ranked.push((*r, *secs / scale.max(1))), None => other += *secs / scale.max(1) }
+        }
+        ranked.sort();
+        let mut segs: Vec<(Color32, u32)> = ranked.iter().map(|(r, s)| (lane_color(*r, false), *s)).filter(|x| x.1 > 0).collect();
+        if other > 0 { segs.push((Color32::from_gray(130), other)); }
+        v.segs.push(segs);
+        let mut sorted: Vec<&(u32, u32)> = bar.iter().filter(|x| x.1 / scale.max(1) > 0).collect();
+        sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
+        let mut lines: Vec<String> = sorted.iter().take(5).map(|(id, secs)| format!("{} : {}", names.get(id).map_or("?", |n| n.as_str()), session(*secs / scale.max(1)))).collect();
+        if sorted.len() > 5 { lines.push(format!("et {} autre{}", sorted.len() - 5, if sorted.len() > 6 { "s" } else { "" })); }
+        v.lines.push(lines.join("\n"));
+    }
+    v
+}
+
+/// Le temps de chaque jeu, jour par jour (`edges` : les minuits).
+fn per_day_by_game(all: &[(u32, String, Session)], edges: &[u64]) -> Vec<Vec<(u32, u32)>> {
+    let mut by: HashMap<u32, Vec<&Session>> = HashMap::new();
+    for (id, _, s) in all { by.entry(*id).or_default().push(s); }
+    let mut out = vec![Vec::new(); edges.len().saturating_sub(1)];
+    for (id, ss) in by {
+        for (d, secs) in stats::per_day_in(&ss, edges).into_iter().enumerate() { if secs > 0 { out[d].push((id, secs)); } }
+    }
+    out
+}
+
+/// Découpe une partie heure par heure : (heure locale, secondes).
+fn hour_slices(s: &Session) -> Vec<(usize, u32)> {
+    let (mut t, end, mut out) = (s.start, s.start + s.secs as u64, Vec::new());
+    // Les fuseaux d'ici sont décalés d'heures entières : une heure locale commence avec une heure UTC.
+    while t < end { let next = (t / 3600 + 1) * 3600; out.push((stats::hour_of(t), (next.min(end) - t) as u32)); t = next; }
+    out
+}
+
+fn overlap(s: &Session, lo: u64, hi: u64) -> u32 { (s.start + s.secs as u64).min(hi).saturating_sub(s.start.max(lo)) as u32 }
 
 const SHORT_MONTHS: [&str; 12] = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.", "déc."];
 const WEEKDAYS: [&str; 7] = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
@@ -134,7 +203,7 @@ impl App {
         let p = self.acc_prefix();
         let running: HashSet<String> = self.running.iter().map(|i| format!("{p}{i}")).collect();
         let names = self.names();
-        let (started, ended) = self.stats.tick(&p, &running, &names, stats::now());
+        let (started, ended) = self.stats.tick(&p, &running, &names, stats::now(), self.stats_alive);
         // Rien n'est écrit pendant la partie : seulement son début, puis sa fin.
         if ended { self.save_stats(); } else if started { self.save_stats_with(false); }
     }
@@ -154,10 +223,14 @@ impl App {
 
     /// Une fois par ouverture : le journal du système retrouve les parties lancées sans Steam
     /// pendant que l'app était fermée ou quand le PC a planté.
-    fn read_journal(&self) {
+    pub(crate) fn read_journal(&self) {
         if std::env::var_os("APP_SCREENSHOT").is_some() { return; }
         let tx = self.tx.clone();
-        std::thread::spawn(move || { let _ = tx.send(Msg::Journal(direct::journal_runs(60))); });
+        std::thread::spawn(move || {
+            // Le journal écrit la fin de la partie un instant après.
+            std::thread::sleep(Duration::from_secs(3));
+            let _ = tx.send(Msg::Journal(direct::journal_runs(60)));
+        });
     }
 
     pub(crate) fn apply_journal(&mut self, ctx: &egui::Context, runs: Vec<direct::Run>, going: Vec<(u32, u64)>) {
@@ -259,7 +332,7 @@ impl App {
                 .filter(|g| key.query.is_empty() || g.name.to_lowercase().contains(&key.query))
                 .map(|g| (g.id, g.name.clone(), self.agg(g.id, &idx, t, false).total)).collect();
             list.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
-            self.stats_cached = Some(StatsCache { key, ranges: Rc::new(Ranges::new(t)), list: Rc::new(list), games: HashMap::new(), overview: None, day: None, reports: HashMap::new(), months: HashMap::new(), data_months: None });
+            self.stats_cached = Some(StatsCache { key, ranges: Rc::new(Ranges::new(t)), list: Rc::new(list), games: HashMap::new(), overview: None, day: None, reports: HashMap::new(), months: HashMap::new(), views: HashMap::new(), data_months: None });
         }
         self.stats_cached.as_mut().expect("cache")
     }
@@ -468,7 +541,7 @@ impl App {
         ];
         // En haut, côte à côte : la vue d'ensemble et le rapport de la période choisie.
         let rep = self.report_top(ui, None, "Vue d'ensemble", left);
-        self.charts_block(ui, None, f, &r);
+        self.charts_block(ui, None, f, &r, Some(&rep.rank));
         self.day_panel(ui, None, pick);
         ui.add_space(12.0);
         let ever: Vec<(u32, String, u32)> = list.iter().filter(|l| l.2 > 0).take(6).cloned().collect();
@@ -640,7 +713,7 @@ impl App {
             ("Série en cours".into(), f.streak.clone(), String::new()),
         ];
         let rep = self.report_top(ui, Some(id), "Ce jeu", left);
-        self.charts_block(ui, Some(id), f, &r);
+        self.charts_block(ui, Some(id), f, &r, None);
         self.day_panel(ui, Some(id), pick);
         ui.add_space(4.0);
         let since = if a.since > 0 { format!("Jour par jour depuis le {}.", short_date(a.since)) } else { "Le jour par jour commence à ta prochaine partie.".into() };
@@ -864,26 +937,29 @@ fn streak(days: &[u32]) -> String {
 
 /// Les trois graphiques. `month` : les jours du mois affiché et leurs minuits, `back` : combien de
 /// mois en arrière. Rend le jour cliqué (son minuit) et le changement de mois demandé.
-fn charts(ui: &mut egui::Ui, f: &Figures, r: &Ranges, selected: Option<u64>, month: (&[u32], &[u64]), back: i32) -> (Option<u64>, i32) {
+/// `views` : les barres découpées par jeu (cette semaine, la dernière, le mois), sur la vue d'ensemble.
+#[allow(clippy::too_many_arguments)]
+fn charts(ui: &mut egui::Ui, f: &Figures, r: &Ranges, selected: Option<u64>, month: (&[u32], &[u64]), back: i32, views: Option<[&StackView; 3]>) -> (Option<u64>, i32) {
     let mut nav = 0;
     let wide = ui.available_width() > 640.0;
     let mut clicked = None;
-    let mut week_chart = |ui: &mut egui::Ui, title: &str, v: &[u32], edges: &[u64]| {
+    let mut week_chart = |ui: &mut egui::Ui, title: &str, v: &[u32], edges: &[u64], st: Option<&StackView>| {
         pill().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             chart_title(ui, title, v.iter().sum());
-            if let Some(i) = bars(ui, v, edges, |i| DAYS[i % 7].trim_end_matches('.').to_string(), r.today, selected, 120.0) { clicked = edges.get(i).copied(); }
+            if let Some(i) = bars(ui, v, edges, |i| DAYS[i % 7].trim_end_matches('.').to_string(), r.today, selected, 120.0, st) { clicked = edges.get(i).copied(); }
         });
     };
+    let view = |k: usize| views.map(|v| v[k]);
     if wide {
         ui.columns(2, |c| {
-            week_chart(&mut c[0], "Cette semaine", &f.this_w, &r.week);
-            week_chart(&mut c[1], "Semaine dernière", &f.last_w, &r.last_week);
+            week_chart(&mut c[0], "Cette semaine", &f.this_w, &r.week, view(0));
+            week_chart(&mut c[1], "Semaine dernière", &f.last_w, &r.last_week, view(1));
         });
     } else {
-        week_chart(ui, "Cette semaine", &f.this_w, &r.week);
+        week_chart(ui, "Cette semaine", &f.this_w, &r.week, view(0));
         ui.add_space(8.0);
-        week_chart(ui, "Semaine dernière", &f.last_w, &r.last_week);
+        week_chart(ui, "Semaine dernière", &f.last_w, &r.last_week, view(1));
     }
     ui.add_space(8.0);
     pill().inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
@@ -897,9 +973,12 @@ fn charts(ui: &mut egui::Ui, f: &Figures, r: &Ranges, selected: Option<u64>, mon
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new(hm(v.iter().sum())).size(13.5).color(pal().muted)); });
         });
         ui.add_space(4.0);
-        if let Some(i) = bars(ui, v, edges, |i| (i + 1).to_string(), r.today, selected, 130.0) { clicked = edges.get(i).copied(); }
+        if let Some(i) = bars(ui, v, edges, |i| (i + 1).to_string(), r.today, selected, 130.0, view(2)) { clicked = edges.get(i).copied(); }
     });
-    if selected.is_none() { ui.label(RichText::new("Clique sur un jour pour voir son détail heure par heure.").size(12.0).color(pal().muted)); }
+    if selected.is_none() {
+        let t = if views.is_some() { "Chaque couleur est un jeu (les mêmes que dans la répartition du rapport). Survole une barre pour le détail, clique sur un jour pour le voir heure par heure." } else { "Clique sur un jour pour voir son détail heure par heure." };
+        ui.add(egui::Label::new(RichText::new(t).size(12.0).color(pal().muted)).wrap());
+    }
     (clicked, nav)
 }
 
@@ -913,17 +992,18 @@ fn chart_title(ui: &mut egui::Ui, title: &str, sum: u32) {
 
 /// Un graphique en barres : une barre par jour (`starts` : les minuits), la valeur exacte au survol.
 /// Rend la barre cliquée.
-fn bars(ui: &mut egui::Ui, v: &[u32], starts: &[u64], label: impl Fn(usize) -> String, today: u64, selected: Option<u64>, h: f32) -> Option<usize> {
+#[allow(clippy::too_many_arguments)]
+fn bars(ui: &mut egui::Ui, v: &[u32], starts: &[u64], label: impl Fn(usize) -> String, today: u64, selected: Option<u64>, h: f32, stacks: Option<&StackView>) -> Option<usize> {
     let mark = starts[..v.len().min(starts.len())].iter().position(|x| *x == today);
     let picked = selected.and_then(|s| starts[..v.len().min(starts.len())].iter().position(|x| *x == s));
     let tip = |i: usize| (day_label(starts.get(i).copied().unwrap_or(0)), if v[i] > 0 { session(v[i]) } else { "Pas joué".into() });
-    bar_chart(ui, starts.first().copied().unwrap_or(0), v, label, tip, mark, picked, h, Some("Clic : détail du jour"))
+    bar_chart(ui, starts.first().copied().unwrap_or(0), v, label, tip, mark, picked, h, Some("Clic : détail du jour"), stacks)
 }
 
 /// Un graphique en barres générique. `mark` : la barre à souligner (aujourd'hui), `picked` : la barre
 /// choisie (les autres s'effacent), `hint` : si les barres se cliquent, ce que fait le clic.
 #[allow(clippy::too_many_arguments)]
-fn bar_chart(ui: &mut egui::Ui, id: impl std::hash::Hash, v: &[u32], label: impl Fn(usize) -> String, tip: impl Fn(usize) -> (String, String), mark: Option<usize>, picked: Option<usize>, h: f32, hint: Option<&str>) -> Option<usize> {
+fn bar_chart(ui: &mut egui::Ui, id: impl std::hash::Hash, v: &[u32], label: impl Fn(usize) -> String, tip: impl Fn(usize) -> (String, String), mark: Option<usize>, picked: Option<usize>, h: f32, hint: Option<&str>, stacks: Option<&StackView>) -> Option<usize> {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h + 20.0), Sense::hover());
     if !ui.is_rect_visible(rect) { return None; }
     let p = ui.painter_at(rect.expand(2.0));
@@ -954,9 +1034,25 @@ fn bar_chart(ui: &mut egui::Ui, id: impl std::hash::Hash, v: &[u32], label: impl
         if hover { p.rect_filled(egui::Rect::from_min_max(egui::pos2(cx - slot / 2.0 + 1.0, plot.top()), egui::pos2(cx + slot / 2.0 - 1.0, plot.bottom())), 4.0, pal().hover.gamma_multiply(0.5)); }
         if *secs > 0 {
             let bh = (plot.height() * *secs as f32 / top).max(3.0);
-            let r = egui::Rect::from_min_max(egui::pos2(cx - bw / 2.0, plot.bottom() - bh), egui::pos2(cx + bw / 2.0, plot.bottom()));
-            let c = if hover { blend(pal().accent, Color32::WHITE, 0.15) } else if picked.is_some_and(|p| p != i) { pal().accent.gamma_multiply(0.45) } else { pal().accent };
-            p.rect_filled(r, CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, c);
+            let shade = |c: Color32| if hover { blend(c, Color32::WHITE, 0.15) } else if picked.is_some_and(|p| p != i) { c.gamma_multiply(0.45) } else { c };
+            match stacks.and_then(|st| st.segs.get(i)).filter(|seg| !seg.is_empty()) {
+                // Une barre découpée par jeu, du plus joué (en bas) au moins joué.
+                Some(seg) => {
+                    let sum = seg.iter().map(|x| x.1).sum::<u32>().max(1) as f32;
+                    let mut y = plot.bottom();
+                    for (k, (c, part)) in seg.iter().enumerate() {
+                        let ph = bh * *part as f32 / sum;
+                        let r = egui::Rect::from_min_max(egui::pos2(cx - bw / 2.0, y - ph), egui::pos2(cx + bw / 2.0, y));
+                        let rad = if k + 1 == seg.len() { CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 } } else { CornerRadius::ZERO };
+                        p.rect_filled(r, rad, shade(*c));
+                        y -= ph;
+                    }
+                }
+                None => {
+                    let r = egui::Rect::from_min_max(egui::pos2(cx - bw / 2.0, plot.bottom() - bh), egui::pos2(cx + bw / 2.0, plot.bottom()));
+                    p.rect_filled(r, CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, shade(pal().accent));
+                }
+            }
         }
         let is_today = mark == Some(i);
         let on = picked == Some(i);
@@ -968,7 +1064,8 @@ fn bar_chart(ui: &mut egui::Ui, id: impl std::hash::Hash, v: &[u32], label: impl
     }
     let clicked = resp.clicked().then_some(hovered).flatten();
     if let Some(i) = hovered {
-        let (title, value) = tip(i);
+        let (title, mut value) = tip(i);
+        if let Some(l) = stacks.and_then(|st| st.lines.get(i)).filter(|l| !l.is_empty()) { value = format!("{value}\n{l}"); }
         let resp = if hint.is_some() { resp.on_hover_cursor(egui::CursorIcon::PointingHand) } else { resp };
         resp.on_hover_ui_at_pointer(|ui| {
             ui.label(RichText::new(title).strong());
@@ -1016,7 +1113,7 @@ fn timeline(ui: &mut egui::Ui, d: &DayData, single: bool, now: u64) {
             // Date approchée : couleur adoucie et bord, pour la distinguer sans la cacher.
             if *guess { p.rect(r, 3.0, color.gamma_multiply(0.35), Stroke::new(1.0_f32, color), egui::StrokeKind::Inside); } else { p.rect_filled(r, 3.0, color); }
             if pointer.is_some_and(|pos| r.expand2(egui::vec2(2.0, 0.0)).contains(pos)) {
-                let mut detail = format!("{} → {}  ·  {}", stats::clock(*a), stats::clock(*b), session((*b - *a) as u32));
+                let mut detail = format!("{} – {}  ·  {}", stats::clock(*a), stats::clock(*b), session((*b - *a) as u32));
                 if *guess { detail.push_str("\nHeure approchée (MinimalSteam était fermé)"); }
                 if let Some(f) = from { detail.push_str(&format!("\nJoué sous « {f} »")); }
                 tip = Some((l.name.clone(), detail));
@@ -1037,9 +1134,10 @@ fn rank(ui: &mut egui::Ui, items: &[(u32, String, u32)]) -> Option<u32> {
     let max = items.iter().map(|x| x.2).max().unwrap_or(1).max(1) as f32;
     let mut out = None;
     for (id, name, min) in items {
-        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), Sense::click());
+        // Id 0 : une ligne qui n'est pas un jeu (moment de la journée), elle ne s'ouvre pas.
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), if *id != 0 { Sense::click() } else { Sense::hover() });
         let p = ui.painter();
-        if resp.hovered() { p.rect_filled(r, 6.0, pal().hover); }
+        if resp.hovered() && *id != 0 { p.rect_filled(r, 6.0, pal().hover); }
         let mut job = egui::text::LayoutJob::simple_singleline(name.clone(), egui::FontId::proportional(13.0), pal().text);
         job.wrap = egui::text::TextWrapping::truncate_at_width(r.width() - 80.0);
         let g = p.layout_job(job);
@@ -1050,7 +1148,7 @@ fn rank(ui: &mut egui::Ui, items: &[(u32, String, u32)]) -> Option<u32> {
         let mut f = track;
         f.set_width((track.width() * *min as f32 / max).max(3.0));
         p.rect_filled(f, 3.0, pal().accent);
-        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { out = Some(*id); }
+        if *id != 0 && resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() { out = Some(*id); }
     }
     out
 }
@@ -1086,10 +1184,23 @@ impl App {
     }
 
     /// Les graphiques de la semaine et du mois, avec le choix du mois.
-    fn charts_block(&mut self, ui: &mut egui::Ui, game: Option<u32>, f: &Figures, r: &Ranges) {
+    /// Les barres découpées par jeu pour ces jours (`edges`), avec les couleurs du rapport.
+    fn day_stacks(&mut self, edges: &[u64], rank: &Rc<HashMap<u32, usize>>) -> Rc<StackView> {
+        let key = (edges.first().copied().unwrap_or(0), edges.len(), Rc::as_ptr(rank) as usize);
+        if let Some(v) = self.stats_cache().views.get(&key) { return v.clone(); }
+        let all = self.all_sessions(None);
+        let names: HashMap<u32, String> = all.iter().map(|(id, n, _)| (*id, n.clone())).collect();
+        let v = Rc::new(stack_view(&per_day_by_game(&all, edges), rank, &names, 1));
+        self.stats_cache().views.insert(key, v.clone());
+        v
+    }
+
+    fn charts_block(&mut self, ui: &mut egui::Ui, game: Option<u32>, f: &Figures, r: &Ranges, rank: Option<&Rc<HashMap<u32, usize>>>) {
         let back = self.stats_month;
         let m = self.month_view(game, back);
-        let (day, nav) = charts(ui, f, r, self.stats_day, (&m.0, &m.1), back);
+        // Sur la vue d'ensemble, chaque barre est découpée par jeu.
+        let views = rank.filter(|_| game.is_none()).map(|rank| [self.day_stacks(&r.week, rank), self.day_stacks(&r.last_week, rank), self.day_stacks(&m.1, rank)]);
+        let (day, nav) = charts(ui, f, r, self.stats_day, (&m.0, &m.1), back, views.as_ref().map(|v| [&*v[0], &*v[1], &*v[2]]));
         if let Some(day) = day { self.stats_day = if self.stats_day == Some(day) { None } else { Some(day) }; }
         if nav != 0 { self.stats_month = (back - nav).max(0); }
     }
@@ -1120,12 +1231,29 @@ impl App {
         for (id, name, s) in &clipped { by.entry(*id).or_insert_with(|| ((*name).clone(), 0)).1 += s.secs; }
         let mut by_game: Vec<(u32, String, u32)> = by.into_iter().map(|(id, (n, t))| (id, n, t)).collect();
         by_game.sort_by_key(|x| std::cmp::Reverse(x.2));
+        let rank: HashMap<u32, usize> = by_game.iter().enumerate().map(|(i, g)| (g.0, i)).collect();
+        let names: HashMap<u32, String> = all.iter().map(|(id, n, _)| (*id, n.clone())).collect();
+        // Heure par heure : le temps de chaque jeu et les dernières parties (8 au plus).
         let mut hours = vec![0u32; 24];
-        for s in &refs {
-            let (mut t, end) = (s.start, s.start + s.secs as u64);
-            // Les fuseaux d'ici sont décalés d'heures entières : une heure locale commence avec une heure UTC.
-            while t < end { let next = (t / 3600 + 1) * 3600; hours[stats::hour_of(t)] += (next.min(end) - t) as u32; t = next; }
+        let mut hour_game: Vec<HashMap<u32, u32>> = vec![HashMap::new(); 24];
+        let mut hour_sessions: Vec<Vec<Played>> = vec![Vec::new(); 24];
+        let mut today_game: Vec<HashMap<u32, u32>> = vec![HashMap::new(); 24];
+        let tomorrow_lo = stats::midnight(r.now, 1);
+        for (id, name, s) in &clipped {
+            for (h, secs) in hour_slices(s) {
+                hours[h] += secs;
+                *hour_game[h].entry(*id).or_default() += secs;
+                if !hour_sessions[h].iter().any(|p| p.0 == s.start) { hour_sessions[h].push((s.start, s.secs, (*name).clone())); }
+            }
         }
+        for (id, _, s) in &all {
+            let sl = Session { start: s.start.max(r.today), secs: overlap(s, r.today, tomorrow_lo), guess: s.guess };
+            if sl.secs > 0 { for (h, secs) in hour_slices(&sl) { *today_game[h].entry(*id).or_default() += secs; } }
+        }
+        let sorted = |m: &HashMap<u32, u32>| -> Vec<(u32, u32)> { let mut v: Vec<(u32, u32)> = m.iter().map(|(a, b)| (*a, *b)).collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1)); v };
+        let hours_by: Vec<Vec<(u32, u32)>> = hour_game.iter().map(sorted).collect();
+        let today_by: Vec<Vec<(u32, u32)>> = today_game.iter().map(sorted).collect();
+        for l in hour_sessions.iter_mut() { l.sort_by_key(|p| std::cmp::Reverse(p.0)); l.truncate(8); }
         let (mut weekdays, mut weekday_n) = (vec![0u32; 7], vec![0u32; 7]);
         let span = edges.iter().take(days).filter(|e| **e <= r.today).count();
         for (i, d) in per_day.iter().enumerate().take(span) {
@@ -1133,6 +1261,53 @@ impl App {
             weekdays[w] += d;
             weekday_n[w] += 1;
         }
+        // Jour de la semaine par jour de la semaine : le temps de chaque jeu et les dernières parties.
+        let mut week_game: Vec<HashMap<u32, u32>> = vec![HashMap::new(); 7];
+        let mut week_sessions: Vec<Vec<Played>> = vec![Vec::new(); 7];
+        for (d, bar) in per_day_by_game(&clipped.iter().map(|(i, n, s)| (*i, (*n).clone(), s.clone())).collect::<Vec<_>>(), &edges).iter().enumerate().take(span) {
+            let w = stats::day_parts(edges[d]).1 as usize;
+            for (id, secs) in bar { *week_game[w].entry(*id).or_default() += secs; }
+        }
+        for (_, name, s) in &clipped { let w = stats::day_parts(s.start).1 as usize; week_sessions[w].push((s.start, s.secs, (*name).clone())); }
+        for l in week_sessions.iter_mut() { l.sort_by_key(|p| std::cmp::Reverse(p.0)); l.truncate(8); }
+        let week_by: Vec<Vec<(u32, u32)>> = week_game.iter().map(sorted).collect();
+        let mut moments = [0u32; 4];
+        for (h, secs) in hours.iter().enumerate() { moments[h / 6] += secs; }
+        let hour_views = [
+            Rc::new(stack_view(&hours_by, &rank, &names, 1)),
+            Rc::new(stack_view(&hours_by, &rank, &names, span.max(1) as u32)),
+            Rc::new(stack_view(&today_by, &rank, &names, 1)),
+        ];
+        let week_view = Rc::new(stack_view(&week_by, &rank, &names, 1));
+        // La période d'avant, de même longueur.
+        let prev_range = match period {
+            Period::Days7 => Some((stats::midnight(lo, -7), lo, "7 jours d'avant")),
+            Period::Days30 => Some((stats::midnight(lo, -30), lo, "30 jours d'avant")),
+            Period::Month => Some((stats::month_at(r.now, back.max(0) as u32 + 1).0, lo, "le mois d'avant")),
+            Period::Year => Some((stats::month_at(r.now, 23).0, lo, "les 12 mois d'avant")),
+            Period::All => None,
+        };
+        let prev = prev_range.map(|(a, b, l)| (all.iter().map(|x| overlap(&x.2, a, b)).sum::<u32>(), l));
+        // Les records, sur tout l'historique.
+        let records = {
+            let mut rec = Records { total: all.iter().map(|x| x.2.secs).sum(), sessions: all.len(), ..Default::default() };
+            rec.longest = all.iter().max_by_key(|x| x.2.secs).map(|x| (x.2.secs, x.2.start, x.1.clone()));
+            if let Some(first) = all.iter().map(|x| x.2.start).min() {
+                let e = stats::edges(stats::midnight(first, 0), stats::days_between(stats::midnight(first, 0), tomorrow).max(1));
+                let every_day = stats::per_day_in(&all.iter().map(|x| &x.2).collect::<Vec<_>>(), &e);
+                rec.best_day = every_day.iter().enumerate().max_by_key(|(_, d)| **d).filter(|(_, d)| **d > 0).map(|(i, d)| (e[i], *d));
+                let (mut run, mut best) = (0, 0);
+                for d in &every_day { if *d > 0 { run += 1; best = best.max(run); } else { run = 0; } }
+                rec.streak = best;
+            }
+            let mut by_month: HashMap<(i32, u32), u32> = HashMap::new();
+            for x in &all { let (_, _, m, y) = stats::day_parts(x.2.start); *by_month.entry((y, m)).or_default() += x.2.secs; }
+            rec.best_month = by_month.into_iter().max_by_key(|x| x.1).map(|((y, m), secs)| (stats::month_bounds(y, m).0, secs));
+            // La partie qui a fini le plus tard dans la nuit (avant 6 h, c'est encore la veille au soir).
+            rec.latest = all.iter().map(|x| x.2.start + x.2.secs as u64).max_by_key(|end| { let h = stats::hour_of(*end); let m = (*end % 3600) / 60; ((h + 18) % 24) * 60 + m as usize });
+            rec.night = all.iter().flat_map(|x| hour_slices(&x.2)).filter(|(h, _)| *h < 6).map(|(_, s)| s).sum();
+            rec
+        };
         let best = per_day.iter().enumerate().max_by_key(|(_, d)| **d).filter(|(_, d)| **d > 0).map(|(i, d)| (edges[i], *d));
         let longest = clipped.iter().max_by_key(|c| c.2.secs).map(|c| (c.2.secs, c.2.start, c.1.clone()));
         // Les 12 derniers mois et le calendrier ne dépendent pas de la période choisie.
@@ -1148,6 +1323,7 @@ impl App {
         let rep = Rc::new(Report {
             total: per_day.iter().sum(), sessions: clipped.len(), longest, days: per_day.iter().filter(|d| **d > 0).count(), span, best,
             by_game, hours, weekdays, weekday_n, months, month_starts, heat_days, heat,
+            prev, hour_views, week_view, hours_by, week_by, hour_sessions, week_sessions, moments, records, rank: Rc::new(rank),
         });
         self.stats_cache().reports.insert(key, rep.clone());
         rep
@@ -1170,8 +1346,21 @@ impl App {
                 ("Plus longue partie".into(), rep.longest.as_ref().map_or("—".into(), |l| session(l.0)), rep.longest.as_ref().map_or(String::new(), |l| if game.is_some() { short_date(l.1) } else { l.2.clone() })),
             ];
             if game.is_none() { v.insert(2, ("Jeux joués".into(), rep.by_game.len().to_string(), rep.by_game.first().map_or(String::new(), |g| format!("surtout {}", g.1)))); }
+            // Par rapport à la période d'avant, de même longueur.
+            if let Some((before, label)) = rep.prev {
+                let value = if before == 0 { "Nouveau".to_string() } else {
+                    let d = (rep.total as i64 - before as i64) * 100 / before as i64;
+                    if d >= 0 { format!("+{d} %") } else { format!("-{} %", -d) }
+                };
+                v.insert(1, ("Évolution".into(), value, format!("vs {label} ({})", hm(before))));
+            }
             v
         };
+        let view = Cell::new(None::<u8>);
+        let current_view = self.report_view;
+        // Camembert et classement : par jeu sur la vue d'ensemble, par moment de la journée pour un jeu.
+        let parts: Vec<(u32, String, u32)> = if game.is_none() { rep.by_game.clone() } else { MOMENTS.iter().zip(rep.moments).filter(|m| m.1 > 0).map(|(n, v)| (0, n.to_string(), v)).collect() };
+        let picked_game = Cell::new(None::<u32>);
         fn as_refs(v: &[(String, String, String)]) -> Vec<(&str, String, String)> { v.iter().map(|(a, b, c)| (a.as_str(), b.clone(), c.clone())).collect() }
         let (l, r) = (as_refs(&left), as_refs(&right));
         pair_cards(ui, ("top", game), 860.0, |ui| {
@@ -1186,10 +1375,29 @@ impl App {
                     if chip_resp(ui, label, current == p).on_hover_text(tip).clicked() { period.set(p); }
                 }
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Afficher").size(12.5).color(pal().muted));
+                let pie = if game.is_none() { "Le temps de chaque jeu" } else { "Le temps par moment de la journée" };
+                for (k, l, t) in [(0u8, "Chiffres", "Les chiffres clés de la période"), (1, "Camembert", pie), (2, "Classement", pie)] {
+                    if chip_resp(ui, l, current_view == k).on_hover_text(t).clicked() { view.set(Some(k)); }
+                }
+            });
             ui.add_space(6.0);
-            if r.is_empty() { ui.label(RichText::new("Aucune partie notée sur cette période.").color(pal().muted)); } else { tiles(ui, &r); }
+            if r.is_empty() { ui.label(RichText::new("Aucune partie notée sur cette période.").color(pal().muted)); }
+            else {
+                match current_view {
+                    1 => if let Some(id) = donut(ui, &parts, rep.total).filter(|id| *id != 0) { picked_game.set(Some(id)); },
+                    2 => {
+                        let items: Vec<(u32, String, u32)> = parts.iter().take(8).map(|(i, n, v)| (*i, n.clone(), v / 60)).collect();
+                        if let Some(id) = rank(ui, &items).filter(|id| *id != 0) { picked_game.set(Some(id)); }
+                    }
+                    _ => tiles(ui, &r),
+                }
+            }
         });
         ui.add_space(8.0);
+        if let Some(v) = view.get() { self.report_view = v; }
+        if let Some(id) = picked_game.get() { self.stats_pick = Some(id); }
         if period.get() != current { self.report_period = period.get(); return self.report_data(game, self.report_period, back, year); }
         rep
     }
@@ -1203,38 +1411,68 @@ impl App {
         let (open_game, open_month, open_day, nav_year) = (Cell::new(None::<u32>), Cell::new(None::<i32>), Cell::new(None::<u64>), Cell::new(0_i32));
         let (selected_day, today) = (self.stats_day, r.today);
         // Les cartes, dans l'ordre : elles sont posées deux par deux.
-        let mut cards: Vec<Box<dyn FnOnce(&mut egui::Ui) + '_>> = Vec::new();
+        let pname = period_name(self.report_period, &self.month_view(game, back).1);
+        let (mode, slot) = (self.hour_mode as usize, self.stats_slot);
+        let (mode_out, slot_out) = (Cell::new(None::<u8>), Cell::new(None::<Option<(u8, usize)>>));
+        // (rangée où s'ouvre le détail d'une heure ou d'un jour de la semaine, carte)
+        let mut cards: Vec<(bool, Box<dyn FnOnce(&mut egui::Ui) + '_>)> = Vec::new();
         if played && game.is_none() {
             let (rep, out) = (&rep, &open_game);
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
+            cards.push((false, Box::new(move |ui: &mut egui::Ui| {
                 chart_title(ui, "Répartition par jeu", rep.total);
                 if let Some(id) = donut(ui, &rep.by_game, rep.total) { out.set(Some(id)); }
-            }));
+            })));
         }
         if game.is_none() {
             let (rep, out) = (&rep, &open_day);
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
+            cards.push((false, Box::new(move |ui: &mut egui::Ui| {
                 chart_title(ui, "Activité des 6 derniers mois", rep.heat.iter().sum());
                 if let Some(d) = heatmap(ui, game, &rep.heat_days, &rep.heat, today, selected_day) { out.set(Some(d)); }
-            }));
+            })));
         }
         if played {
-            let rep = &rep;
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
-                chart_title(ui, "Heures de la journée", rep.total);
-                let tip = |i: usize| (format!("{i:02}h – {:02}h", (i + 1) % 24), format!("{} · {} % du temps", hm(rep.hours[i]), rep.hours[i] as u64 * 100 / rep.total.max(1) as u64));
-                bar_chart(ui, ("hours", game), &rep.hours, |i| if i % 3 == 0 { format!("{i}h") } else { String::new() }, tip, None, None, 110.0, None);
-            }));
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
-                chart_title(ui, "Jours de la semaine", rep.total);
-                let tip = |i: usize| (WEEKDAYS[i].to_string(), format!("{} au total · {} en moyenne", hm(rep.weekdays[i]), hm(rep.weekdays[i] / rep.weekday_n[i].max(1))));
-                bar_chart(ui, ("weekdays", game), &rep.weekdays, |i| DAYS[i].trim_end_matches('.').to_string(), tip, None, None, 110.0, None);
-            }));
+            let (rep, mode_out, slot_out, open_day, pname) = (&rep, &mode_out, &slot_out, &open_day, &pname);
+            let stacked = game.is_none();
+            cards.push((true, Box::new(move |ui: &mut egui::Ui| {
+                // Total sur la période, moyenne par jour, ou aujourd'hui seulement.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Heures de la journée").size(14.5).strong());
+                    ui.add_space(4.0);
+                    for (k, l, t) in [(0u8, "Total", "Le temps joué à chaque heure, additionné sur toute la période"), (1, "Par jour", "En moyenne par jour de la période"), (2, "Aujourd'hui", "Seulement aujourd'hui")] {
+                        if chip_resp(ui, l, mode == k as usize).on_hover_text(t).clicked() { mode_out.set(Some(k)); }
+                    }
+                });
+                let view = &rep.hour_views[mode.min(2)];
+                let values: Vec<u32> = view.segs.iter().map(|s| s.iter().map(|x| x.1).sum()).collect();
+                let sub = match mode { 0 => format!("Additionné sur {pname}"), 1 => format!("Moyenne par jour sur {pname}"), _ => "Aujourd'hui, à chaque heure".to_string() };
+                ui.label(RichText::new(format!("{sub} · {}", hm(values.iter().sum()))).size(12.0).color(pal().muted));
+                ui.add_space(2.0);
+                let tip = |i: usize| (format!("{i:02}h – {:02}h", (i + 1) % 24), match mode {
+                    0 => format!("{} au total · {} % du temps de la période", hm(values[i]), values[i] as u64 * 100 / rep.total.max(1) as u64),
+                    1 => format!("{} par jour en moyenne", hm(values[i])),
+                    _ => format!("{} aujourd'hui", hm(values[i])),
+                });
+                let picked = slot.filter(|s| s.0 == 0 && mode < 2).map(|s| s.1);
+                let hint = if mode == 2 { "Clic : la journée d'aujourd'hui en détail" } else { "Clic : ce qui a été joué à cette heure" };
+                if let Some(i) = bar_chart(ui, ("hours", game, mode), &values, |i| if i % 3 == 0 { format!("{i}h") } else { String::new() }, tip, None, picked, 110.0, Some(hint), stacked.then_some(&**view)) {
+                    if mode == 2 { open_day.set(Some(today)); } else { slot_out.set(Some(if slot == Some((0, i)) { None } else { Some((0, i)) })); }
+                }
+            })));
+            cards.push((true, Box::new(move |ui: &mut egui::Ui| {
+                ui.label(RichText::new("Jours de la semaine").size(14.5).strong());
+                ui.label(RichText::new(format!("Additionné sur {pname} · {}", hm(rep.total))).size(12.0).color(pal().muted));
+                ui.add_space(2.0);
+                let tip = |i: usize| (WEEKDAYS[i].to_string(), format!("{} au total · {} en moyenne par {}", hm(rep.weekdays[i]), hm(rep.weekdays[i] / rep.weekday_n[i].max(1)), WEEKDAYS[i].to_lowercase()));
+                let picked = slot.filter(|s| s.0 == 1).map(|s| s.1);
+                if let Some(i) = bar_chart(ui, ("weekdays", game), &rep.weekdays, |i| DAYS[i].trim_end_matches('.').to_string(), tip, None, picked, 110.0, Some("Clic : ce qui a été joué ce jour-là de la semaine"), stacked.then_some(&*rep.week_view)) {
+                    slot_out.set(Some(if slot == Some((1, i)) { None } else { Some((1, i)) }));
+                }
+            })));
         }
         {
             // 12 mois, une année après l'autre : un clic ouvre le mois dans le graphique du mois.
             let (rep, out, nav) = (&rep, &open_month, &nav_year);
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
+            cards.push((false, Box::new(move |ui: &mut egui::Ui| {
                 ui.horizontal(|ui| {
                     if ui.button("◀").on_hover_text("Année précédente").clicked() { nav.set(1); }
                     let first = SHORT_MONTHS[stats::day_parts(rep.month_starts[0]).2 as usize];
@@ -1248,39 +1486,139 @@ impl App {
                 let picked = (0..12).contains(&k).then(|| 11 - k as usize);
                 let tip = |i: usize| (month_title(rep.month_starts[i]), hm(rep.months[i]));
                 let mark = (year == 0).then_some(11);
-                if let Some(i) = bar_chart(ui, ("months", game, year), &rep.months, |i| SHORT_MONTHS[stats::day_parts(rep.month_starts[i]).2 as usize].to_string(), tip, mark, picked, 165.0, Some("Clic : voir ce mois jour par jour")) { out.set(Some(12 * year + 11 - i as i32)); }
-            }));
+                if let Some(i) = bar_chart(ui, ("months", game, year), &rep.months, |i| SHORT_MONTHS[stats::day_parts(rep.month_starts[i]).2 as usize].to_string(), tip, mark, picked, 165.0, Some("Clic : voir ce mois jour par jour"), None) { out.set(Some(12 * year + 11 - i as i32)); }
+            })));
         }
         if let Some(ever) = ever {
             let out = &open_game;
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
+            cards.push((false, Box::new(move |ui: &mut egui::Ui| {
                 ui.label(RichText::new("Les plus joués depuis toujours").size(14.5).strong());
                 ui.add_space(4.0);
                 if let Some(id) = rank(ui, ever) { out.set(Some(id)); }
-            }));
+            })));
         }
         if game.is_some() {
             let (rep, out) = (&rep, &open_day);
-            cards.push(Box::new(move |ui: &mut egui::Ui| {
+            cards.push((false, Box::new(move |ui: &mut egui::Ui| {
                 chart_title(ui, "Activité des 6 derniers mois", rep.heat.iter().sum());
                 if let Some(d) = heatmap(ui, game, &rep.heat_days, &rep.heat, today, selected_day) { out.set(Some(d)); }
-            }));
+            })));
+        }
+        if rep.records.sessions > 0 {
+            let rep = &rep;
+            cards.push((false, Box::new(move |ui: &mut egui::Ui| records_card(ui, &rep.records, game.is_none()))));
         }
         let mut it = cards.into_iter();
         let mut row = 0;
-        while let Some(a) = it.next() {
+        let mut slot_action: (bool, Option<u32>) = (false, None);
+        while let Some((ta, a)) = it.next() {
+            let mut tagged = ta;
             match it.next() {
-                Some(b) => pair_cards(ui, ("report", game, row), 640.0, a, b),
+                Some((tb, b)) => { tagged |= tb; pair_cards(ui, ("report", game, row), 640.0, a, b) }
                 None => { card(ui, 0.0, a); }
             }
             row += 1;
             ui.add_space(8.0);
+            // Le détail de l'heure ou du jour de la semaine cliqué, juste sous ses graphiques.
+            if tagged {
+                if let Some(sl) = slot_out.get().unwrap_or(slot) { slot_action = slot_panel(ui, &rep, sl, &pname); ui.add_space(8.0); }
+            }
         }
+        if let Some(m) = mode_out.get() { self.hour_mode = m; }
+        if let Some(sl) = slot_out.get() { self.stats_slot = sl; }
+        if slot_action.0 { self.stats_slot = None; }
+        if let Some(id) = slot_action.1 { *pick = Some(Some(id)); }
         if let Some(id) = open_game.get() { *pick = Some(Some(id)); }
         if let Some(b) = open_month.get() { self.stats_month = b; }
         if let Some(d) = open_day.get() { self.stats_day = Some(d); }
         if nav_year.get() != 0 { self.stats_year = (year + nav_year.get()).max(0); }
     }
+}
+
+/// Le nom de la période du rapport, pour les titres (« les 30 derniers jours »…).
+fn period_name(p: Period, month: &[u64]) -> String {
+    match p {
+        Period::Days7 => "les 7 derniers jours".into(),
+        Period::Days30 => "les 30 derniers jours".into(),
+        Period::Month => month.first().map_or(String::new(), |m| month_title(*m).to_lowercase()),
+        Period::Year => "les 12 derniers mois".into(),
+        Period::All => "tout l'historique".into(),
+    }
+}
+
+/// Le détail d'une heure (0, h) ou d'un jour de la semaine (1, j) : temps par jeu et dernières
+/// parties. Rend (fermer, jeu à ouvrir).
+fn slot_panel(ui: &mut egui::Ui, rep: &Report, slot: (u8, usize), pname: &str) -> (bool, Option<u32>) {
+    let (mut close, mut open) = (false, None);
+    let (title, games, played, total, per) = if slot.0 == 0 {
+        let h = slot.1.min(23);
+        (format!("Entre {h}h et {}h", h + 1), &rep.hours_by[h], &rep.hour_sessions[h], rep.hours[h], rep.span.max(1) as u32)
+    } else {
+        let w = slot.1.min(6);
+        (format!("Le {}", WEEKDAYS[w].to_lowercase()), &rep.week_by[w], &rep.week_sessions[w], rep.weekdays[w], rep.weekday_n[w].max(1))
+    };
+    let names: HashMap<u32, &String> = rep.by_game.iter().map(|g| (g.0, &g.1)).collect();
+    card(ui, 0.0, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{title} · {pname}")).size(16.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { close = ui.button("Fermer").clicked(); });
+        });
+        ui.add_space(6.0);
+        let per_label = if slot.0 == 0 { "Par jour en moyenne" } else { "Par semaine en moyenne" };
+        tiles(ui, &[
+            ("Temps joué", hm(total), format!("{} % de la période", total as u64 * 100 / rep.total.max(1) as u64)),
+            (per_label, hm(total / per), String::new()),
+            ("Jeux", games.len().to_string(), games.first().and_then(|g| names.get(&g.0)).map_or(String::new(), |n| format!("surtout {n}"))),
+            ("Parties", played.len().to_string(), if played.len() >= 8 { "les 8 dernières ci-dessous".into() } else { String::new() }),
+        ]);
+        let mut left = |ui: &mut egui::Ui| {
+            ui.label(RichText::new("Jeux joués").size(14.0).strong());
+            for (id, secs) in games.iter().take(10) {
+                let (row, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::click());
+                let p = ui.painter();
+                if r.hovered() { p.rect_filled(row, 6.0, pal().hover); }
+                let color = rep.rank.get(id).map_or(Color32::from_gray(130), |k| lane_color(*k, false));
+                p.rect_filled(egui::Rect::from_center_size(egui::pos2(row.left() + 10.0, row.center().y), egui::vec2(9.0, 9.0)), 2.0, color);
+                let mut job = egui::text::LayoutJob::simple_singleline(names.get(id).map_or("?".to_string(), |n| n.to_string()), egui::FontId::proportional(13.0), pal().text);
+                job.wrap = egui::text::TextWrapping::truncate_at_width(row.width() - 130.0);
+                let g = p.layout_job(job);
+                p.galley(egui::pos2(row.left() + 22.0, row.center().y - g.size().y / 2.0), g, pal().text);
+                p.text(egui::pos2(row.right() - 6.0, row.center().y), egui::Align2::RIGHT_CENTER, format!("{} · {} %", hm(*secs), *secs as u64 * 100 / total.max(1) as u64), egui::FontId::proportional(12.5), pal().muted);
+                if r.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Voir les stats de ce jeu").clicked() { open = Some(*id); }
+            }
+        };
+        let right = |ui: &mut egui::Ui| {
+            ui.label(RichText::new("Dernières parties").size(14.0).strong());
+            for (start, secs, name) in played.iter() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} · {} – {}", short_date(*start), stats::clock(*start), stats::clock(start + *secs as u64))).size(12.5));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(session(*secs)).size(12.5).strong());
+                        ui.add(egui::Label::new(RichText::new(name).size(12.5).color(pal().muted)).truncate());
+                    });
+                });
+            }
+        };
+        ui.add_space(4.0);
+        if ui.available_width() > 640.0 { ui.columns(2, |c| { left(&mut c[0]); right(&mut c[1]); }); } else { left(ui); ui.add_space(6.0); right(ui); }
+    });
+    (close, open)
+}
+
+/// Les records, sur tout l'historique.
+fn records_card(ui: &mut egui::Ui, rec: &Records, all_games: bool) {
+    ui.label(RichText::new("Records").size(14.5).strong());
+    ui.label(RichText::new("Sur tout l'historique noté jour par jour.").size(12.0).color(pal().muted));
+    ui.add_space(4.0);
+    tiles(ui, &[
+        ("Plus longue partie", rec.longest.as_ref().map_or("—".into(), |l| session(l.0)), rec.longest.as_ref().map_or(String::new(), |l| if all_games { format!("{} · {}", l.2, short_date(l.1)) } else { short_date(l.1) })),
+        ("Meilleur jour", rec.best_day.map_or("—".into(), |b| session(b.1)), rec.best_day.map_or(String::new(), |b| short_date(b.0))),
+        ("Plus longue série", if rec.streak > 0 { plural(rec.streak, "jour", "jours") } else { "—".into() }, "jours joués d'affilée".into()),
+        ("Meilleur mois", rec.best_month.map_or("—".into(), |m| session(m.1)), rec.best_month.map_or(String::new(), |m| month_title(m.0))),
+        ("Fin la plus tardive", rec.latest.map_or("—".into(), stats::clock), rec.latest.map_or(String::new(), short_date)),
+        ("Jeu de nuit (0h – 6h)", format!("{} %", rec.night as u64 * 100 / rec.total.max(1) as u64), hm(rec.night)),
+        ("Parties notées", rec.sessions.to_string(), format!("{} en moyenne", session(rec.total / rec.sessions.max(1) as u32))),
+    ]);
 }
 
 /// Une carte. Rend la hauteur de son contenu, avant d'appliquer la hauteur minimale `min_h`.
@@ -1319,7 +1657,7 @@ fn donut(ui: &mut egui::Ui, items: &[(u32, String, u32)], total: u32) -> Option<
     const SHOWN: usize = 6;
     let rest: u32 = items.iter().skip(SHOWN).map(|x| x.2).sum();
     let total_f = total.max(1) as f32;
-    let parts: Vec<(Option<u32>, String, Color32, u32)> = items.iter().take(SHOWN).enumerate().map(|(i, g)| (Some(g.0), g.1.clone(), lane_color(i, false), g.2))
+    let parts: Vec<(Option<u32>, String, Color32, u32)> = items.iter().take(SHOWN).enumerate().map(|(i, g)| ((g.0 != 0).then_some(g.0), g.1.clone(), lane_color(i, false), g.2))
         .chain((rest > 0).then(|| (None, format!("{} autre{}", items.len() - SHOWN, if items.len() - SHOWN > 1 { "s" } else { "" }), Color32::from_gray(130), rest))).collect();
     let mut out = None;
     ui.horizontal_top(|ui| {
@@ -1357,7 +1695,7 @@ fn donut(ui: &mut egui::Ui, items: &[(u32, String, u32)], total: u32) -> Option<
             a0 = a1;
         }
         p.text(c - egui::vec2(0.0, 8.0), egui::Align2::CENTER_CENTER, session(total), egui::FontId::proportional(15.0), pal().text);
-        p.text(c + egui::vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, plural(items.len(), "jeu", "jeux"), egui::FontId::proportional(11.5), pal().muted);
+        if items.iter().any(|x| x.0 != 0) { p.text(c + egui::vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, plural(items.len(), "jeu", "jeux"), egui::FontId::proportional(11.5), pal().muted); }
         if let Some(i) = hovered {
             let (id, name, _, v) = &parts[i];
             if resp.clicked() { out = *id; }

@@ -110,8 +110,8 @@ impl Store {
     }
 
     /// Suit les jeux en cours du compte `prefix` (« compte: »). `running` : les clés des jeux lancés.
-    /// Rend (une partie a commencé, une partie a fini).
-    pub fn tick(&mut self, prefix: &str, running: &HashSet<String>, names: &HashMap<String, String>, t: u64) -> (bool, bool) {
+    /// `alive_since` : l'ouverture de l'app. Rend (une partie a commencé, une partie a fini).
+    pub fn tick(&mut self, prefix: &str, running: &HashSet<String>, names: &HashMap<String, String>, t: u64, alive_since: u64) -> (bool, bool) {
         let mut started = false;
         for k in running {
             let r = self.games.entry(k.clone()).or_default();
@@ -124,8 +124,10 @@ impl Store {
             // Les parties des autres comptes restent ouvertes jusqu'à ce qu'on les regarde.
             if running.contains(k) || !k.starts_with(prefix) { continue; }
             let Some((start, seen)) = r.open.take() else { continue };
-            // Vu il y a longtemps : l'app était fermée, le jeu a fini vers ce moment-là.
-            let end = if t.saturating_sub(seen) > 180 { seen } else { t };
+            // Vu pour la dernière fois avant l'ouverture de l'app : elle était fermée, le jeu a fini
+            // vers ce moment-là. Sinon l'app tournait : le jeu vient de finir (l'app ne regarde
+            // les jeux que quand quelque chose change, la dernière fois vue peut dater).
+            let end = if seen < alive_since { seen } else { t };
             let secs = end.saturating_sub(start) as u32;
             if secs >= 30 {
                 r.sessions.push(Session { start, secs, guess: false });
@@ -179,13 +181,17 @@ impl Store {
         // La partie en cours est suivie en direct.
         if r.open.is_some_and(|o| o.0 < end && start < o.1.max(o.0 + 1)) { return 0; }
         let overlap = |s: &Session| { let (a, b) = (s.start.max(start), (s.start + s.secs as u64).min(end)); b.saturating_sub(a) };
-        let covered: u64 = r.sessions.iter().map(overlap).sum();
+        let pieces: Vec<&Session> = r.sessions.iter().filter(|s| overlap(s) > 0).collect();
+        let covered: u64 = pieces.iter().map(|s| overlap(s)).sum();
         let missing = secs.saturating_sub(covered);
-        if missing < 60 { return 0; }
-        // Le journal a les heures exactes : sa partie remplace les morceaux notés.
+        // Déjà notée telle quelle : rien à faire.
+        let exact = pieces.len() == 1 && !pieces[0].guess && pieces[0].start.abs_diff(start) < 120 && (pieces[0].secs as u64).abs_diff(secs) < 120;
+        if exact { return 0; }
+        // Le journal a les heures exactes : sa partie remplace les morceaux notés (coupés ou approchés).
         r.sessions.retain(|s| overlap(s) == 0);
         r.sessions.push(Session { start, secs: secs as u32, guess: false });
         r.sessions.sort_by_key(|s| s.start);
+        if missing < 60 { return 0; }
         let tracked = r.since > 0 && start >= r.since;
         // `since` reste le début du suivi : il décide de ce qui a déjà été compté ou non.
         if !tracked { return 0; }
@@ -439,14 +445,50 @@ mod tests {
         let none = HashSet::new();
         s.reconcile(&[seen(100, 0)], &none, 1000);
         let on: HashSet<String> = ["a:1".to_string()].into();
-        s.tick("a:", &on, &HashMap::new(), 10_000);
-        s.tick("a:", &on, &HashMap::new(), 13_600);
-        assert_eq!(s.tick("a:", &none, &HashMap::new(), 13_602), (false, true));
+        s.tick("a:", &on, &HashMap::new(), 10_000, 0);
+        s.tick("a:", &on, &HashMap::new(), 13_600, 0);
+        assert_eq!(s.tick("a:", &none, &HashMap::new(), 13_602, 0), (false, true));
         s.reconcile(&[seen(160, 13_602)], &none, 13_700);
         let r = &s.games["a:1"];
         assert_eq!(r.sessions.len(), 1);
         assert!(!r.sessions[0].guess);
         assert!(r.live.is_empty());
+    }
+
+    #[test]
+    fn long_quiet_session_is_not_cut() {
+        // L'app tourne depuis 900 ; le jeu est vu à 1000 et 1100, puis plus rien jusqu'à sa fin à 2100.
+        let mut s = Store::default();
+        let on: HashSet<String> = ["a:1".to_string()].into();
+        let none = HashSet::new();
+        s.tick("a:", &on, &HashMap::new(), 1000, 900);
+        s.tick("a:", &on, &HashMap::new(), 1100, 900);
+        s.tick("a:", &none, &HashMap::new(), 2100, 900);
+        assert_eq!(s.games["a:1"].sessions[0].secs, 1100);
+        // Partie d'avant l'ouverture de l'app, finie pendant qu'elle était fermée : elle s'arrête à la dernière fois vue.
+        let mut s = Store::default();
+        s.tick("a:", &on, &HashMap::new(), 1000, 900);
+        s.tick("a:", &on, &HashMap::new(), 1100, 900);
+        s.tick("a:", &none, &HashMap::new(), 5000, 4000);
+        assert_eq!(s.games["a:1"].sessions[0].secs, 100);
+    }
+
+    #[test]
+    fn journal_replaces_cut_pieces_without_credit() {
+        // Le cas réel : 13:04 noté 4 min, puis 14 min approchées ; le journal dit 13:04:39 → 13:22:50.
+        let mut s = Store::default();
+        let none = HashSet::new();
+        s.reconcile(&[seen(0, 0)], &none, 100);
+        let r = s.games.get_mut("a:1").unwrap();
+        r.sessions.push(Session { start: 1000, secs: 240, guess: false });
+        r.sessions.push(Session { start: 1240, secs: 840, guess: true });
+        assert_eq!(s.recover("a:1", "Jeu", 1000, 2090), 0);
+        let r = &s.games["a:1"];
+        assert_eq!(r.sessions.len(), 1);
+        assert_eq!((r.sessions[0].start, r.sessions[0].secs, r.sessions[0].guess), (1000, 1090, false));
+        // Relu une seconde fois : rien ne change.
+        assert_eq!(s.recover("a:1", "Jeu", 1000, 2090), 0);
+        assert_eq!(s.games["a:1"].sessions.len(), 1);
     }
 
     #[test]
