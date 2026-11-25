@@ -1,5 +1,6 @@
 //! La description d'un jeu, en français : celle que Steam garde en cache, sinon la fiche
 //! du magasin Steam (trouvée par le nom pour un jeu non-Steam), ou un texte écrit à la main.
+//! Quand Steam n'a qu'un texte anglais, le résumé de l'article Wikipédia en français le remplace.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,10 +15,40 @@ pub struct Desc {
     pub from: Option<u32>,
     /// Écrit ou corrigé à la main : jamais remplacé automatiquement.
     pub custom: bool,
+    /// Texte tiré de Wikipédia en français (licence CC BY-SA, source affichée).
+    pub wiki: Option<String>,
+    /// La recherche d'un texte français a déjà été faite : on ne la refait pas.
+    pub fr_checked: bool,
 }
 
 impl Desc {
     pub fn is_empty(&self) -> bool { self.short.trim().is_empty() && self.full.trim().is_empty() }
+    /// Steam a parfois un résumé anglais au-dessus d'un texte complet français : on reprend
+    /// alors le début du texte français. Rend `true` si le résumé a changé.
+    pub fn fix_short(&mut self) -> bool {
+        if self.custom || self.full.trim().is_empty() || is_french(&self.short) || !is_french(&self.full) { return false; }
+        // Les premières lignes, jusqu'à ≈ 200 caractères : le reste reste dans « Lire la suite ».
+        let mut short = String::new();
+        for l in first_para(&self.full).lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !short.is_empty() { short.push('\n'); }
+            short.push_str(l);
+            if short.chars().count() >= 200 { break; }
+        }
+        self.short = short;
+        true
+    }
+    /// Tout est en français (ou presque rien à juger).
+    pub fn french(&self) -> bool { is_french(&self.short) && is_french(&self.full) }
+}
+
+/// Le texte est-il en français ? Compte les petits mots les plus courants de chaque langue.
+pub fn is_french(s: &str) -> bool {
+    const FR: [&str; 16] = ["le", "la", "les", "des", "du", "de", "un", "une", "et", "est", "dans", "pour", "vous", "votre", "avec", "sur"];
+    const EN: [&str; 16] = ["the", "and", "of", "to", "you", "your", "is", "in", "with", "for", "an", "this", "that", "on", "as", "are"];
+    let words: Vec<String> = s.split(|c: char| !c.is_alphabetic() && c != '\'').map(str::to_lowercase).filter(|w| !w.is_empty()).collect();
+    let fr = words.iter().filter(|w| FR.contains(&w.as_str()) || w.starts_with("l'") || w.starts_with("d'")).count();
+    let en = words.iter().filter(|w| EN.contains(&w.as_str())).count();
+    fr + en < 3 || fr >= en
 }
 
 /// Les descriptions connues, par jeu (compte:id). Un texte vide : rien trouvé, on ne recherche plus.
@@ -65,7 +96,7 @@ pub fn local(root: &Path, account: &str, appid: u32) -> Option<Desc> {
     let d = v.as_array()?.iter().find(|e| e.get(0).and_then(|k| k.as_str()) == Some("descriptions"))?.get(1)?.get("data")?;
     let full = clean(d.get("strFullDescription").and_then(|s| s.as_str()).unwrap_or_default());
     let short = clean(d.get("strSnippet").and_then(|s| s.as_str()).unwrap_or_default());
-    let desc = Desc { short: if short.is_empty() { first_para(&full) } else { short }, full, from: Some(appid), custom: false };
+    let desc = Desc { short: if short.is_empty() { first_para(&full) } else { short }, full, from: Some(appid), ..Default::default() };
     (!desc.is_empty()).then_some(desc)
 }
 
@@ -85,7 +116,7 @@ pub fn store(appid: u32) -> Result<Desc, String> {
     let get = |k: &str| clean(d.get(k).and_then(|s| s.as_str()).unwrap_or_default());
     let full = { let a = get("about_the_game"); if a.is_empty() { get("detailed_description") } else { a } };
     let short = get("short_description");
-    let desc = Desc { short: if short.is_empty() { first_para(&full) } else { short }, full, from: Some(appid), custom: false };
+    let desc = Desc { short: if short.is_empty() { first_para(&full) } else { short }, full, from: Some(appid), ..Default::default() };
     if desc.is_empty() { Err("Cette fiche Steam n'a pas de description.".into()) } else { Ok(desc) }
 }
 
@@ -98,14 +129,44 @@ pub fn search(term: &str) -> Result<Vec<(u32, String)>, String> {
 
 fn norm(s: &str) -> String { s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect() }
 
+fn words(s: &str) -> Vec<String> { s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect() }
+
+/// Le résumé de l'article Wikipédia en français du jeu, si un article porte bien son nom.
+pub fn wikipedia(name: &str) -> Option<Desc> {
+    let get = |url: String| -> Option<serde_json::Value> { agent().get(&url).header("User-Agent", "MinimalSteam (lanceur de jeux)").call().ok()?.body_mut().read_json().ok() };
+    let v = get(format!("https://fr.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit=8&format=json", encode(&format!("{name} jeu vidéo"))))?;
+    let titles: Vec<String> = v.get("query")?.get("search")?.as_array()?.iter().filter_map(|r| r.get("title")?.as_str().map(String::from)).collect();
+    // Le titre doit être le nom du jeu (à la ponctuation près), ou contenir tous ses mots sans en ajouter beaucoup.
+    let want = words(name);
+    let title = titles.iter().find(|t| norm(t) == norm(name)).or_else(|| titles.iter().find(|t| {
+        let tw = words(t);
+        want.iter().all(|w| tw.contains(w)) && tw.len() <= want.len() + 2
+    }))?;
+    let v = get(format!("https://fr.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles={}&format=json", encode(title)))?;
+    let text = v.get("query")?.get("pages")?.as_object()?.values().next()?.get("extract")?.as_str()?.trim().to_string();
+    // Un article de jeu vidéo, pas une page d'homonymie ou un film du même nom.
+    if text.len() < 80 || !text.to_lowercase().contains("jeu") { return None; }
+    let full = text.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n\n");
+    Some(Desc { short: first_para(&full), full, from: None, custom: false, wiki: Some(title.clone()), fr_checked: true })
+}
+
 /// Trouve tout seul la description d'un jeu. `steam` : l'id Steam s'il en a un.
 pub fn find(root: &Path, account: &str, steam: Option<u32>, name: &str) -> Option<Desc> {
-    if let Some(id) = steam { return local(root, account, id).or_else(|| store(id).ok()); }
-    let wanted = norm(name);
-    if wanted.is_empty() { return None; }
-    // Seulement un nom qui correspond vraiment : mieux vaut rien qu'une fiche d'un autre jeu.
-    let hit = search(name).ok()?.into_iter().find(|(_, n)| norm(n) == wanted)?;
-    store(hit.0).ok()
+    let found = match steam {
+        Some(id) => local(root, account, id).or_else(|| store(id).ok()),
+        None => {
+            let wanted = norm(name);
+            if wanted.is_empty() { return None; }
+            // Seulement un nom qui correspond vraiment : mieux vaut rien qu'une fiche d'un autre jeu.
+            search(name).ok().and_then(|l| l.into_iter().find(|(_, n)| norm(n) == wanted)).and_then(|hit| store(hit.0).ok())
+        }
+    };
+    let found = found.map(|mut d| { d.fix_short(); d });
+    match found {
+        Some(d) if d.french() => Some(Desc { fr_checked: true, ..d }),
+        // Steam n'a que de l'anglais (ou rien) : Wikipédia en français, sinon le texte de Steam.
+        other => wikipedia(name).or(other.map(|d| Desc { fr_checked: true, ..d })),
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +183,24 @@ mod tests {
     fn local_cache_if_present() {
         let root = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".steam/steam");
         if let Some(d) = local(&root, "153185168", 1466860) { assert!(d.short.contains("Age of Empires")); assert!(d.full.len() > d.short.len()); }
+    }
+
+    #[test]
+    fn language() {
+        assert!(is_french("Un jeu d'action et de plates-formes dans l'univers Star Wars, sorti sur PC et Xbox."));
+        assert!(!is_french("The latest installment in the Jedi Knight series, you play as a student of the Jedi Academy."));
+        assert!(is_french("Mafia"));
+        let mut d = Desc { short: "Forge your weapon and follow the path of the Jedi. You are the new student of the academy.".into(), full: "Fabriquez votre arme et suivez la voie du Jedi\nJedi Academy est le dernier épisode de la série très acclamée. Incarnez un nouvel élève impatient de pouvoir apprendre les secrets de la Force, dispensés par le Maître Jedi Luke Skywalker.\nPersonnalisez votre personnage en choisissant son apparence.".into(), ..Default::default() };
+        assert!(d.fix_short());
+        assert!(d.short.starts_with("Fabriquez") && d.short.contains("Luke Skywalker") && !d.short.contains("Personnalisez"), "{}", d.short);
+    }
+
+    #[test]
+    #[ignore]
+    fn wikipedia_fr() {
+        let d = wikipedia("STAR WARS Jedi Knight: Jedi Academy").expect("article");
+        assert!(d.full.contains("Raven Software"), "{}", d.full);
+        assert!(d.french());
     }
 
     #[test]

@@ -29,7 +29,11 @@ impl App {
     pub(crate) fn desc_block(&mut self, ui: &mut egui::Ui, g: &Game) {
         let Some(key) = self.acc().map(|a| gkey(&a.id, g.id)) else { return };
         let ctx = ui.ctx().clone();
-        if !self.descs.0.contains_key(&key) && !self.desc_asked.contains(&key) && !g.pending { self.fetch_desc(&ctx, key.clone(), g); }
+        // Résumé anglais au-dessus d'un texte français (déjà en cache) : corrigé sur place.
+        if self.descs.0.get_mut(&key).is_some_and(|d| d.fix_short()) { self.save_descs(); }
+        // Pas encore cherchée, ou trouvée seulement en anglais avant que Wikipédia serve de secours.
+        let english = self.descs.0.get(&key).is_some_and(|d| !d.custom && !d.fr_checked && !d.french());
+        if (!self.descs.0.contains_key(&key) || english) && !self.desc_asked.contains(&key) && !g.pending { self.fetch_desc(&ctx, key.clone(), g); }
         let editing = self.desc_edit.as_ref().is_some_and(|e| e.key == key);
         let (mut edit, mut save, mut cancel, mut reset, mut search, mut pick) = (false, false, false, false, false, None);
         let d = self.descs.0.get(&key).cloned();
@@ -72,6 +76,9 @@ impl App {
                 if !d.full.is_empty() && !d.short.is_empty() && d.full.trim() != d.short.trim() {
                     if ui.add(egui::Button::new(RichText::new(if more { "Réduire" } else { "Lire la suite" }).size(12.5).color(pal().accent)).frame(false)).clicked() { self.desc_more = !self.desc_more; }
                 }
+                if let Some(t) = &d.wiki {
+                    ui.label(RichText::new(format!("Source : Wikipédia, « {t} » (CC BY-SA)")).size(11.5).color(pal().muted));
+                }
             } else {
                 ui.label(RichText::new(if loading { "Recherche de la description…" } else { "Aucune description trouvée. « Modifier » permet d'en écrire une ou de choisir la fiche Steam du jeu." }).size(13.0).color(pal().muted));
             }
@@ -97,7 +104,7 @@ impl App {
             if let Some(e) = self.desc_edit.take() {
                 // Texte de la fiche choisie, non retouché : on garde aussi sa version longue.
                 let full = if e.text.trim() == e.picked.trim() { e.full } else { String::new() };
-                self.descs.0.insert(key, desc::Desc { short: e.text.trim().to_string(), full, from: e.from, custom: true });
+                self.descs.0.insert(key, desc::Desc { short: e.text.trim().to_string(), full, from: e.from, custom: true, ..Default::default() });
                 self.save_descs();
             }
         }

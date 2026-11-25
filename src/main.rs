@@ -19,6 +19,7 @@ mod fonts;
 mod friends;
 mod friendsui;
 mod gamepad;
+mod gpu;
 mod owned;
 mod scan;
 #[allow(dead_code)]
@@ -229,6 +230,11 @@ struct Config {
     friends_fav_only: bool,
     /// Groupes repliés dans l'onglet Amis (0 en jeu, 1 en ligne, 2 hors ligne).
     friends_closed: std::collections::BTreeSet<u8>,
+    /// Statistiques : la façon d'afficher chaque graphique (barres, courbe, camembert…), la période
+    /// du rapport et le mode des heures. Gardé d'un démarrage à l'autre.
+    stats_views: std::collections::BTreeMap<String, u8>,
+    /// Limite de watts et overclocking de la carte graphique, par jeu (NVIDIA, option à activer).
+    gpu: gpu::GpuCfg,
 }
 
 /// Le dossier des statistiques, à part de la config pour se sauvegarder facilement.
@@ -462,6 +468,10 @@ enum Msg {
     DescPicked(u32, Result<desc::Desc, String>),
     Queued(Vec<steam::NewGame>),
     QueueDone { applied: steam::Queue, result: Result<Option<String>, String> },
+    /// Réglage de la carte graphique appliqué (ou erreur).
+    Gpu(Result<String, String>),
+    /// Autorisation de la carte graphique installée ou retirée.
+    GpuHelper(Result<(), String>),
 }
 
 struct Row { on: bool, exists: bool, name: String, exe: String, options: String, windows: bool }
@@ -552,6 +562,12 @@ struct App {
     countdown: Option<Instant>,
     hold: bool,
     update: SelfUpdate,
+    /// Cartes NVIDIA (lues une fois, à la demande).
+    gpu_cards: Option<Result<Vec<gpu::Card>, String>>,
+    /// Dernier réglage de carte demandé, et celui qui attend d'être stable 1,5 s pour partir.
+    gpu_want: Option<gpu::Profile>,
+    gpu_pending: Option<(gpu::Profile, Instant)>,
+    gpu_busy: bool,
     hook: TestHook,
     /// Historique des parties et regroupements (dossier `statistiques`).
     stats: stats::Store,
@@ -633,11 +649,12 @@ impl App {
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), gpu_cards: None, gpu_want: None, gpu_pending: None, gpu_busy: false, hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
             stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), hour_mode: 0, stats_slot: None, report_view: 0, ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false, stats_alive: stats::now(),
             descs: config_dir("Minimalsteam").map(|d| desc::Store::load(&d)).unwrap_or_default(), desc_asked: HashSet::new(), friends: None, friends_busy: false, friends_at: None, show_hidden_friends: false, desc_more: false, desc_edit: None,
         };
+        app.load_views();
         app.track_direct(direct_now);
         app.stats_tick();
         if std::env::var_os("APP_SCREENSHOT").is_some() {
@@ -645,6 +662,10 @@ impl App {
             if let Some(h) = std::env::var("MINIMALSTEAM_TEST_HOUR").ok().and_then(|d| d.parse::<usize>().ok()) { app.stats_slot = Some((0, h)); }
             if std::env::var_os("MINIMALSTEAM_TEST_CLOSED").is_some() { app.cfg.friends_closed.insert(2); }
             if let Some(v) = std::env::var("MINIMALSTEAM_TEST_VIEW").ok().and_then(|d| d.parse::<u8>().ok()) { app.report_view = v; }
+            // MINIMALSTEAM_TEST_VIEWS=jeux=1,heures=2 : la vue de chaque graphique (sans rien enregistrer).
+            for kv in std::env::var("MINIMALSTEAM_TEST_VIEWS").unwrap_or_default().split(',') {
+                if let Some((k, v)) = kv.split_once('=') { if let Ok(v) = v.parse::<u8>() { app.cfg.stats_views.insert(k.to_string(), v); } }
+            }
             if let Some(n) = std::env::var("MINIMALSTEAM_TEST_MONTH").ok().and_then(|d| d.parse::<i32>().ok()) { app.stats_month = n; }
             if let Some(n) = std::env::var("MINIMALSTEAM_TEST_DAY").ok().and_then(|d| d.parse::<i32>().ok()) { app.stats_day = Some(stats::midnight(stats::now(), -n)); }
             match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("stats") => app.filter = Filter::Stats, Ok("friends") => app.filter = Filter::Friends, Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
@@ -736,6 +757,58 @@ impl App {
             Sort::Playtime => v.sort_by_key(|i| std::cmp::Reverse(self.games[*i].playtime)),
         }
         v
+    }
+
+    /// La première carte NVIDIA, lue une fois.
+    fn gpu_card(&mut self) -> Option<gpu::Card> {
+        if self.gpu_cards.is_none() { self.gpu_cards = Some(if self.hook.demo { Ok(vec![gpu::Card { uuid: "GPU-00000000-0000-0000-0000-000000000000".into(), name: "NVIDIA GeForce RTX 4070".into(), default_w: 200.0, min_w: 100.0, max_w: 216.0, limit_w: 120.0 }]) } else { gpu::cards() }); }
+        self.gpu_cards.as_ref().and_then(|r| r.as_ref().ok()).and_then(|l| l.first().cloned())
+    }
+
+    fn gpu_default(&mut self) -> Option<gpu::Profile> {
+        let c = self.gpu_card()?;
+        Some(self.cfg.gpu.default.unwrap_or_else(|| c.current()))
+    }
+
+    /// Le réglage voulu maintenant : celui du jeu en cours le plus gourmand qui en a un, sinon le défaut.
+    fn gpu_desired(&mut self) -> Option<gpu::Profile> {
+        if !self.cfg.gpu.enabled { return None; }
+        let def = self.gpu_default()?;
+        let acc = self.acc().map(|a| a.id.clone()).unwrap_or_default();
+        let ids: HashSet<u32> = self.running.iter().copied().chain(self.launched.keys().copied()).collect();
+        Some(ids.iter().filter_map(|id| self.cfg.gpu.games.get(&gkey(&acc, *id)).copied()).max_by_key(|p| (p.watts, p.oc)).unwrap_or(def))
+    }
+
+    /// Applique le réglage voulu quand il change (jeu lancé ou fermé, réglage modifié),
+    /// une fois stable 1,5 s pour ne pas l'envoyer à chaque mouvement du curseur.
+    fn gpu_sync(&mut self, ctx: &egui::Context) {
+        if self.hook.demo || std::env::var_os("APP_SCREENSHOT").is_some() { return; }
+        let Some(want) = self.gpu_desired() else { self.gpu_want = None; self.gpu_pending = None; return };
+        // Au démarrage de l'app (ou à l'activation) : on n'envoie rien si la carte a déjà ces watts.
+        let Some(last) = self.gpu_want else {
+            let same = self.gpu_card().is_some_and(|c| (c.limit_w - want.watts as f32).abs() < 1.0);
+            self.gpu_want = Some(if same { want } else { gpu::Profile { watts: 0, oc: 255 } });
+            return;
+        };
+        if want == last { self.gpu_pending = None; return; }
+        match self.gpu_pending {
+            Some((p, t)) if p == want && t.elapsed() >= Duration::from_millis(1500) && !self.gpu_busy => {
+                let Some(card) = self.gpu_card() else { return };
+                self.gpu_want = Some(want);
+                self.gpu_pending = None;
+                self.gpu_busy = true;
+                let (tx, c) = (self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || { let _ = tx.send(Msg::Gpu(gpu::apply(&card, want))); c.request_repaint(); });
+            }
+            Some((p, _)) if p == want => ctx.request_repaint_after(Duration::from_millis(300)),
+            _ => { self.gpu_pending = Some((want, Instant::now())); ctx.request_repaint_after(Duration::from_millis(300)); }
+        }
+    }
+
+    fn gpu_helper(&mut self, ctx: &egui::Context, install: bool) {
+        self.gpu_busy = true;
+        let (tx, c) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || { let _ = tx.send(Msg::GpuHelper(if install { gpu::install_helper() } else { gpu::uninstall_helper() })); c.request_repaint(); });
     }
 
     fn launch(&mut self, id: u32) {
@@ -881,6 +954,17 @@ impl App {
                         Err(e) => self.set_status(e, true),
                     }
                 }
+                Msg::Gpu(r) => {
+                    self.gpu_busy = false;
+                    match r { Ok(t) => self.set_status(t, false), Err(e) => self.set_status(format!("Carte graphique : {e}"), true) }
+                }
+                Msg::GpuHelper(r) => {
+                    self.gpu_busy = false;
+                    match r {
+                        Ok(()) => { self.gpu_want = None; self.set_status("Autorisation de la carte graphique à jour.", false); }
+                        Err(e) => self.set_status(format!("Carte graphique : {e}"), true),
+                    }
+                }
                 Msg::Poll { steam, running, direct, changed } => {
                     let ended = self.track_direct(direct);
                     self.steam_on = steam;
@@ -995,7 +1079,14 @@ impl App {
                 Msg::StatsExported(Err(e)) => self.set_status(e, true),
                 Msg::Desc(key, d) => {
                     // Un texte écrit à la main n'est jamais remplacé.
-                    if !self.descs.0.get(&key).is_some_and(|x| x.custom) { self.descs.0.insert(key, d.unwrap_or_default()); self.save_descs(); }
+                    if !self.descs.0.get(&key).is_some_and(|x| x.custom) {
+                        match (d, self.descs.0.get_mut(&key)) {
+                            // Rien de mieux trouvé : on garde le texte déjà là, sans rechercher encore.
+                            (None, Some(old)) if !old.is_empty() => old.fr_checked = true,
+                            (d, _) => { self.descs.0.insert(key, d.unwrap_or_default()); }
+                        }
+                        self.save_descs();
+                    }
                 }
                 Msg::DescSearch(r) => if let Some(e) = self.desc_edit.as_mut() {
                     e.searching = false;
@@ -2033,6 +2124,7 @@ impl App {
         let confirming = self.stop_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
         if confirming || halting { ctx.request_repaint_after(Duration::from_millis(250)); }
         let (busy, game_running, steam_on) = (self.busy.clone(), self.game_active(), self.steam_on);
+        let gpu_card = if self.cfg.gpu.enabled { self.gpu_card() } else { None };
         let t = self.cfg.theme.clone();
         let panel_tex = self.zone_tex(Zone::Panel);
         let fade = if panel_tex.is_some() { Color32::from_rgba_unmultiplied(t.panel[0], t.panel[1], t.panel[2], (t.panel_dim as f32 * 2.55).round() as u8) } else { pal().panel };
@@ -2170,6 +2262,27 @@ impl App {
                     cancel_add = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler l'ajout")).clicked();
                 }
                 ui.add_space(10.0);
+                if let Some(card) = gpu_card.as_ref().filter(|_| g.installed) {
+                    pill().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.label(RichText::new("Carte graphique").size(13.5).color(pal().muted));
+                        let mut on = self.cfg.gpu.games.contains_key(&via_key);
+                        if ui.checkbox(&mut on, "Réglage propre à ce jeu").on_hover_text("Limite de watts et overclocking appliqués au lancement de ce jeu, puis retour au réglage par défaut à sa fermeture.").changed() {
+                            if on { let d = self.cfg.gpu.default.unwrap_or_else(|| card.current()); self.cfg.gpu.games.insert(via_key.clone(), d); } else { self.cfg.gpu.games.remove(&via_key); }
+                            self.dirty = true;
+                        }
+                        if let Some(mut p) = self.cfg.gpu.games.get(&via_key).copied() {
+                            if gpu_editor(ui, card, &mut p) { self.cfg.gpu.games.insert(via_key.clone(), p); self.dirty = true; }
+                            let when = if running { "Appliqué maintenant, et à chaque lancement de ce jeu." } else { "Appliqué au lancement de ce jeu ; retour au réglage par défaut à sa fermeture." };
+                            ui.add(egui::Label::new(RichText::new(when).size(12.5).color(pal().muted)).wrap());
+                        } else {
+                            let d = self.cfg.gpu.default.unwrap_or_else(|| card.current());
+                            ui.add(egui::Label::new(RichText::new(format!("Réglage par défaut : {} W, overclocking {}.", d.watts, gpu::LEVELS[d.oc.min(3) as usize].to_lowercase())).size(12.5).color(pal().muted)).wrap());
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
                 if g.installed && !g.local && !g.pending {
                     let mut on = collection_on;
                     if ui.checkbox(&mut on, "Dans la collection MinimalSteam").on_hover_text("Range ce jeu dans la collection MinimalSteam de Steam, ou l'en retire. Le jeu reste dans ta bibliothèque.").changed() { collection_toggle = true; }
@@ -2486,6 +2599,17 @@ impl App {
         let (mut save, mut pick_image, mut changed, mut pick_sgdb, mut close, mut need_fonts) = (false, None, false, None, false, false);
         let mut save_steam = false;
         let mut sync_all = false;
+        // Carte graphique : lue seulement quand on ouvre son onglet.
+        let gpu_card = if self.settings_tab == 4 { self.gpu_card() } else { None };
+        let gpu_err = self.gpu_cards.as_ref().and_then(|r| r.as_ref().err().cloned());
+        let (gpu_ready, gpu_busy) = (gpu::helper_ready(), self.gpu_busy);
+        let mut gpu_helper: Option<bool> = None;
+        // Jeux avec un réglage propre : (clé, nom), par nom.
+        let mut gpu_games: Vec<(String, String)> = self.cfg.gpu.games.keys().map(|k| {
+            let name = k.split(':').nth(1).and_then(|i| i.parse::<u32>().ok()).and_then(|i| self.game(i)).map_or_else(|| format!("Jeu {k}"), |g| g.name.clone());
+            (k.clone(), name)
+        }).collect();
+        gpu_games.sort_by_key(|(_, n)| n.to_lowercase());
         let to_sync = self.unsynced();
         let sync_rows: Vec<(u32, String)> = to_sync.iter().filter_map(|i| Some((*i, self.game(*i)?.name.clone()))).collect();
         let screen = ctx.screen_rect();
@@ -2504,7 +2628,7 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_width(128.0);
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    for (i, label) in ["Thème", "Fonds", "Affichage", "Compte"].into_iter().enumerate() {
+                    for (i, label) in ["Thème", "Fonds", "Affichage", "Compte", "Carte graphique"].into_iter().enumerate() {
                         if nav_item(ui, label, self.settings_tab == i as u8) { self.settings_tab = i as u8; self.color_edit = None; }
                     }
                 });
@@ -2622,6 +2746,59 @@ impl App {
                                     }
                                 }
                             }
+                            4 => {
+                                let wrap = |ui: &mut egui::Ui, t: &str, c: Color32| { ui.add(egui::Label::new(RichText::new(t).size(13.0).color(c)).wrap()); };
+                                let head = |t: String| RichText::new(t).size(14.5).strong();
+                                let summary = |p: gpu::Profile| format!("{} W · {}", p.watts, gpu::LEVELS[p.oc.min(3) as usize]);
+                                field(ui, "Carte graphique selon le jeu");
+                                wrap(ui, "MinimalSteam règle la limite de watts et l'overclocking de la carte graphique quand tu lances un jeu, puis remet le réglage par défaut quand il se ferme.", pal().muted);
+                                ui.add_space(4.0);
+                                if ui.checkbox(&mut self.cfg.gpu.enabled, "Régler la carte graphique selon le jeu").changed() { self.gpu_want = None; changed = true; }
+                                wrap(ui, "Cartes NVIDIA seulement. AMD et Intel ne sont pas encore pris en charge : avec une de ces cartes, laisse cette option décochée.", GOLD);
+                                ui.add_space(8.0);
+                                match &gpu_card {
+                                    None => wrap(ui, gpu_err.as_deref().unwrap_or("Recherche de la carte…"), BAD),
+                                    Some(card) => {
+                                        egui::CollapsingHeader::new(head(format!("Carte et autorisation{}", if gpu_ready { "" } else { " — à installer" }))).id_salt("gpu-card").default_open(!gpu_ready).show(ui, |ui| {
+                                            info(ui, "Carte", &card.name);
+                                            info(ui, "Limite au moment de l'ouverture", &format!("{:.0} W (origine {:.0} W, de {:.0} à {:.0} W)", card.limit_w, card.default_w, card.min_w, card.max_w));
+                                            ui.add_space(4.0);
+                                            if gpu_ready {
+                                                wrap(ui, "Autorisation installée : les réglages s'appliquent sans mot de passe.", pal().accent);
+                                                if ui.add_enabled(!gpu_busy, egui::Button::new("Retirer l'autorisation")).on_hover_text("Supprime le script administrateur et sa règle. Mot de passe demandé.").clicked() { gpu_helper = Some(false); }
+                                            } else {
+                                                wrap(ui, "Pour changer de réglage à chaque lancement sans te demander ton mot de passe, MinimalSteam installe un petit script administrateur qui ne fait que ça (il vérifie chaque valeur), autorisé pour ton compte seulement. Mot de passe demandé une seule fois.", pal().muted);
+                                                if fill_button(ui, "Installer l'autorisation", egui::vec2(0.0, 32.0), 13.5, pal().accent, !gpu_busy) { gpu_helper = Some(true); }
+                                            }
+                                            wrap(ui, &format!("Fichiers : {} et {}", gpu::HELPER, gpu::RULE), pal().muted);
+                                        });
+                                        if self.cfg.gpu.enabled {
+                                            ui.add_space(4.0);
+                                            let mut p = self.cfg.gpu.default.unwrap_or_else(|| card.current());
+                                            egui::CollapsingHeader::new(head(format!("Réglage par défaut — {}", summary(p)))).id_salt("gpu-default").show(ui, |ui| {
+                                                wrap(ui, "Sur le bureau, et pour les jeux sans réglage propre. Si tu utilises PowerCap, mets le même que celui gardé au démarrage.", pal().muted);
+                                                ui.add_space(4.0);
+                                                if gpu_editor(ui, card, &mut p) { self.cfg.gpu.default = Some(p); self.dirty = true; }
+                                            });
+                                            ui.add_space(4.0);
+                                            let n = gpu_games.len();
+                                            egui::CollapsingHeader::new(head(format!("Jeux avec un réglage propre ({n})"))).id_salt("gpu-games").default_open(n > 0).show(ui, |ui| {
+                                                if n == 0 { wrap(ui, "Aucun pour l'instant. Dans le panneau d'un jeu, coche « Réglage propre à ce jeu ».", pal().muted); }
+                                                let mut remove = None;
+                                                for (key, name) in &gpu_games {
+                                                    let Some(mut p) = self.cfg.gpu.games.get(key).copied() else { continue };
+                                                    egui::CollapsingHeader::new(RichText::new(format!("{name} — {}", summary(p))).size(13.5)).id_salt(("gpu-game", key)).show(ui, |ui| {
+                                                        if gpu_editor(ui, card, &mut p) { self.cfg.gpu.games.insert(key.clone(), p); self.dirty = true; }
+                                                        ui.add_space(4.0);
+                                                        if ui.button("Revenir au réglage par défaut").on_hover_text("Retire le réglage propre à ce jeu : il prendra le réglage par défaut.").clicked() { remove = Some(key.clone()); }
+                                                    });
+                                                }
+                                                if let Some(k) = remove { self.cfg.gpu.games.remove(&k); self.dirty = true; }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             _ => {
                                 field(ui, "Compte Steam");
                                 let shown = |a: &Account| if demo { "Mon compte".to_string() } else { a.name.clone() };
@@ -2692,6 +2869,7 @@ impl App {
             });
         });
         if need_fonts { self.fonts = Some(vec![]); self.spawn(ctx, || Msg::Fonts(fonts::list())); }
+        if let Some(install) = gpu_helper { self.gpu_helper(ctx, install); }
         if close { self.settings = false; }
         if changed { self.dirty = true; apply_theme(ctx, &self.cfg.theme); }
         if let Some(panel) = pick_sgdb { self.open_back_picker(ctx, panel); return; }
@@ -2858,6 +3036,59 @@ fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 /// Le fond arrondi qui garde les commandes lisibles, même sur une jaquette.
+/// Limite de watts et palier d'overclocking, avec les mêmes conseils que PowerCap. Rend `true` si changé.
+fn gpu_editor(ui: &mut egui::Ui, card: &gpu::Card, p: &mut gpu::Profile) -> bool {
+    let mut changed = false;
+    let wrap = |ui: &mut egui::Ui, t: String, c: Color32, size: f32| { ui.add(egui::Label::new(RichText::new(t).size(size).color(c)).wrap()); };
+    let ratio = card.ratio(p.watts);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} W", p.watts)).size(22.0).strong().color(pal().accent));
+        ui.label(RichText::new(format!("{:.0} % de l'origine ({:.0} W)", ratio * 100.0, card.default_w)).size(13.0).color(pal().muted));
+    });
+    if card.adjustable() {
+        let mut w = p.watts as f32;
+        ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(80.0);
+        if ui.add(egui::Slider::new(&mut w, card.min_w..=card.max_w).step_by(card.step() as f64).show_value(false)).changed() { p.watts = w.round() as u32; changed = true; }
+        ui.horizontal_wrapped(|ui| {
+            for (name, r) in gpu::PRESETS {
+                let w = card.preset(r);
+                if chip(ui, &format!("{name} {w} W"), p.watts == w) { p.watts = w; changed = true; }
+            }
+        });
+    } else {
+        wrap(ui, "Cette carte ne permet pas de régler sa limite de watts : seul l'overclocking s'applique.".into(), GOLD, 13.0);
+    }
+    let line = if (0.995..=1.005).contains(&ratio) { "Puissance d'origine : toutes les performances, toute la chaleur.".to_string() }
+        else if ratio > 1.0 { format!("Au-dessus de l'origine : ≈ +1 % d'images/s au mieux, pour {:.0} W de chaleur en plus.", p.watts as f32 - card.default_w) }
+        else { format!("Carte à fond : ≈ −{:.0} % d'images/s sans overclocking, et jusqu'à {:.0} W de chaleur en moins.", gpu::fps_loss(ratio).max(0.5), card.default_w - p.watts as f32) };
+    wrap(ui, line, pal().text, 13.0);
+    ui.add_space(4.0);
+    ui.label(RichText::new("Overclocking").size(13.5).strong());
+    ui.horizontal_wrapped(|ui| {
+        for (i, name) in gpu::LEVELS.iter().enumerate() {
+            if chip(ui, name, p.oc == i as u8) { p.oc = i as u8; changed = true; }
+        }
+    });
+    let (c, m) = card.offsets(*p);
+    if p.oc > 0 {
+        wrap(ui, format!("+{c} MHz processeur graphique, +{m} MHz mémoire vidéo (adapté à {} W).", p.watts), pal().muted, 12.5);
+        let (risk, color) = match p.oc {
+            1 => ("Prudent : la quasi-totalité des cartes le tiennent.", pal().accent),
+            2 => ("Courant : beaucoup de cartes le tiennent, chacune est différente. Teste-le bien en jouant.", pal().accent),
+            _ => ("Élevé : beaucoup de cartes plantent ici (jeu qui se ferme, écran noir). Sans danger pour la carte, mais risqué.", GOLD),
+        };
+        wrap(ui, risk.into(), color, 12.5);
+    }
+    let net = gpu::net_vs_stock(card, *p);
+    wrap(ui, format!("Bilan, carte à fond : ≈ {}{:.0} % d'images/s par rapport à la carte d'origine.", if net < -0.5 { "−" } else { "+" }, net.abs()), pal().text, 13.0);
+    let why = if ratio < 0.97 && p.oc > 0 { "Bridée en watts, la carte ne chauffe pas plus avec l'overclocking : elle tire plus d'images/s des mêmes watts." }
+        else if p.oc > 0 { "À cette puissance, l'overclocking chauffe un peu plus, sans dépasser la limite." }
+        else { "L'overclocking récupère une partie de ce que la limite fait perdre, sans chaleur en plus quand la carte est bridée." };
+    wrap(ui, why.into(), pal().muted, 12.5);
+    wrap(ui, "Jeu léger ou images/s plafonnées (VRR, 60/120/180 fps) : la carte tourne sous sa limite, la perte réelle est plus faible, voire nulle.".into(), pal().muted, 12.5);
+    changed
+}
+
 fn pill() -> egui::Frame {
     if soft() {
         egui::Frame::new().fill(pal().menu).stroke(Stroke::new(1.0_f32, blend(pal().line, Color32::WHITE, 0.10).gamma_multiply(0.8))).corner_radius(14).inner_margin(Margin::same(3))
@@ -3156,6 +3387,7 @@ impl eframe::App for App {
             }
         }
         self.sync_font(ctx);
+        self.gpu_sync(ctx);
         self.tick_queue(ctx);
         self.queue_bar(ctx);
         self.detail(ctx);
