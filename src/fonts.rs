@@ -40,9 +40,65 @@ pub fn load(name: &str) -> Option<Vec<u8>> {
     usable(&bytes).then_some(bytes)
 }
 
+/// Les polices de secours pour ce que la police normale n'a pas : chinois, japonais, coréen,
+/// lettres stylisées et symboles des pseudos. Sans elles, ces caractères s'affichent en carrés.
+/// Cherchées une seule fois ; chacune doit savoir afficher le caractère qu'on attend d'elle.
+pub fn fallbacks() -> Vec<std::sync::Arc<eframe::egui::FontData>> {
+    static FALLBACKS: std::sync::OnceLock<Vec<std::sync::Arc<eframe::egui::FontData>>> = std::sync::OnceLock::new();
+    FALLBACKS.get_or_init(|| {
+        let wanted: [(&[&str], char); 3] = [
+            (&["Droid Sans Fallback", "Noto Sans CJK JP", "WenQuanYi Zen Hei"], '中'),
+            (&["Noto Sans Math", "STIX Two Math"], '\u{1D504}'),
+            (&["Noto Sans Symbols 2", "Noto Sans Symbols"], '\u{2729}'),
+        ];
+        let mut out = Vec::new();
+        for (names, test) in wanted {
+            for name in names {
+                let Ok(o) = fc("fc-match").args([*name, "--format", "%{family[0]}\n%{file}\n%{index}"]).output() else { continue };
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                let mut l = text.lines();
+                let (Some(family), Some(file)) = (l.next(), l.next()) else { continue };
+                if !family.eq_ignore_ascii_case(name) { continue; }
+                let index: u32 = l.next().and_then(|i| i.trim().parse().ok()).unwrap_or(0);
+                if std::fs::metadata(file).map_or(true, |m| m.len() > 40 << 20) { continue; }
+                let Ok(bytes) = std::fs::read(file) else { continue };
+                // Une police illisible ferait planter egui.
+                if !ab_glyph::FontRef::try_from_slice_and_index(&bytes, index).is_ok_and(|f| f.glyph_id(test).0 != 0) { continue; }
+                let mut d = eframe::egui::FontData::from_owned(bytes);
+                d.index = index;
+                out.push(std::sync::Arc::new(d));
+                break;
+            }
+        }
+        out
+    }).clone()
+}
+
+/// Les polices de l'app : la police choisie (s'il y en a une) en premier, celles de secours en dernier.
+pub fn definitions(chosen: Option<Vec<u8>>) -> eframe::egui::FontDefinitions {
+    use eframe::egui::FontFamily;
+    let mut f = eframe::egui::FontDefinitions::default();
+    if let Some(b) = chosen {
+        f.font_data.insert("choisie".into(), std::sync::Arc::new(eframe::egui::FontData::from_owned(b)));
+        if let Some(l) = f.families.get_mut(&FontFamily::Proportional) { l.insert(0, "choisie".into()); }
+    }
+    for (i, d) in fallbacks().into_iter().enumerate() {
+        let key = format!("secours-{i}");
+        f.font_data.insert(key.clone(), d);
+        for fam in [FontFamily::Proportional, FontFamily::Monospace] { if let Some(l) = f.families.get_mut(&fam) { l.push(key.clone()); } }
+    }
+    f
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_reads_cjk_if_installed() {
+        for d in fallbacks() { assert!(ab_glyph::FontRef::try_from_slice_and_index(&d.font, d.index).is_ok()); }
+        assert!(definitions(None).families.values().all(|l| !l.is_empty()));
+    }
 
     #[test]
     fn bad_fonts_are_refused() {

@@ -20,6 +20,7 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Jeux non-Steam lancés sans Steam**, avec Proton et dans leur préfixe habituel, donc avec les mêmes sauvegardes.
 - **AppImage et scripts `.sh`** ajoutés directement à MinimalSteam, sans passer par Steam.
 - **Synchronisation avec Steam** : envoie un ou plusieurs programmes dans Steam, avec ou sans collection MinimalSteam, et range chaque jeu dans la collection ou retire-le depuis sa fiche.
+- **Onglet Amis** : qui de tes amis Steam est en jeu (et à quoi), en ligne ou hors ligne (vu il y a…), actualisé chaque minute. Marque tes amis favoris d'une étoile et n'affiche qu'eux si tu veux. Chaque groupe (en jeu, en ligne, hors ligne) se replie d'un clic, par exemple pendant un stream. Avec la clé API Steam ; si ta liste d'amis Steam est privée, ce sont les comptes que Steam connaît sur ton PC, et tu peux masquer ceux qui ne sont plus tes amis.
 - **Onglet Non installés** pour voir et installer les jeux que tu possèdes.
 - **Onglet Lancés** pour voir et arrêter tout ce qui tourne, Steam ou non.
 - **Jeux cachés** : cache un jeu depuis sa fiche, il ne s'affiche plus que dans l'onglet **Cachés**. Rien n'est changé dans Steam.

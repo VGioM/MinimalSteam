@@ -16,6 +16,8 @@ mod descui;
 mod desktop;
 mod direct;
 mod fonts;
+mod friends;
+mod friendsui;
 mod gamepad;
 mod owned;
 mod scan;
@@ -75,12 +77,12 @@ impl Sort {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum Filter { All, Favorites, Steam, Other, Missing, Running, Hidden, Stats }
+enum Filter { All, Favorites, Steam, Other, Missing, Running, Hidden, Stats, Friends }
 
 impl Filter {
-    const ALL: [Filter; 8] = [Filter::All, Filter::Favorites, Filter::Steam, Filter::Other, Filter::Missing, Filter::Running, Filter::Hidden, Filter::Stats];
+    const ALL: [Filter; 9] = [Filter::All, Filter::Favorites, Filter::Steam, Filter::Other, Filter::Missing, Filter::Running, Filter::Hidden, Filter::Stats, Filter::Friends];
     fn label(self) -> &'static str {
-        match self { Filter::All => "Tous", Filter::Favorites => "Favoris", Filter::Steam => "Steam", Filter::Other => "Non-Steam", Filter::Missing => "Non installés", Filter::Running => "Lancés", Filter::Hidden => "Cachés", Filter::Stats => "Statistiques" }
+        match self { Filter::All => "Tous", Filter::Favorites => "Favoris", Filter::Steam => "Steam", Filter::Other => "Non-Steam", Filter::Missing => "Non installés", Filter::Running => "Lancés", Filter::Hidden => "Cachés", Filter::Stats => "Statistiques", Filter::Friends => "Amis" }
     }
 }
 
@@ -221,6 +223,12 @@ struct Config {
     view_bar: Bar,
     /// Dossier où une copie des statistiques est écrite à chaque enregistrement (vide : aucun).
     stats_backup: String,
+    /// Amis en favori, et comptes masqués de l'onglet Amis (identifiants Steam 64 bits).
+    friend_favorites: HashSet<u64>,
+    friend_hidden: HashSet<u64>,
+    friends_fav_only: bool,
+    /// Groupes repliés dans l'onglet Amis (0 en jeu, 1 en ligne, 2 hors ligne).
+    friends_closed: std::collections::BTreeSet<u8>,
 }
 
 /// Le dossier des statistiques, à part de la config pour se sauvegarder facilement.
@@ -448,6 +456,7 @@ enum Msg {
     StatsExported(Result<PathBuf, String>),
     StatsFolder(PathBuf),
     Journal((Vec<direct::Run>, Vec<(u32, u64)>)),
+    Friends(Result<(Vec<friends::Friend>, friends::Source), String>),
     Desc(String, Option<desc::Desc>),
     DescSearch(Result<Vec<(u32, String)>, String>),
     DescPicked(u32, Result<desc::Desc, String>),
@@ -585,6 +594,10 @@ struct App {
     stats_written: String,
     /// Descriptions des jeux (descriptions.json).
     descs: desc::Store,
+    friends: Option<Result<(Vec<friends::Friend>, friends::Source), String>>,
+    friends_busy: bool,
+    friends_at: Option<Instant>,
+    show_hidden_friends: bool,
     desc_asked: HashSet<String>,
     desc_more: bool,
     desc_edit: Option<descui::DescEdit>,
@@ -620,20 +633,21 @@ impl App {
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
-            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
             stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), hour_mode: 0, stats_slot: None, report_view: 0, ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false, stats_alive: stats::now(),
-            descs: config_dir("Minimalsteam").map(|d| desc::Store::load(&d)).unwrap_or_default(), desc_asked: HashSet::new(), desc_more: false, desc_edit: None,
+            descs: config_dir("Minimalsteam").map(|d| desc::Store::load(&d)).unwrap_or_default(), desc_asked: HashSet::new(), friends: None, friends_busy: false, friends_at: None, show_hidden_friends: false, desc_more: false, desc_edit: None,
         };
         app.track_direct(direct_now);
         app.stats_tick();
         if std::env::var_os("APP_SCREENSHOT").is_some() {
             app.del_open = std::env::var_os("MINIMALSTEAM_TEST_FORGET").is_some();
             if let Some(h) = std::env::var("MINIMALSTEAM_TEST_HOUR").ok().and_then(|d| d.parse::<usize>().ok()) { app.stats_slot = Some((0, h)); }
+            if std::env::var_os("MINIMALSTEAM_TEST_CLOSED").is_some() { app.cfg.friends_closed.insert(2); }
             if let Some(v) = std::env::var("MINIMALSTEAM_TEST_VIEW").ok().and_then(|d| d.parse::<u8>().ok()) { app.report_view = v; }
             if let Some(n) = std::env::var("MINIMALSTEAM_TEST_MONTH").ok().and_then(|d| d.parse::<i32>().ok()) { app.stats_month = n; }
             if let Some(n) = std::env::var("MINIMALSTEAM_TEST_DAY").ok().and_then(|d| d.parse::<i32>().ok()) { app.stats_day = Some(stats::midnight(stats::now(), -n)); }
-            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("stats") => app.filter = Filter::Stats, Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
+            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("stats") => app.filter = Filter::Stats, Ok("friends") => app.filter = Filter::Friends, Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
         }
         app.reload(&cc.egui_ctx);
         if std::env::var_os("APP_SCREENSHOT").is_none() { app.refresh_owned(&cc.egui_ctx); }
@@ -713,7 +727,7 @@ impl App {
                 Filter::Other => !g.steam,
                 Filter::Missing => !g.installed,
                 Filter::Running => self.running.contains(&g.id) || self.launched.contains_key(&g.id),
-                Filter::Stats => false,
+                Filter::Stats | Filter::Friends => false,
             }
         }).map(|(i, _)| i).collect();
         match self.cfg.sort {
@@ -946,16 +960,13 @@ impl App {
                     if name == self.cfg.theme.font {
                         match bytes {
                             Some(b) => {
-                                let mut f = egui::FontDefinitions::default();
-                                f.font_data.insert("choisie".into(), Arc::new(egui::FontData::from_owned(b)));
-                                if let Some(l) = f.families.get_mut(&egui::FontFamily::Proportional) { l.insert(0, "choisie".into()); }
-                                ctx.set_fonts(f);
+                                ctx.set_fonts(fonts::definitions(Some(b)));
                             }
                             None => {
                                 self.cfg.theme.font.clear();
                                 self.font_applied.clear();
                                 self.dirty = true;
-                                ctx.set_fonts(egui::FontDefinitions::default());
+                                ctx.set_fonts(fonts::definitions(None));
                                 self.set_status(format!("La police {name} ne peut pas être utilisée."), true);
                             }
                         }
@@ -965,6 +976,15 @@ impl App {
                 Msg::Ach(id, list) => { self.achs.insert(id, list.map(std::rc::Rc::new)); }
                 Msg::Rarity(id, map) => { self.rarity.insert(id, std::rc::Rc::new(map.unwrap_or_default())); }
                 Msg::Journal((runs, going)) => self.apply_journal(ctx, runs, going),
+                Msg::Friends(r) => {
+                    self.friends_busy = false;
+                    self.friends_at = Some(Instant::now());
+                    // Une erreur passagère garde la dernière liste affichée.
+                    match (r, self.friends.take()) {
+                        (Err(e), Some(Ok(old))) => { self.set_status(e, true); self.friends = Some(Ok(old)); }
+                        (r, _) => self.friends = Some(r),
+                    }
+                }
                 Msg::StatsImport(Ok(other)) => {
                     let n = self.stats.import(other);
                     self.save_stats();
@@ -1189,7 +1209,7 @@ impl App {
     fn sync_font(&mut self, ctx: &egui::Context) {
         if self.cfg.theme.font == self.font_applied { return; }
         self.font_applied = self.cfg.theme.font.clone();
-        if self.font_applied.is_empty() { ctx.set_fonts(egui::FontDefinitions::default()); return; }
+        if self.font_applied.is_empty() { ctx.set_fonts(fonts::definitions(None)); return; }
         let name = self.font_applied.clone();
         self.spawn(ctx, move || { let b = fonts::load(&name); Msg::FontReady(name, b) });
     }
@@ -1423,6 +1443,7 @@ impl App {
         let n = match f {
             Filter::Running => self.running.len() + self.launched.keys().filter(|i| !self.running.contains(i)).count(),
             Filter::Hidden => self.acc().map_or(0, |a| { let p = format!("{}:", a.id); self.games.iter().filter(|g| self.cfg.hidden.contains(&format!("{p}{}", g.id))).count() }),
+            Filter::Friends => self.friends_online(),
             _ => 0,
         };
         if n > 0 { format!("{} ({n})", f.label()) } else { f.label().to_string() }
@@ -1641,6 +1662,7 @@ impl App {
 
     fn grid(&mut self, ctx: &egui::Context) {
         if self.filter == Filter::Stats { self.stats_view(ctx); return; }
+        if self.filter == Filter::Friends { self.friends_view(ctx); return; }
         let visible = self.visible();
         let mut acts = Vec::new();
         let (cover, rad, names) = (self.cfg.cover(), self.cfg.theme.radius, self.cfg.theme.show_names);
@@ -1983,7 +2005,7 @@ impl App {
     }
 
     fn detail(&mut self, ctx: &egui::Context) {
-        if self.filter == Filter::Stats { return; }
+        if self.filter == Filter::Stats || self.filter == Filter::Friends { return; }
         if self.desc_edit.as_ref().is_some_and(|e| self.acc().is_none_or(|a| e.key != gkey(&a.id, self.selected.unwrap_or(0)))) { self.desc_edit = None; }
         if ctx.memory(|m| m.data.get_temp::<u32>(egui::Id::new("desc-for"))) != self.selected { self.desc_more = false; ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("desc-for"), self.selected.unwrap_or(0))); }
         if self.rename.as_ref().is_some_and(|r| Some(r.0) != self.selected) { self.rename = None; }
