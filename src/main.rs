@@ -557,6 +557,21 @@ struct App {
     /// Succès : la liste des débloqués (sinon celle des restants).
     ach_done: bool,
     show_hidden: bool,
+    /// Jour choisi dans les graphiques (son minuit) : son détail s'affiche dessous.
+    stats_day: Option<u64>,
+    /// Mois montré dans le graphique du mois (0 : le mois en cours, 1 : le précédent…).
+    stats_month: i32,
+    /// Années en arrière dans le graphique des 12 mois.
+    stats_year: i32,
+    /// Effacement de mois : liste ouverte, mois cochés (année, mois 0 à 11), confirmation.
+    del_open: bool,
+    del_sel: std::collections::BTreeSet<(i32, u32)>,
+    del_confirm: Option<Instant>,
+    report_period: statsui::Period,
+    /// Succès : liste dépliée, entière, et recherche.
+    ach_open: bool,
+    ach_all: bool,
+    ach_query: String,
     merge_pick: Option<u32>,
     /// Dernier contenu écrit de stats.json, pour ne pas le réécrire à l'identique.
     stats_written: String,
@@ -599,12 +614,15 @@ impl App {
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
             steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
-            stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false,
+            stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false,
             descs: config_dir("Minimalsteam").map(|d| desc::Store::load(&d)).unwrap_or_default(), desc_asked: HashSet::new(), desc_more: false, desc_edit: None,
         };
         app.track_direct(direct_now);
         app.stats_tick();
         if std::env::var_os("APP_SCREENSHOT").is_some() {
+            app.del_open = std::env::var_os("MINIMALSTEAM_TEST_FORGET").is_some();
+            if let Some(n) = std::env::var("MINIMALSTEAM_TEST_MONTH").ok().and_then(|d| d.parse::<i32>().ok()) { app.stats_month = n; }
+            if let Some(n) = std::env::var("MINIMALSTEAM_TEST_DAY").ok().and_then(|d| d.parse::<i32>().ok()) { app.stats_day = Some(stats::midnight(stats::now(), -n)); }
             match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("stats") => app.filter = Filter::Stats, Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
         }
         app.reload(&cc.egui_ctx);

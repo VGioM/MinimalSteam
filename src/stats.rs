@@ -39,6 +39,8 @@ pub struct Store {
     pub games: HashMap<String, Record>,
     /// Jeu fusionné → jeu qui regroupe ses stats.
     pub merged: HashMap<String, String>,
+    /// Périodes effacées à la demande (début, fin) : le journal du système ne les remplit plus.
+    pub forgotten: Vec<(u64, u64)>,
 }
 
 /// Ce qu'il faut savoir d'un jeu pour retrouver ses parties manquées.
@@ -171,7 +173,7 @@ impl Store {
     /// n'a pas comptées : seulement pour une partie après le début du suivi, avant c'est de l'historique.
     pub fn recover(&mut self, key: &str, name: &str, start: u64, end: u64) -> u32 {
         let secs = end.saturating_sub(start);
-        if secs < 30 { return 0; }
+        if secs < 30 || self.is_forgotten(start) { return 0; }
         let r = self.games.entry(key.to_string()).or_default();
         if r.name.is_empty() { r.name = name.to_string(); }
         // La partie en cours est suivie en direct.
@@ -191,6 +193,34 @@ impl Store {
         // Le total va augmenter d'autant : ce n'est pas une partie à deviner une seconde fois.
         r.live.push((end, credit));
         credit
+    }
+
+    pub fn is_forgotten(&self, t: u64) -> bool { self.forgotten.iter().any(|(a, b)| *a <= t && t < *b) }
+
+    /// Efface les parties commencées dans ces périodes, pour les jeux dont la clé commence par
+    /// `prefix` (le compte). Le temps total de Steam n'est pas touché. Rend le nombre de parties effacées.
+    pub fn forget(&mut self, prefix: &str, ranges: &[(u64, u64)]) -> usize {
+        let inside = |t: u64| ranges.iter().any(|(a, b)| *a <= t && t < *b);
+        let mut n = 0;
+        for (k, r) in self.games.iter_mut().filter(|(k, _)| k.starts_with(prefix)) {
+            let _ = k;
+            let before = r.sessions.len();
+            r.sessions.retain(|s| !inside(s.start));
+            n += before - r.sessions.len();
+        }
+        for r in ranges { if !self.forgotten.contains(r) { self.forgotten.push(*r); } }
+        n
+    }
+
+    /// Les mois qui ont des parties : ((année, mois 0 à 11), secondes jouées), du plus récent au plus ancien.
+    pub fn months(&self, prefix: &str) -> Vec<((i32, u32), u32)> {
+        let mut m: HashMap<(i32, u32), u32> = HashMap::new();
+        for r in self.games.iter().filter(|(k, _)| k.starts_with(prefix)).map(|(_, r)| r) {
+            for s in &r.sessions { let (_, _, mo, y) = day_parts(s.start); *m.entry((y, mo)).or_default() += s.secs; }
+        }
+        let mut v: Vec<((i32, u32), u32)> = m.into_iter().collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v
     }
 
     pub fn target(&self, key: &str) -> Option<&String> { self.merged.get(key) }
@@ -270,6 +300,31 @@ pub fn month(ts: u64) -> (u64, usize) {
 }
 
 /// (jour du mois, jour de la semaine 0 = lundi, mois 0 à 11, année)
+/// Le 1er à minuit du mois (`mon` de 0 à 11) d'une année, et le 1er du mois suivant.
+pub fn month_bounds(year: i32, mon: u32) -> (u64, u64) {
+    let at = |y: i32, m: i32| { let mut t = Tm { mday: 1, mon: m, year: y - 1900, isdst: -1, ..Tm::default() }; unsafe { mktime(&mut t).max(0) as u64 } };
+    (at(year, mon as i32), at(year, mon as i32 + 1))
+}
+
+/// Le mois situé `back` mois avant celui de `ts` : (son 1er à minuit, nombre de jours).
+/// Calcul direct, sans remonter mois par mois : rapide même des années en arrière.
+pub fn month_at(ts: u64, back: u32) -> (u64, usize) {
+    let m = local(ts);
+    let total = m.year as i64 * 12 + m.mon as i64 - back as i64;
+    let (year, mon) = ((total.div_euclid(12)) as i32 + 1900, total.rem_euclid(12) as u32);
+    let (first, next) = month_bounds(year, mon);
+    (first, days_between(first, next))
+}
+
+/// Nombre de jours entre deux minuits (les changements d'heure ne font pas un jour de plus).
+pub fn days_between(a: u64, b: u64) -> usize { ((b.saturating_sub(a) + 43_200) / 86_400) as usize }
+
+/// L'heure locale (0 à 23).
+pub fn hour_of(ts: u64) -> usize { local(ts).hour.clamp(0, 23) as usize }
+
+/// L'heure locale, « 14:05 ».
+pub fn clock(ts: u64) -> String { let m = local(ts); format!("{:02}:{:02}", m.hour, m.min) }
+
 pub fn day_parts(ts: u64) -> (u32, u32, u32, i32) {
     let m = local(ts);
     (m.mday as u32, ((m.wday + 6) % 7) as u32, m.mon.clamp(0, 11) as u32, m.year + 1900)
@@ -425,6 +480,41 @@ mod tests {
         // Le total de Steam (+ sans Steam) qui monte de 90 min ne crée pas de partie devinée.
         s.reconcile(&[seen(90, 21_800)], &none, 30_000);
         assert_eq!(s.games["a:1"].sessions.len(), 3);
+    }
+
+    #[test]
+    fn forget_months_and_block_the_journal() {
+        let mut s = Store::default();
+        let (aug, sep) = month_bounds(2026, 7);
+        let (_, oct) = month_bounds(2026, 8);
+        assert_eq!(day_parts(aug).0, 1);
+        assert_eq!(day_parts(sep).2, 8);
+        let r = s.games.entry("a:1".into()).or_default();
+        r.sessions.extend([Session { start: aug + 3600, secs: 600, guess: false }, Session { start: sep + 3600, secs: 900, guess: false }]);
+        s.games.entry("b:1".into()).or_default().sessions.push(Session { start: aug + 3600, secs: 600, guess: false });
+        assert_eq!(s.months("a:").len(), 2);
+        assert_eq!(s.forget("a:", &[(aug, sep)]), 1);
+        assert_eq!(s.months("a:"), vec![((2026, 8), 900)]);
+        // L'autre compte n'est pas touché, et le journal ne remet pas août.
+        assert_eq!(s.games["b:1"].sessions.len(), 1);
+        assert_eq!(s.recover("a:1", "Jeu", aug + 7200, aug + 9000), 0);
+        assert_eq!(s.games["a:1"].sessions.len(), 1);
+        assert!(oct > sep);
+    }
+
+    #[test]
+    fn months_back_and_hours() {
+        let t = 1_795_600_000; // 25 nov. 2026
+        let (cur, n) = month_at(t, 0);
+        let (prev, pn) = month_at(t, 1);
+        assert_eq!((day_parts(cur).0, n), (1, 30));
+        assert_eq!((day_parts(prev).0, day_parts(prev).2, pn), (1, 9, 31));
+        assert_eq!(day_parts(month_at(t, 11).0).2, 11);
+        // Deux ans et un mois en arrière : octobre 2024, 31 jours.
+        let (old, on) = month_at(t, 25);
+        assert_eq!((day_parts(old).0, day_parts(old).2, day_parts(old).3, on), (1, 9, 2024, 31));
+        assert_eq!(days_between(prev, cur), 31);
+        assert!(hour_of(t) < 24);
     }
 
     #[test]
