@@ -12,7 +12,10 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Recherche, favoris et tri** par date, nom ou temps de jeu.
 - **Grille ou liste** : jaquettes de toutes tailles jusqu'aux simples icônes, ou une ligne par jeu avec temps de jeu, dernière partie et emplacement.
 - **Onglets et barre à ta main** : dans Réglages > Affichage, choisis les onglets à montrer et glisse-les pour changer leur ordre ; les options de tri, taille et vue peuvent rester dans la barre, tenir dans un bouton « Affichage » ou disparaître. La fenêtre s'adapte quand elle est étroite : les onglets en trop passent dans un menu « Plus ».
-- **Fiche de jeu** : temps de jeu, dernière partie, taille, disque et version de Proton.
+- **Fiche de jeu** : temps de jeu, dernière partie, taille, disque, version de Proton et **description en français** (celle de Steam, ou la fiche du magasin Steam trouvée par le nom pour un jeu non-Steam), modifiable si ce n'est pas la bonne.
+- **Onglet Statistiques** : pour chaque jeu, le temps total, le temps joué chaque jour de la semaine en cours, de la semaine dernière et du mois, les dernières parties, la plus longue, la série de jours joués, et les **succès Steam** débloqués (avec leur date) ou à débloquer (avec la part des joueurs qui les ont). Une vue d'ensemble montre les mêmes chiffres pour tous tes jeux. Le bouton **Statistiques** sous **Jouer** ouvre directement celles du jeu.
+- **Entrées regroupées** : plusieurs entrées non-Steam pour le même jeu (par exemple Prototype, Prototype 2 et Prototype Biohazard Bundle) peuvent compter leurs stats dans une seule, même après la suppression des autres.
+- **Statistiques exportables** : elles sont rangées dans `~/.config/Minimalsteam/statistiques` avec une copie de secours par jour, s'exportent et s'importent sans doublon, et peuvent être copiées automatiquement dans le dossier de ton choix.
 - **Lancement** en un double-clic, avec le bouton Jouer, la touche Entrée ou la manette.
 - **Jeux non-Steam lancés sans Steam**, avec Proton et dans leur préfixe habituel, donc avec les mêmes sauvegardes.
 - **AppImage et scripts `.sh`** ajoutés directement à MinimalSteam, sans passer par Steam.
@@ -107,6 +110,7 @@ Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Ste
 
 - L'installation d'un jeu Steam se fait toujours dans Steam : MinimalSteam ouvre sa fenêtre d'installation.
 - Le temps de jeu sans Steam n'est compté que si MinimalSteam reste ouvert jusqu'à la fermeture du jeu.
+- Le temps de jeu jour par jour commence le premier jour d'utilisation de cette version : Steam ne garde pas d'historique avant. Une partie jouée pendant que MinimalSteam était fermé est retrouvée d'après le total de Steam, avec une date approchée.
 - MinimalSteam ne gère pas les ROM ni les émulateurs.
 
 ## Remplace Biblijeu sur Linux

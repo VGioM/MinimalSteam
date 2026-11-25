@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 mod appinfo;
 mod blur;
+mod desc;
+mod descui;
 #[allow(dead_code)]
 mod desktop;
 mod direct;
@@ -21,6 +23,8 @@ mod scan;
 mod sgdb;
 mod selfupdate;
 mod single;
+mod stats;
+mod statsui;
 mod steam;
 mod vdf;
 
@@ -71,12 +75,12 @@ impl Sort {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum Filter { All, Favorites, Steam, Other, Missing, Running, Hidden }
+enum Filter { All, Favorites, Steam, Other, Missing, Running, Hidden, Stats }
 
 impl Filter {
-    const ALL: [Filter; 7] = [Filter::All, Filter::Favorites, Filter::Steam, Filter::Other, Filter::Missing, Filter::Running, Filter::Hidden];
+    const ALL: [Filter; 8] = [Filter::All, Filter::Favorites, Filter::Steam, Filter::Other, Filter::Missing, Filter::Running, Filter::Hidden, Filter::Stats];
     fn label(self) -> &'static str {
-        match self { Filter::All => "Tous", Filter::Favorites => "Favoris", Filter::Steam => "Steam", Filter::Other => "Non-Steam", Filter::Missing => "Non installés", Filter::Running => "Lancés", Filter::Hidden => "Cachés" }
+        match self { Filter::All => "Tous", Filter::Favorites => "Favoris", Filter::Steam => "Steam", Filter::Other => "Non-Steam", Filter::Missing => "Non installés", Filter::Running => "Lancés", Filter::Hidden => "Cachés", Filter::Stats => "Statistiques" }
     }
 }
 
@@ -215,7 +219,14 @@ struct Config {
     tabs: Vec<(Filter, bool)>,
     /// Options d'affichage dans la barre : complètes, réduites à un bouton, ou retirées.
     view_bar: Bar,
+    /// Dossier où une copie des statistiques est écrite à chaque enregistrement (vide : aucun).
+    stats_backup: String,
 }
+
+/// Le dossier des statistiques, à part de la config pour se sauvegarder facilement.
+fn stats_dir() -> Option<PathBuf> { config_dir("Minimalsteam").map(|d| d.join("statistiques")) }
+
+thread_local! { static LAST_CONFIG: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 
 fn config_dir(app: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
@@ -234,9 +245,13 @@ impl Config {
     }
     fn save(&self) {
         let Some(d) = config_dir("Minimalsteam") else { return };
+        let json = serde_json::to_string_pretty(self).unwrap_or_default();
+        // Rien à écrire si rien n'a changé depuis la dernière fois.
+        if LAST_CONFIG.with(|l| *l.borrow() == json) { return; }
+        LAST_CONFIG.with(|l| *l.borrow_mut() = json.clone());
         let _ = std::fs::create_dir_all(&d);
         let (p, tmp) = (d.join("config.json"), d.join("config.json.tmp"));
-        if std::fs::write(&tmp, serde_json::to_string_pretty(self).unwrap_or_default()).is_ok() {
+        if std::fs::write(&tmp, json).is_ok() {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
             let _ = std::fs::rename(&tmp, &p);
@@ -273,6 +288,7 @@ fn game_menu(ui: &mut egui::Ui, g: &Game, st: &MenuState, tools: &[(String, Stri
     else if g.installed { item(ui, &mut out, !g.pending && !st.launching, "▶  Jouer", Menu::Play); }
     else { item(ui, &mut out, true, "⬇  Installer", Menu::Play); }
     item(ui, &mut out, true, "Afficher la fiche", Menu::Details);
+    item(ui, &mut out, !g.pending, "Statistiques", Menu::Stats);
     item(ui, &mut out, true, if st.favorite { "★  Retirer des favoris" } else { "☆  Ajouter aux favoris" }, Menu::Favorite);
     ui.separator();
     if !g.steam { item(ui, &mut out, !g.pending, "Renommer…", Menu::Rename); }
@@ -426,6 +442,15 @@ enum Msg {
     BackImage(PathBuf, Zone),
     BackSaved(Zone, Result<PathBuf, String>),
     Progress(String),
+    Ach(u32, Option<Vec<stats::Ach>>),
+    Rarity(u32, Option<HashMap<String, f32>>),
+    StatsImport(Result<stats::Store, String>),
+    StatsExported(Result<PathBuf, String>),
+    StatsFolder(PathBuf),
+    Journal((Vec<direct::Run>, Vec<(u32, u64)>)),
+    Desc(String, Option<desc::Desc>),
+    DescSearch(Result<Vec<(u32, String)>, String>),
+    DescPicked(u32, Result<desc::Desc, String>),
     Queued(Vec<steam::NewGame>),
     QueueDone { applied: steam::Queue, result: Result<Option<String>, String> },
 }
@@ -456,7 +481,7 @@ enum Act { Select(u32), Launch(u32), Menu(u32, Menu) }
 
 /// Les choix du menu clic droit d'un jeu.
 #[derive(Clone, Debug, PartialEq)]
-enum Menu { Play, Details, Stop, Favorite, Rename, Images, Folder, Compat(Option<String>), ViaSteam, Collection, Sync, Hide, CancelAdd, RemoveLocal, Remove }
+enum Menu { Play, Details, Stats, Stop, Favorite, Rename, Images, Folder, Compat(Option<String>), ViaSteam, Collection, Sync, Hide, CancelAdd, RemoveLocal, Remove }
 
 struct App {
     cfg: Config,
@@ -519,6 +544,27 @@ struct App {
     hold: bool,
     update: SelfUpdate,
     hook: TestHook,
+    /// Historique des parties et regroupements (dossier `statistiques`).
+    stats: stats::Store,
+    /// Jeu montré dans l'onglet Statistiques (aucun : vue d'ensemble).
+    stats_pick: Option<u32>,
+    achs: HashMap<u32, Option<std::rc::Rc<Vec<stats::Ach>>>>,
+    rarity: HashMap<u32, std::rc::Rc<HashMap<String, f32>>>,
+    /// Les calculs de l'onglet Statistiques, refaits seulement quand `stats_rev` ou la minute change.
+    stats_cached: Option<statsui::StatsCache>,
+    stats_rev: u64,
+    journal_asked: bool,
+    /// Succès : la liste des débloqués (sinon celle des restants).
+    ach_done: bool,
+    show_hidden: bool,
+    merge_pick: Option<u32>,
+    /// Dernier contenu écrit de stats.json, pour ne pas le réécrire à l'identique.
+    stats_written: String,
+    /// Descriptions des jeux (descriptions.json).
+    descs: desc::Store,
+    desc_asked: HashSet<String>,
+    desc_more: bool,
+    desc_edit: Option<descui::DescEdit>,
 }
 
 impl App {
@@ -552,10 +598,14 @@ impl App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
             steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: String::new(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), hook,
+            stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
+            stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false,
+            descs: config_dir("Minimalsteam").map(|d| desc::Store::load(&d)).unwrap_or_default(), desc_asked: HashSet::new(), desc_more: false, desc_edit: None,
         };
         app.track_direct(direct_now);
+        app.stats_tick();
         if std::env::var_os("APP_SCREENSHOT").is_some() {
-            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
+            match std::env::var("MINIMALSTEAM_TEST_FILTER").as_deref() { Ok("stats") => app.filter = Filter::Stats, Ok("missing") => app.filter = Filter::Missing, Ok("other") => app.filter = Filter::Other, Ok("running") => app.filter = Filter::Running, Ok("hidden") => app.filter = Filter::Hidden, _ => {} }
         }
         app.reload(&cc.egui_ctx);
         if std::env::var_os("APP_SCREENSHOT").is_none() { app.refresh_owned(&cc.egui_ctx); }
@@ -635,6 +685,7 @@ impl App {
                 Filter::Other => !g.steam,
                 Filter::Missing => !g.installed,
                 Filter::Running => self.running.contains(&g.id) || self.launched.contains_key(&g.id),
+                Filter::Stats => false,
             }
         }).map(|(i, _)| i).collect();
         match self.cfg.sort {
@@ -768,6 +819,7 @@ impl App {
                     if !self.hook.hide.is_empty() { g.retain(|x| !self.hook.hide.iter().any(|h| x.name.to_lowercase().contains(h))); }
                     self.games = g;
                     self.merge_queue();
+                    self.stats_reconcile();
                     let find = |games: &[Game], n: &str| games.iter().find(|g| g.name.to_lowercase().contains(n)).map(|g| g.id);
                     if let Some(id) = self.hook.panel.take().and_then(|n| find(&self.games, &n)) { self.cfg.theme.panel_game = id; self.cfg.theme.panel_back = Back::Chosen; }
                     if self.hook.top_clear { self.cfg.theme.top_back = Back::Transparent; }
@@ -776,7 +828,7 @@ impl App {
                     self.tools = self.acc().map(steam::compat_tools).unwrap_or_default();
                     self.loaded = true;
                     self.error = None;
-                    if let Some(t) = self.hook.select.clone() { self.selected = self.games.iter().find(|g| g.name.to_lowercase().contains(&t)).map(|g| g.id); self.hook.select = None; self.hook_open(ctx); }
+                    if let Some(t) = self.hook.select.clone() { self.selected = self.games.iter().find(|g| g.name.to_lowercase().contains(&t)).map(|g| g.id); self.hook.select = None; if self.filter == Filter::Stats { self.stats_pick = self.selected; } self.hook_open(ctx); }
                     if self.selected.is_some_and(|s| !self.games.iter().any(|g| g.id == s)) { self.selected = None; }
                 }
                 Msg::Loaded(Err(e)) => { self.loaded = true; self.error = Some(e); }
@@ -794,6 +846,7 @@ impl App {
                     self.stopping.retain(|id, _| running.contains(id));
                     if self.stop_confirm.is_some_and(|(id, _)| !running.contains(&id)) { self.stop_confirm = None; }
                     self.running = running;
+                    self.stats_tick();
                     if changed || ended { self.reload(ctx); }
                 }
                 Msg::Search { id, result } => {
@@ -879,6 +932,33 @@ impl App {
                     }
                 }
                 Msg::Progress(t) => self.busy = Some(t),
+                Msg::Ach(id, list) => { self.achs.insert(id, list.map(std::rc::Rc::new)); }
+                Msg::Rarity(id, map) => { self.rarity.insert(id, std::rc::Rc::new(map.unwrap_or_default())); }
+                Msg::Journal((runs, going)) => self.apply_journal(ctx, runs, going),
+                Msg::StatsImport(Ok(other)) => {
+                    let n = self.stats.import(other);
+                    self.save_stats();
+                    self.set_status(if n == 0 { "Import terminé : ces parties étaient déjà là.".to_string() } else { format!("Import terminé : {n} partie{} ajoutée{}.", if n > 1 { "s" } else { "" }, if n > 1 { "s" } else { "" }) }, false);
+                }
+                Msg::StatsImport(Err(e)) => self.set_status(e, true),
+                Msg::StatsExported(Ok(p)) => self.set_status(format!("Statistiques exportées dans {}.", p.display()), false),
+                Msg::StatsExported(Err(e)) => self.set_status(e, true),
+                Msg::Desc(key, d) => {
+                    // Un texte écrit à la main n'est jamais remplacé.
+                    if !self.descs.0.get(&key).is_some_and(|x| x.custom) { self.descs.0.insert(key, d.unwrap_or_default()); self.save_descs(); }
+                }
+                Msg::DescSearch(r) => if let Some(e) = self.desc_edit.as_mut() {
+                    e.searching = false;
+                    match r { Ok(l) if l.is_empty() => e.error = Some("Aucun jeu trouvé sur le magasin Steam.".into()), Ok(l) => e.results = l, Err(err) => e.error = Some(err) }
+                },
+                Msg::DescPicked(id, r) => if let Some(e) = self.desc_edit.as_mut() {
+                    e.searching = false;
+                    match r {
+                        Ok(d) => { e.text = d.short.clone(); e.picked = d.short; e.full = d.full; e.from = Some(id); }
+                        Err(err) => e.error = Some(err),
+                    }
+                },
+                Msg::StatsFolder(p) => { self.cfg.stats_backup = p.to_string_lossy().into_owned(); self.cfg.save(); self.save_stats(); }
                 Msg::Queued(games) => {
                     self.busy = None;
                     self.add = None;
@@ -1530,6 +1610,7 @@ impl App {
     }
 
     fn grid(&mut self, ctx: &egui::Context) {
+        if self.filter == Filter::Stats { self.stats_view(ctx); return; }
         let visible = self.visible();
         let mut acts = Vec::new();
         let (cover, rad, names) = (self.cfg.cover(), self.cfg.theme.radius, self.cfg.theme.show_names);
@@ -1742,6 +1823,7 @@ impl App {
         match m {
             Menu::Play => { self.selected = Some(id); self.launch(id); }
             Menu::Details => { self.selected = Some(id); self.scroll_to = true; }
+            Menu::Stats => self.open_stats(id),
             Menu::Stop => {
                 // Le menu vaut confirmation : il a déjà fallu deux clics.
                 self.stop_confirm = Some((id, Instant::now()));
@@ -1871,6 +1953,9 @@ impl App {
     }
 
     fn detail(&mut self, ctx: &egui::Context) {
+        if self.filter == Filter::Stats { return; }
+        if self.desc_edit.as_ref().is_some_and(|e| self.acc().is_none_or(|a| e.key != gkey(&a.id, self.selected.unwrap_or(0)))) { self.desc_edit = None; }
+        if ctx.memory(|m| m.data.get_temp::<u32>(egui::Id::new("desc-for"))) != self.selected { self.desc_more = false; ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("desc-for"), self.selected.unwrap_or(0))); }
         if self.rename.as_ref().is_some_and(|r| Some(r.0) != self.selected) { self.rename = None; }
         let Some(g) = self.selected.and_then(|id| self.game(id)).cloned() else { return };
         let (mut play, mut fav, mut edit, mut close) = (false, false, false, false);
@@ -1882,6 +1967,7 @@ impl App {
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
         let (mut stop, mut open_dir, mut via_toggle, mut remove_local, mut sync_one) = (false, false, false, false, false);
+        let mut open_stats = false;
         let (hidden, mut hide_toggle, mut remove_steam) = (self.is_hidden(g.id), false, false);
         let removing = self.remove_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
         if removing { ctx.request_repaint_after(Duration::from_millis(250)); }
@@ -1967,6 +2053,10 @@ impl App {
                     let star = RichText::new(if favorite { "★" } else { "☆" }).size(20.0).color(if favorite { GOLD } else { pal().text });
                     fav = ui.add(egui::Button::new(star).min_size(egui::vec2(46.0, 42.0))).on_hover_text("Favori").clicked();
                 });
+                if !g.pending {
+                    ui.add_space(6.0);
+                    open_stats = ui.add(egui::Button::new(RichText::new("📊  Statistiques").size(14.5)).min_size(egui::vec2(310.0, 34.0))).on_hover_text("Temps de jeu jour par jour, parties et succès").clicked();
+                }
                 ui.add_space(10.0);
                 pill().inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1984,6 +2074,8 @@ impl App {
                     if let Some(s) = g.size { info(ui, "Taille", &size(s)); }
                     info(ui, "Emplacement", &g.disk);
                 });
+                ui.add_space(8.0);
+                self.desc_block(ui, &g);
                 ui.add_space(8.0);
                 if g.installed && !g.local {
                 let mut pick = chosen.clone();
@@ -2101,6 +2193,7 @@ impl App {
         if sync_one { self.queue_sync(ctx, vec![g.id]); }
         if collection_toggle { self.toggle_collection(g.id); }
         if play { self.launch(g.id); }
+        if open_stats { self.open_stats(g.id); return; }
         if stop { self.request_stop(g.id, &g.name); }
         if fav { self.toggle_favorite(g.id); }
         if edit { self.open_editor(ctx, g.id); }
@@ -3019,6 +3112,10 @@ impl eframe::App for App {
         self.editor_modal(ctx);
         self.settings_modal(ctx);
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) { self.dirty = false; self.cfg.save(); }
+        // La durée de la partie en cours, affichée dans les stats, avance toute seule.
+        if self.filter == Filter::Stats && self.stats.games.values().any(|r| r.open.is_some()) {
+            ctx.request_repaint_after(Duration::from_secs(30));
+        }
         self.update.ui(ctx, pal().accent, pal().on_accent, pal().card);
         if self.hook.add && self.add.is_none() {
             self.hook.add = false;

@@ -3,7 +3,7 @@
 //! systemd, ce qui permet de le suivre et de l'arrêter avec tous ses processus.
 
 use crate::steam::{self, Account, Game};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Un programme ajouté à MinimalSteam seulement : Steam ne le connaît pas.
@@ -172,5 +172,80 @@ mod tests {
         assert!(is_windows("/j/Jeu.EXE"));
         assert!(!is_windows("/j/Recomp.appimage"));
         assert!(!is_windows("/j/start.sh"));
+    }
+}
+
+/// Une partie lancée sans Steam, d'après le journal du système (qui garde le début et la fin
+/// de chaque `minimalsteam-game-<id>.scope`, même si l'app était fermée ou si le PC a planté).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Run { pub id: u32, pub start: u64, pub end: u64, pub crashed: bool }
+
+fn journal(args: &[&str]) -> String {
+    let mut c = steam::host_command("journalctl");
+    c.args(["--user", "--no-pager", "-o", "json"]).args(args).stdout(std::process::Stdio::piped());
+    c.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+}
+
+fn scope_in(msg: &str) -> Option<u32> {
+    let rest = &msg[msg.find(UNIT)? + UNIT.len()..];
+    rest[..rest.find(".scope")?].parse().ok()
+}
+
+/// Lit les lignes JSON du journal : (id, boot, heure en secondes, début ?).
+fn events(text: &str) -> Vec<(u32, String, u64, bool)> {
+    text.lines().filter_map(|l| {
+        let v: serde_json::Value = serde_json::from_str(l).ok()?;
+        let msg = v.get("MESSAGE")?.as_str()?;
+        let id = scope_in(msg)?;
+        let t = v.get("__REALTIME_TIMESTAMP")?.as_str()?.parse::<u64>().ok()? / 1_000_000;
+        let boot = v.get("_BOOT_ID")?.as_str()?.to_string();
+        let start = msg.starts_with("Started ");
+        let end = msg.starts_with("Stopped ") || msg.contains(": Consumed ") || msg.contains(": Deactivated") || msg.contains(": Failed");
+        (start || end).then_some((id, boot, t, start))
+    }).collect()
+}
+
+/// Les parties terminées des `days` derniers jours. Celles coupées par un plantage finissent à la
+/// dernière ligne du journal avant le plantage. Rend aussi les parties encore en cours (id, début).
+pub fn journal_runs(days: u32) -> (Vec<Run>, Vec<(u32, u64)>) {
+    let current = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().replace('-', "");
+    let since = format!("-{days}d");
+    let ev = events(&journal(&["--since", &since, "-u", "minimalsteam-game-*.scope", "--output-fields=MESSAGE,_BOOT_ID"]));
+    let mut open: HashMap<(u32, String), u64> = HashMap::new();
+    let mut runs = Vec::new();
+    for (id, boot, t, start) in ev {
+        if start { open.insert((id, boot), t); }
+        else if let Some(s) = open.remove(&(id, boot)) { runs.push(Run { id, start: s, end: t, crashed: false }); }
+    }
+    let mut going = Vec::new();
+    let mut last: HashMap<String, Option<u64>> = HashMap::new();
+    for ((id, boot), s) in open {
+        if boot == current { going.push((id, s)); continue; }
+        let end = *last.entry(boot.clone()).or_insert_with(|| {
+            journal(&["-b", &boot, "-n", "1", "--output-fields=_BOOT_ID"]).lines().last()
+                .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .and_then(|v| v.get("__REALTIME_TIMESTAMP")?.as_str()?.parse::<u64>().ok()).map(|t| t / 1_000_000)
+        });
+        if let Some(e) = end.filter(|e| *e > s) { runs.push(Run { id, start: s, end: e, crashed: true }); }
+    }
+    runs.sort_by_key(|r| r.start);
+    (runs, going)
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    #[test]
+    fn reads_scope_events() {
+        let l = |t: u64, m: &str| format!("{{\"__REALTIME_TIMESTAMP\":\"{}\",\"_BOOT_ID\":\"b1\",\"MESSAGE\":\"{m}\"}}", t * 1_000_000);
+        let text = [l(100, "Started minimalsteam-game-42.scope - [systemd-run] sh"), l(150, "Proton: minimalsteam-game-x"), l(400, "minimalsteam-game-42.scope: Consumed 3min CPU time over 5min wall clock time.")].join("\n");
+        assert_eq!(events(&text), vec![(42, "b1".into(), 100, true), (42, "b1".into(), 400, false)]);
+    }
+
+    #[test]
+    fn real_journal_runs_are_ordered() {
+        let (runs, _) = journal_runs(60);
+        assert!(runs.iter().all(|r| r.end >= r.start));
     }
 }
