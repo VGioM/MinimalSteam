@@ -899,7 +899,9 @@ impl App {
         // Les jeux Steam gardent Steam (licence, Cloud). Les autres s'en passent si Proton est là.
         let by_steam = g.steam || self.cfg.via_steam.contains(&gkey(&a.id, id));
         let started = if by_steam { steam::launch(&a, &g) } else {
-            match direct::launch(&a, &g) { Ok(true) => Ok(()), Ok(false) => steam::launch(&a, &g), Err(e) => Err(e) }
+            // Souris cachée partout : le pointeur du système est invisible dans le jeu, sauf exception.
+            let env = if self.cursor_everywhere() && !self.cursor_kept(id) { kwincursor::game_env() } else { vec![] };
+            match direct::launch(&a, &g, &env) { Ok(true) => Ok(()), Ok(false) => steam::launch(&a, &g), Err(e) => Err(e) }
         };
         match started {
             Ok(()) => { self.launched.insert(id, Instant::now()); self.set_status(format!("Lancement de {}…", g.name), false); }

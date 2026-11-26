@@ -163,7 +163,7 @@ Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Ste
 - Le temps de jeu jour par jour commence le premier jour d'utilisation de cette version : Steam ne garde pas d'historique avant. Une partie jouée pendant que MinimalSteam était fermé est retrouvée d'après le total de Steam, avec une date approchée.
 - MinimalSteam ne gère pas les ROM ni les émulateurs.
 - En Big Picture, la recherche se fait au clavier : il n'y a pas encore de clavier à l'écran.
-- La souris cachée dans les jeux et les autres logiciels demande KDE Plasma 6.2 ou plus ; ailleurs, elle n'est cachée que dans MinimalSteam.
+- La souris cachée dans les jeux et les autres logiciels demande KDE Plasma 6.2 ou plus ; ailleurs, elle n'est cachée que dans MinimalSteam. Dans les jeux non-Steam lancés par MinimalSteam, le pointeur du système est carrément invisible (un jeu qui dessine son propre curseur le garde). Dans les jeux lancés par Steam, seul l'effet de KDE agit, et un jeu qui replace lui-même le pointeur en continu peut le garder visible.
 - Hors Big Picture, la souris cachée partout l'est tant que MinimalSteam reste ouvert, même en arrière-plan.
 
 ## Remplace Biblijeu sur Linux

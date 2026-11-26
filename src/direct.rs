@@ -99,7 +99,8 @@ fn scoped(id: u32, options: &str, cmd: &[&str]) -> std::process::Command {
 }
 
 /// Lance le jeu sans Steam. `Ok(false)` : il faut passer par Steam (pas de Proton utilisable).
-pub fn launch(a: &Account, g: &Game) -> Result<bool, String> {
+/// `env` : variables ajoutées pour ce jeu (par exemple le pointeur invisible).
+pub fn launch(a: &Account, g: &Game, env: &[(String, String)]) -> Result<bool, String> {
     let exe = Path::new(&g.exe);
     if !exe.is_file() { return Err(format!("Programme introuvable : {}", g.exe)); }
     let dir = g.folder.clone().filter(|d| d.is_dir()).or_else(|| exe.parent().map(Path::to_path_buf));
@@ -130,6 +131,7 @@ pub fn launch(a: &Account, g: &Game) -> Result<bool, String> {
         if runnable { scoped(g.id, &g.options, &[&g.exe]) } else { scoped(g.id, &g.options, &["sh", &g.exe]) }
     };
     if let Some(d) = dir { c.current_dir(d); }
+    for (k, v) in env { c.env(k, v); }
     steam::spawn_detached(c).map_err(|e| format!("Impossible de lancer le jeu : {e}"))?;
     Ok(true)
 }
