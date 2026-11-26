@@ -222,8 +222,7 @@ impl App {
             let on = self.acc().is_some_and(|a| self.cfg.via_steam.contains(&gkey(&a.id, g.id)));
             v.push((Do::ViaSteam, format!("Lancer via Steam : {}", if on { "oui" } else { "non" }), true));
         }
-        let b = &self.cfg.big_picture;
-        if g.installed && b.hide_cursor && b.hide_everywhere {
+        if g.installed && self.cursor_choice_shown() {
             v.push((Do::Cursor, format!("Souris pendant ce jeu : {}", if self.cursor_kept(g.id) { "toujours visible" } else { "cachée sans bouger" }), true));
         }
         if !g.pending { v.push((Do::Stats, "Statistiques".into(), true)); }

@@ -245,6 +245,10 @@ struct Config {
     /// Jeux pendant lesquels le pointeur n'est jamais caché hors de MinimalSteam (compte:id), par
     /// exemple ceux qui dessinent leur propre curseur.
     cursor_visible: HashSet<String>,
+    /// Hors Big Picture : souris cachée après quelques secondes sans bouger, dans la fenêtre de
+    /// l'app, et en option partout (effet de KDE, tant que MinimalSteam est ouvert).
+    cursor_desktop: bool,
+    cursor_desktop_everywhere: bool,
     /// Effet KDE « Cacher le pointeur » chargé par l'app : à défaire (aussi au démarrage suivant si
     /// l'app s'est arrêtée brutalement).
     kwin_restore: Option<kwincursor::Restore>,
@@ -1528,7 +1532,7 @@ impl App {
         if raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. })) { self.mouse_nav = true; self.pointer_at = now; self.cursor_pad = false; }
         if raw.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })) { self.mouse_nav = false; self.last_pad = false; }
         // Pointeur caché : il ne survole plus rien (pas de contour sur la jaquette restée dessous).
-        let hidden = self.big && self.cfg.big_picture.hide_cursor && (self.cursor_pad || now.duration_since(self.pointer_at) >= bigui::CURSOR_IDLE);
+        let hidden = self.cursor_hiding() && (self.cursor_pad || now.duration_since(self.pointer_at) >= bigui::CURSOR_IDLE);
         if hidden && !self.pointer_gone { raw.events.push(egui::Event::PointerGone); self.pointer_gone = true; }
         else if !hidden { self.pointer_gone = false; }
         let key = |raw: &mut egui::RawInput, k: egui::Key, shift: bool| {
@@ -1732,7 +1736,7 @@ impl App {
     /// joue à la manette. Il revient au premier mouvement. À appeler après tous les widgets (ils
     /// choisissent aussi le pointeur, la main au survol par exemple).
     fn hide_cursor(&self, ctx: &egui::Context) {
-        if !self.big || !self.cfg.big_picture.hide_cursor { return; }
+        if !self.cursor_hiding() { return; }
         let idle = self.pointer_at.elapsed();
         if self.cursor_pad || idle >= bigui::CURSOR_IDLE { ctx.set_cursor_icon(egui::CursorIcon::None); }
         else { ctx.request_repaint_after(bigui::CURSOR_IDLE - idle + Duration::from_millis(50)); }
@@ -1743,8 +1747,7 @@ impl App {
     fn kwin_sync(&mut self, ctx: &egui::Context) {
         if self.hook.path.is_some() || self.kwin_busy { return; }
         let keep = self.acc().is_some_and(|a| self.running.iter().chain(self.launched.keys()).any(|id| self.cfg.cursor_visible.contains(&gkey(&a.id, *id))));
-        let b = &self.cfg.big_picture;
-        let want = self.big && b.hide_cursor && b.hide_everywhere && !keep;
+        let want = self.cursor_everywhere() && !keep;
         if self.kwin_want == Some(want) { return; }
         // Au démarrage, rien à défaire si l'effet n'a pas été chargé par nous.
         if self.kwin_want.is_none() && !want && self.cfg.kwin_restore.is_none() { self.kwin_want = Some(false); return; }
@@ -1755,6 +1758,21 @@ impl App {
             if want { Msg::KwinCursor(Some(kwincursor::hide(bigui::CURSOR_IDLE.as_secs()))) }
             else { if let Some(r) = restore { kwincursor::show(&r); } Msg::KwinCursor(None) }
         });
+    }
+
+    /// Souris cachée sans bouger dans la fenêtre de l'app (réglage du mode en cours).
+    fn cursor_hiding(&self) -> bool { if self.big { self.cfg.big_picture.hide_cursor } else { self.cfg.cursor_desktop } }
+
+    /// Souris cachée aussi dans les jeux et les autres logiciels (réglage du mode en cours).
+    fn cursor_everywhere(&self) -> bool {
+        let b = &self.cfg.big_picture;
+        if self.big { b.hide_cursor && b.hide_everywhere } else { self.cfg.cursor_desktop && self.cfg.cursor_desktop_everywhere }
+    }
+
+    /// Le choix « souris toujours visible » par jeu sert dans l'un des deux modes.
+    pub(crate) fn cursor_choice_shown(&self) -> bool {
+        let b = &self.cfg.big_picture;
+        (b.hide_cursor && b.hide_everywhere) || (self.cfg.cursor_desktop && self.cfg.cursor_desktop_everywhere)
     }
 
     fn cursor_kept(&self, id: u32) -> bool { self.acc().is_some_and(|a| self.cfg.cursor_visible.contains(&gkey(&a.id, id))) }
@@ -2439,6 +2457,7 @@ impl App {
         let (mut compat_pick, mut compat_apply, mut compat_cancel, mut cancel_add) = (None, false, false, false);
         let launching = self.launched.contains_key(&g.id);
         let (mut stop, mut open_dir, mut via_toggle, mut remove_local, mut sync_one) = (false, false, false, false, false);
+        let (cursor_shown, mut cursor_kept, mut cursor_toggle) = (self.cursor_choice_shown() && g.installed, self.cursor_kept(g.id), false);
         let mut open_stats = false;
         let (hidden, mut hide_toggle, mut remove_steam) = (self.is_hidden(g.id), false, false);
         let removing = self.remove_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
@@ -2585,6 +2604,10 @@ impl App {
                     let mut by_steam = self.cfg.via_steam.contains(&via_key);
                     if ui.checkbox(&mut by_steam, "Lancer via Steam").on_hover_text("Pour un jeu qui a besoin de Steam (overlay, Steam Input, anti-triche). Sinon il démarre directement avec Proton, dans le même préfixe.").changed() { via_toggle = true; }
                 }
+                if cursor_shown {
+                    ui.add_space(4.0);
+                    if ui.checkbox(&mut cursor_kept, "Souris toujours visible pendant ce jeu").on_hover_text("Pour un jeu qui a son propre curseur (WoW…) : la souris n'y est jamais cachée.").changed() { cursor_toggle = true; }
+                }
                 if g.pending {
                     ui.add_space(4.0);
                     ui.colored_label(GOLD, "Pas encore enregistré dans Steam.");
@@ -2677,6 +2700,7 @@ impl App {
                 match steam::open_folder(f) { Ok(()) => self.set_status("Dossier du jeu ouvert.", false), Err(e) => self.set_status(e, true) }
             }
         }
+        if cursor_toggle { self.toggle_cursor_kept(g.id); }
         if via_toggle {
             if !self.cfg.via_steam.remove(&via_key) { self.cfg.via_steam.insert(via_key.clone()); }
             self.cfg.save();
@@ -3034,6 +3058,17 @@ impl App {
                                 }
                             }
                             2 => {
+                                field(ui, "Souris");
+                                if ui.checkbox(&mut self.cfg.cursor_desktop, "Cacher la souris après 5 secondes sans la bouger").on_hover_text("Dans la fenêtre de MinimalSteam. Elle disparaît aussi dès que tu utilises la manette, et revient au premier mouvement.").changed() { self.dirty = true; }
+                                if self.cfg.cursor_desktop {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(22.0);
+                                        if ui.checkbox(&mut self.cfg.cursor_desktop_everywhere, "Aussi dans les jeux et les autres logiciels").on_hover_text("Avec l'effet « Cacher le pointeur » de KDE, tant que MinimalSteam est ouvert.").changed() { self.dirty = true; }
+                                    });
+                                    if self.cfg.cursor_desktop_everywhere { ui.label(RichText::new("Pour un jeu qui a son propre curseur (WoW…), coche « Souris toujours visible pendant ce jeu » sur sa fiche.").size(12.5).color(pal().muted)); }
+                                }
+                                ui.label(RichText::new("Hors Big Picture. Le Big Picture a ses propres réglages (onglet Big Picture).").size(12.5).color(pal().muted));
+                                ui.add_space(10.0);
                                 field(ui, "Bibliothèque");
                                 self.view_options(ui);
                                 ui.add_space(10.0);

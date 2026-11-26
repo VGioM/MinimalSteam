@@ -19,6 +19,7 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Statistiques exportables** : elles sont rangées dans `~/.config/Minimalsteam/statistiques` avec une copie de secours par jour, s'exportent et s'importent sans doublon, et peuvent être copiées automatiquement dans le dossier de ton choix.
 - **Lancement** en un double-clic, avec le bouton Jouer, la touche Entrée ou la manette.
 - **Mode Big Picture** : plein écran, en gros, tout à la manette, au clavier ou à la souris, comme une console (voir [plus bas](#mode-big-picture)).
+- **Souris cachée** après 5 secondes sans la bouger, aussi hors Big Picture (Réglages > Affichage) : dans la fenêtre de MinimalSteam, et si tu veux dans les jeux et les autres logiciels (KDE). Pour un jeu qui a son propre curseur, coche « Souris toujours visible pendant ce jeu » sur sa fiche.
 - **Lancement au démarrage du PC** (Réglages > Compte ou > Big Picture). Si l'AppImage est sur un disque secondaire, MinimalSteam attend jusqu'à une minute qu'il soit monté.
 - **Commandes à ta main** : dans Réglages > Commandes, deux touches de manette et deux touches de clavier ou de souris (molette, boutons de côté) par action. Toutes les manettes reconnues par Linux marchent (Xbox, PlayStation, 8BitDo…), en USB ou en Bluetooth, sticks et gâchettes compris.
 - **Jeux non-Steam lancés sans Steam**, avec Proton et dans leur préfixe habituel, donc avec les mêmes sauvegardes.
@@ -163,6 +164,7 @@ Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Ste
 - MinimalSteam ne gère pas les ROM ni les émulateurs.
 - En Big Picture, la recherche se fait au clavier : il n'y a pas encore de clavier à l'écran.
 - La souris cachée dans les jeux et les autres logiciels demande KDE Plasma 6.2 ou plus ; ailleurs, elle n'est cachée que dans MinimalSteam.
+- Hors Big Picture, la souris cachée partout l'est tant que MinimalSteam reste ouvert, même en arrière-plan.
 
 ## Remplace Biblijeu sur Linux
 
