@@ -26,10 +26,12 @@ pub(crate) struct Bp {
     pub fullscreen: bool,
     /// Le dernier fond montré : il reste affiché tant que le suivant charge.
     pub last_back: Option<egui::TextureHandle>,
+    /// La case « Ajouter des jeux », au bout de la grille, est choisie.
+    pub add_tile: bool,
 }
 
 impl Default for Bp {
-    fn default() -> Self { Bp { page: Page::Library, focus: 0, menu: None, compat: 0, scroll: 0.0, follow: true, zoom_before: 1.0, fullscreen: false, last_back: None } }
+    fn default() -> Self { Bp { page: Page::Library, focus: 0, menu: None, compat: 0, scroll: 0.0, follow: true, zoom_before: 1.0, fullscreen: false, last_back: None, add_tile: false } }
 }
 
 /// Réglages du mode (Réglages > Big Picture).
@@ -90,6 +92,29 @@ fn focus_glow(p: &egui::Painter, r: egui::Rect, rad: f32, t: f32) { if t > 0.0 {
 fn focus_frame(p: &egui::Painter, r: egui::Rect, rad: f32, t: f32) {
     if t <= 0.0 { return; }
     p.rect_stroke(r, rad, Stroke::new(3.0 * t, blend(pal().accent, Color32::WHITE, 0.2)), egui::StrokeKind::Outside);
+}
+
+/// La case « Ajouter des jeux », au bout de la grille. Rend le clic.
+fn add_tile(ui: &mut egui::Ui, p: &egui::Painter, rect: egui::Rect, clip: egui::Rect, rad: f32, on: bool) -> bool {
+    let resp = ui.interact(rect.intersect(clip), ui.id().with("bp-add"), Sense::CLICK);
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("on"), on, 0.12);
+    let hover = resp.hovered();
+    let r = rect.expand(t * 7.0);
+    focus_glow(p, r, rad, t);
+    p.rect_filled(r, rad, Color32::from_rgb(16, 18, 22));
+    p.rect_filled(r, rad, if hover || on { white(28) } else { white(12) });
+    p.rect_stroke(r.shrink(10.0), (rad - 4.0).max(2.0), Stroke::new(2.0_f32, white(if on { 150 } else { 70 })), egui::StrokeKind::Inside);
+    let c = r.center() - egui::vec2(0.0, r.height() * 0.08);
+    let arm = (r.width() * 0.16).clamp(14.0, 34.0);
+    let ink = if on { Color32::WHITE } else { white(200) };
+    p.line_segment([c - egui::vec2(arm, 0.0), c + egui::vec2(arm, 0.0)], Stroke::new(5.0_f32, ink));
+    p.line_segment([c - egui::vec2(0.0, arm), c + egui::vec2(0.0, arm)], Stroke::new(5.0_f32, ink));
+    let g = p.layout("Ajouter des jeux".into(), egui::FontId::proportional(17.0), ink, r.width() - 24.0);
+    p.galley(egui::pos2(r.center().x - g.size().x / 2.0, c.y + arm + 18.0), g, ink);
+    focus_frame(p, r, rad, t);
+    if hover && !on { p.rect_stroke(r, rad, Stroke::new(2.0_f32, white(120)), egui::StrokeKind::Outside); }
+    if hover { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    resp.clicked()
 }
 
 /// Un grand bouton de liste (fiche, options). `on` : choisi à la manette. Rend le clic.
@@ -258,6 +283,33 @@ impl App {
         }
     }
 
+    /// La case « Ajouter des jeux » est au bout de la grille (onglets où vont les jeux ajoutés).
+    pub(crate) fn bp_add_shown(&self) -> bool { matches!(self.filter, Filter::All | Filter::Other) }
+
+    /// La case « Ajouter des jeux » est la case choisie.
+    pub(crate) fn bp_on_add(&self) -> bool { self.bp_add_shown() && (self.bp.add_tile || (self.loaded && self.visible().is_empty())) }
+
+    /// Déplacement dans la grille, case « Ajouter des jeux » comprise.
+    fn bp_move(&mut self, dx: i32, dy: i32) {
+        let v = self.visible();
+        let add = self.bp_add_shown();
+        let n = v.len() + add as usize;
+        self.bp.follow = true;
+        if n == 0 { return; }
+        let cols = self.columns.max(1);
+        let cur = if self.bp_on_add() { Some(v.len()) } else { self.selected.and_then(|s| v.iter().position(|i| self.games[*i].id == s)) };
+        let next = match cur {
+            None => 0,
+            Some(p) => {
+                let t = p as i32 + dx + dy * cols as i32;
+                // Vers le bas sous une ligne incomplète : la dernière case.
+                if t < 0 || t >= n as i32 { if dy > 0 && p / cols < (n - 1) / cols { n - 1 } else { p } } else { t as usize }
+            }
+        };
+        self.bp.add_tile = add && next == v.len();
+        if let Some(&gi) = v.get(next) { self.selected = Some(self.games[gi].id); }
+    }
+
     fn bp_tab(&mut self, step: i32) {
         let tabs = self.bp_tabs();
         let at = tabs.iter().position(|t| *t == self.filter).unwrap_or(0) as i32;
@@ -271,6 +323,7 @@ impl App {
         self.bp.scroll = 0.0;
         self.bp.follow = true;
         self.bp.page = Page::Library;
+        self.bp.add_tile = false;
         let keep = self.selected.is_some_and(|s| self.visible().iter().any(|i| self.games[*i].id == s));
         if !keep { self.selected = None; self.move_selection(0, 0); }
         self.scroll_to = true;
@@ -310,10 +363,11 @@ impl App {
                 Action::PrevTab => self.bp_tab(-1),
                 Action::NextTab => self.bp_tab(1),
                 _ if matches!(self.filter, Filter::Stats | Filter::Friends) => {}
-                Action::Up => { self.move_selection(0, -1); self.bp.follow = true; }
-                Action::Down => { self.move_selection(0, 1); self.bp.follow = true; }
-                Action::Left => { self.move_selection(-1, 0); self.bp.follow = true; }
-                Action::Right => { self.move_selection(1, 0); self.bp.follow = true; }
+                Action::Up => self.bp_move(0, -1),
+                Action::Down => self.bp_move(0, 1),
+                Action::Left => self.bp_move(-1, 0),
+                Action::Right => self.bp_move(1, 0),
+                Action::Confirm | Action::Options | Action::Favorite if self.bp_on_add() => if a == Action::Confirm { self.open_add(); },
                 Action::Confirm => match self.selected { Some(id) => self.open_page(id), None => self.move_selection(0, 0) },
                 Action::Options => if let Some(id) = self.selected { self.bp.menu = Some((id, 0)); },
                 Action::Favorite => if let Some(id) = self.selected { self.toggle_favorite(id); },
@@ -479,11 +533,16 @@ impl App {
         let h = |a: Action| c.hint(a, pad);
         let mut list: Vec<(Action, String, &str)> = vec![];
         let stats = matches!(self.filter, Filter::Stats | Filter::Friends) && self.bp.page == Page::Library;
-        if self.bp.menu.is_some() {
+        if self.browsing() {
+            list = vec![(Action::Confirm, h(Action::Confirm), "Ouvrir"), (Action::PrevTab, h(Action::PrevTab), "Dossier parent"), (Action::Back, h(Action::Back), "Retour à la liste")];
+        } else if self.add.is_some() {
+            list = vec![(Action::Confirm, h(Action::Confirm), "Valider"), (Action::Back, h(Action::Back), "Fermer")];
+        } else if self.bp.menu.is_some() {
             list = vec![(Action::Confirm, h(Action::Confirm), "Choisir"), (Action::Back, h(Action::Back), "Fermer")];
         } else {
             match self.bp.page {
                 Page::Library if stats => list.extend([(Action::Confirm, h(Action::Confirm), "Valider")]),
+                Page::Library if self.bp_on_add() => list.extend([(Action::Confirm, h(Action::Confirm), "Ajouter des jeux")]),
                 Page::Library => list.extend([(Action::Confirm, h(Action::Confirm), "Ouvrir"), (Action::Options, h(Action::Options), "Options"), (Action::Favorite, h(Action::Favorite), "Favori")]),
                 Page::Game(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Valider"), (Action::Options, h(Action::Options), "Options"), (Action::Back, h(Action::Back), "Retour")]),
                 Page::Compat(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Appliquer"), (Action::Back, h(Action::Back), "Retour")]),
@@ -510,16 +569,20 @@ impl App {
                 }
             });
         });
-        if let Some(a) = clicked { self.bp_action(ctx, a); }
+        // Fenêtre d'ajout ouverte : la touche agit sur elle, comme à la manette.
+        if let Some(a) = clicked { if self.add.is_some() { self.act(ctx, a, false); } else { self.bp_action(ctx, a); } }
     }
 
     fn bp_library(&mut self, ctx: &egui::Context) {
         let visible = self.visible();
         let rad = self.cfg.theme.radius.max(8) as f32;
         let mut open = None;
+        let mut add = false;
+        let add_shown = self.bp_add_shown();
+        let on_add = self.bp_on_add();
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
             let area = ui.max_rect();
-            if !self.loaded || visible.is_empty() {
+            if !self.loaded || (visible.is_empty() && !add_shown) {
                 let text = if !self.loaded { "Chargement des jeux…" } else if !self.query.is_empty() { "Aucun jeu ne correspond à la recherche." } else { "Aucun jeu dans cet onglet." };
                 ui.painter().text(area.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(22.0), pal().muted);
                 return;
@@ -534,15 +597,18 @@ impl App {
             // Cases réduites par la hauteur : la grille reste centrée.
             let x0 = grid.min.x + ((grid.width() - cols as f32 * tile_w - (cols as f32 - 1.0) * GAP) / 2.0).max(0.0);
             self.columns = cols;
-            let rows = visible.len().div_ceil(cols);
+            let count = visible.len() + add_shown as usize;
+            let rows = count.div_ceil(cols);
             let content_h = rows as f32 * step - GAP;
             let max_scroll = (content_h - grid.height() + 30.0).max(0.0);
             // Rien de choisi (onglet changé, jeu disparu) : le premier, pour que la manette ait un point de départ.
             let mut sel = self.selected.and_then(|s| visible.iter().position(|i| self.games[*i].id == s));
-            if sel.is_none() { self.selected = Some(self.games[visible[0]].id); sel = Some(0); self.bp.follow = true; }
+            if sel.is_none() && !visible.is_empty() { self.selected = Some(self.games[visible[0]].id); sel = Some(0); self.bp.follow = true; }
+            // La case choisie : un jeu, ou « Ajouter des jeux » au bout.
+            let cur = if on_add { Some(visible.len()) } else { sel };
             let over = ui.rect_contains_pointer(grid);
             if over { let d = ui.input(|i| i.smooth_scroll_delta.y); if d != 0.0 { self.bp.scroll -= d; self.bp.follow = false; } }
-            if let (true, Some(p)) = (self.bp.follow, sel) { self.bp.scroll = follow(self.bp.scroll, p / cols, step, tile_h, grid.height()); self.bp.follow = false; }
+            if let (true, Some(p)) = (self.bp.follow, cur) { self.bp.scroll = follow(self.bp.scroll, p / cols, step, tile_h, grid.height()); self.bp.follow = false; }
             self.bp.scroll = self.bp.scroll.clamp(0.0, max_scroll);
             let shown = ui.ctx().animate_value_with_time(egui::Id::new("bp-scroll"), self.bp.scroll, 0.16);
             // Marge pour que le halo des cases du bord ne soit pas coupé.
@@ -553,12 +619,15 @@ impl App {
             for row in first..last {
                 for col in 0..cols {
                     let n = row * cols + col;
-                    let Some(&gi) = visible.get(n) else { break };
-                    let g = &self.games[gi];
                     let min = egui::pos2(x0, grid.min.y) + egui::vec2(col as f32 * (tile_w + GAP), row as f32 * step - shown);
                     let rect = egui::Rect::from_min_size(min, egui::vec2(tile_w, tile_h));
+                    let Some(&gi) = visible.get(n) else {
+                        if add_shown && n == visible.len() { add |= add_tile(ui, &p, rect, clip, rad, on_add); }
+                        break;
+                    };
+                    let g = &self.games[gi];
                     let resp = ui.interact(rect.intersect(clip), ui.id().with(("bp-card", g.id)), Sense::CLICK);
-                    let on = sel == Some(n);
+                    let on = cur == Some(n);
                     let t = ui.ctx().animate_bool_with_time(resp.id.with("on"), on, 0.12);
                     let hover = resp.hovered();
                     let lift = ui.ctx().animate_bool_with_time(resp.id.with("hover"), hover, 0.12);
@@ -589,7 +658,12 @@ impl App {
                     if resp.clicked() { open = Some(g.id); }
                 }
             }
-            if info_h > 0.0 {
+            if info_h > 0.0 && on_add {
+                let box_ = egui::Rect::from_min_max(egui::pos2(area.left() + 48.0, area.bottom() - info_h + 14.0), egui::pos2(area.right() - 48.0, area.bottom() - 10.0));
+                let p = ui.painter().with_clip_rect(box_);
+                p.text(box_.left_top(), egui::Align2::LEFT_TOP, "Ajouter des jeux", egui::FontId::proportional(30.0), Color32::WHITE);
+                p.text(box_.left_top() + egui::vec2(0.0, 50.0), egui::Align2::LEFT_TOP, "Un programme, ou tous les jeux d'un dossier, avec leurs images", egui::FontId::proportional(17.0), pal().muted);
+            } else if info_h > 0.0 {
                 if let Some(g) = sel.map(|n| &self.games[visible[n]]) {
                     let box_ = egui::Rect::from_min_max(egui::pos2(area.left() + 48.0, area.bottom() - info_h + 14.0), egui::pos2(area.right() - 48.0, area.bottom() - 10.0));
                     let p = ui.painter();
@@ -604,7 +678,8 @@ impl App {
                 }
             }
         });
-        if let Some(id) = open { self.selected = Some(id); self.open_page(id); }
+        if let Some(id) = open { self.bp.add_tile = false; self.selected = Some(id); self.open_page(id); }
+        if add { self.bp.add_tile = true; self.open_add(); }
     }
 
     fn bp_game(&mut self, ctx: &egui::Context, id: u32) {

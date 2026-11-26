@@ -9,6 +9,9 @@ const SKIP_DIRS: [&str; 12] = ["_commonredist", "commonredist", "redist", "redis
 const NOT_GAME: [&str; 26] = ["unins", "setup", "install", "crash", "report", "redist", "vc_", "vcredist", "dxsetup", "dxwebsetup", "dotnet", "helper", "updater", "update", "config", "settings", "prereq", "cefprocess", "webhelper", "benchmark", "dedicated", "server", "editor", "modkit", "touchup", "activation"];
 const GENERIC: [&str; 12] = ["game", "launcher", "launch", "start", "play", "run", "main", "app", "client", "bin", "win64", "x64"];
 
+/// Un programme que l'ajout sait lancer (Windows ou Linux).
+pub fn is_program(p: &Path) -> bool { kind(p).is_some() }
+
 fn kind(p: &Path) -> Option<bool> {
     let ext = p.extension()?.to_string_lossy().to_lowercase();
     match ext.as_str() { "exe" | "bat" => Some(true), "appimage" | "x86_64" => Some(false), _ => None }
@@ -63,7 +66,8 @@ pub fn best_program(root: &Path) -> Option<PathBuf> {
             let p = e.path();
             if t.is_dir() {
                 let n = e.file_name().to_string_lossy().to_lowercase();
-                if depth < 4 && !n.starts_with('.') && !SKIP_DIRS.contains(&n.as_str()) { stack.push((p, depth + 1)); }
+                // « _Redist », « __Installer » : les mêmes dossiers d'installation, soulignés.
+                if depth < 4 && !n.starts_with('.') && !SKIP_DIRS.contains(&n.trim_start_matches('_')) && !SKIP_DIRS.contains(&n.as_str()) { stack.push((p, depth + 1)); }
             } else if t.is_file() && kind(&p).is_some() {
                 let size = e.metadata().map(|m| m.len()).unwrap_or(0);
                 let s = score(&p, root, depth, size);
@@ -131,6 +135,7 @@ mod tests {
         touch(&d.join("Super Jeu/unins000.exe"), 90000);
         touch(&d.join("Super Jeu/UnityCrashHandler64.exe"), 90000);
         touch(&d.join("Super Jeu/_CommonRedist/vc_redist.x64.exe"), 900000);
+        touch(&d.join("Super Jeu/_Redist/QuickSFV.EXE"), 900000);
         touch(&d.join("Autre/bin/x64/Autre.exe"), 3000);
         touch(&d.join("Vide/notes.txt"), 10);
         touch(&d.join("Portable.AppImage"), 100);

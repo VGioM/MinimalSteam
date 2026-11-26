@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 mod appinfo;
 mod bigui;
 mod blur;
+mod browse;
 mod controls;
 mod controlsui;
 mod desc;
@@ -252,6 +253,13 @@ struct Config {
     /// Effet KDE « Cacher le pointeur » chargé par l'app : à défaire (aussi au démarrage suivant si
     /// l'app s'est arrêtée brutalement).
     kwin_restore: Option<kwincursor::Restore>,
+    /// Les dossiers où l'utilisateur range ses jeux : raccourcis de l'explorateur d'ajout. `None` :
+    /// trouvés d'après les jeux déjà ajoutés.
+    game_folders: Option<Vec<PathBuf>>,
+    /// L'explorateur ne propose pas le dossier personnel ni les disques en plus.
+    game_folders_only: bool,
+    /// Noms choisis pour les dossiers de jeux (chemin → nom).
+    game_folder_names: std::collections::BTreeMap<String, String>,
 }
 
 /// Le dossier des statistiques, à part de la config pour se sauvegarder facilement.
@@ -489,13 +497,19 @@ enum Msg {
     Gpu(Result<String, String>),
     /// Autorisation de la carte graphique installée ou retirée.
     GpuHelper(Result<(), String>),
+    /// Un dossier de jeux choisi dans la fenêtre du système (Réglages > Dossiers de jeux).
+    GameFolder(PathBuf),
     /// Pointeur caché partout (effet KDE chargé : ce qu'il faudra remettre), ou de nouveau visible (`None`).
     KwinCursor(Option<Result<kwincursor::Restore, String>>),
 }
 
 struct Row { on: bool, exists: bool, name: String, exe: String, options: String, windows: bool }
 
-struct AddForm { rows: Vec<Row>, tool: Option<String>, tools: Vec<(String, String)>, fetch_art: bool, scanning: bool, error: Option<String> }
+struct AddForm {
+    rows: Vec<Row>, tool: Option<String>, tools: Vec<(String, String)>, fetch_art: bool, scanning: bool, error: Option<String>,
+    /// L'explorateur de dossiers de MinimalSteam (Big Picture : pilotable à la manette).
+    browse: Option<browse::Browse>,
+}
 
 /// La case de touche qu'on est en train de changer.
 #[derive(Clone, Debug)]
@@ -504,7 +518,7 @@ struct Capture { action: Action, pad: bool, slot: usize, frame: u64, at: Instant
 /// Temps laissé pour appuyer sur la nouvelle touche.
 const CAPTURE_FOR: Duration = Duration::from_secs(6);
 
-const SETTINGS_TABS: [&str; 7] = ["Thème", "Fonds", "Affichage", "Compte", "Carte graphique", "Commandes", "Big Picture"];
+const SETTINGS_TABS: [&str; 8] = ["Thème", "Fonds", "Affichage", "Compte", "Carte graphique", "Commandes", "Big Picture", "Dossiers de jeux"];
 
 struct Editor {
     id: u32,
@@ -581,6 +595,10 @@ struct App {
     autostart: Option<bool>,
     big: bool,
     bp: bigui::Bp,
+    /// Réglages > Dossiers de jeux : l'explorateur qui choisit un dossier à ajouter.
+    folder_pick: Option<browse::Browse>,
+    /// Réglages > Dossiers de jeux : dossier en train d'être renommé (chemin, nom, focus à donner).
+    folder_rename: Option<(String, String, bool)>,
     /// La sélection a bougé à la manette ou au clavier cette image (pour faire défiler jusqu'à elle).
     bp_moved: bool,
     steam_on: bool,
@@ -715,7 +733,7 @@ impl App {
         let (pad, pad_names) = gamepad::start(cc.egui_ctx.clone(), pad_listen.clone());
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
-            columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad, pad_names, rep: Default::default(), pad_acts: vec![], last_pad: false, mouse_nav: false, focus_since: None, nav_check: None, tab_fallback: None, nav_until: None, capture: None, key_seen: vec![], pad_keys: vec![], pad_listen, pointer_at: Instant::now(), cursor_pad: false, pointer_gone: false, kwin_want: None, kwin_busy: false, autostart: None, big: false, bp: Default::default(), bp_moved: false,
+            columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad, pad_names, rep: Default::default(), pad_acts: vec![], last_pad: false, mouse_nav: false, focus_since: None, nav_check: None, tab_fallback: None, nav_until: None, capture: None, key_seen: vec![], pad_keys: vec![], pad_listen, pointer_at: Instant::now(), cursor_pad: false, pointer_gone: false, kwin_want: None, kwin_busy: false, autostart: None, big: false, bp: Default::default(), folder_pick: None, folder_rename: None, bp_moved: false,
             steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), gpu_cards: None, gpu_want: None, gpu_pending: None, gpu_busy: false, hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
             stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), hour_mode: 0, stats_slot: None, report_view: 0, ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false, stats_alive: stats::now(),
@@ -1028,6 +1046,7 @@ impl App {
                     self.gpu_busy = false;
                     match r { Ok(t) => self.set_status(t, false), Err(e) => self.set_status(format!("Carte graphique : {e}"), true) }
                 }
+                Msg::GameFolder(d) => self.add_game_folder(d),
                 Msg::GpuHelper(r) => {
                     self.gpu_busy = false;
                     match r {
@@ -1235,8 +1254,18 @@ impl App {
     fn open_add(&mut self) {
         let tools = self.acc().map(steam::compat_tools).unwrap_or_default();
         let tool = tools.first().map(|t| t.0.clone());
-        self.add = Some(AddForm { rows: vec![], tool, tools, fetch_art: !self.cfg.api_key.trim().is_empty(), scanning: false, error: None });
+        self.add = Some(AddForm { rows: vec![], tool, tools, fetch_art: !self.cfg.api_key.trim().is_empty(), scanning: false, error: None, browse: None });
+        // En Big Picture, l'explorateur s'ouvre tout de suite, dans le dossier où sont déjà tes jeux.
+        if self.big { self.open_browse(); }
     }
+
+    pub(crate) fn open_browse(&mut self) {
+        let b = browse::Browse::new(&self.game_folder_places(), !self.cfg.game_folders_only, false);
+        if let Some(f) = self.add.as_mut() { f.browse = Some(b); }
+    }
+
+    /// L'explorateur est ouvert dans la fenêtre d'ajout.
+    pub(crate) fn browsing(&self) -> bool { self.add.as_ref().is_some_and(|f| f.browse.is_some()) }
 
     fn add_rows(&mut self, list: Vec<scan::Found>) {
         let known: HashSet<String> = self.games.iter().filter(|g| !g.steam).map(|g| g.exe.clone()).collect();
@@ -1681,10 +1710,17 @@ impl App {
                 Action::Back => {
                     if ctx.memory(|m| m.any_popup_open()) { ctx.memory_mut(|m| m.close_popup()); }
                     else if self.update.dialog_open() { self.update.dismiss(); }
+                    else if self.browsing() { if let Some(f) = self.add.as_mut() { f.browse = None; } }
+                    else if self.settings && self.folder_pick.is_some() { self.folder_pick = None; }
                     else if self.settings || self.editor.is_some() || self.add.is_some() { self.add = None; self.editor = None; self.settings = false; self.capture = None; }
                     else if self.big { self.bp_action(ctx, a); }
                 }
-                Action::PrevTab | Action::NextTab if self.settings => {
+                Action::PrevTab if (self.browsing() && !self.settings) || (self.settings && self.folder_pick.is_some()) => {
+                    let b = if self.settings { self.folder_pick.as_mut() } else { self.add.as_mut().and_then(|f| f.browse.as_mut()) };
+                    if let Some(b) = b { b.up(); }
+                    ctx.memory_mut(|m| if let Some(id) = m.focused() { m.surrender_focus(id) });
+                }
+                Action::PrevTab | Action::NextTab if self.settings && self.folder_pick.is_none() => {
                     let step = if a == Action::PrevTab { -1 } else { 1 };
                     self.settings_tab = (self.settings_tab as i32 + step).rem_euclid(tabs) as u8;
                     self.color_edit = None;
@@ -1807,6 +1843,8 @@ impl App {
                 "menu" => self.bp.menu = Some((id, 0)),
                 "gpu" => self.bp.page = bigui::Page::Gpu(id),
                 "compat" => self.bp.page = bigui::Page::Compat(id),
+                "addtile" => { self.bp.add_tile = true; self.bp.follow = true; }
+                "browse" => { self.bp.add_tile = true; self.bp.follow = true; self.open_add(); }
                 _ => {}
             }
         }
@@ -2732,19 +2770,36 @@ impl App {
         if self.add.is_none() { return; }
         let busy = self.busy.clone();
         let (steam_on, game_running) = (self.steam_on, self.game_active());
-        let (mut files, mut folder, mut submit, mut cancel) = (false, false, false, false);
+        let (mut files, mut folder, mut submit, mut cancel, mut browse_open) = (false, false, false, false, false);
+        let mut browsed: Option<browse::Pick> = None;
+        let (big, pad_nav) = (self.big, self.last_pad && !self.mouse_nav);
         let screen = ctx.screen_rect();
         let has_key = !self.cfg.api_key.trim().is_empty();
         let modal = egui::Modal::new(egui::Id::new("add")).frame(modal_frame(ctx)).show(ctx, |ui| {
             ui.set_width((screen.width() - 120.0).clamp(560.0, 760.0));
             let Some(f) = self.add.as_mut() else { return };
             ui.heading("Ajouter des jeux");
+            if let Some(b) = f.browse.as_mut() {
+                ui.label(RichText::new("Ouvre le dossier d'un jeu et choisis son programme, ou ajoute d'un coup tous les jeux d'un dossier.").size(13.0).color(pal().muted));
+                let ready = f.rows.iter().filter(|r| r.on && !r.exists).count();
+                if ready > 0 { ui.label(RichText::new(format!("{ready} jeu{} déjà dans la liste.", if ready > 1 { "x" } else { "" })).size(13.0).color(OK)); }
+                ui.add_space(6.0);
+                browsed = b.ui(ui, (screen.height() - 330.0).clamp(160.0, 520.0));
+                return;
+            }
             ui.label(RichText::new("Choisis un ou plusieurs programmes, ou un dossier de jeux : MinimalSteam trouve le bon programme de chacun.").size(13.0).color(pal().muted));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let idle = busy.is_none() && !f.scanning;
-                files = ui.add_enabled(idle, egui::Button::new("Choisir des fichiers").min_size(egui::vec2(170.0, 34.0))).clicked();
-                folder = ui.add_enabled(idle, egui::Button::new("Scanner un dossier").min_size(egui::vec2(170.0, 34.0))).clicked();
+                if big {
+                    let r = ui.add_enabled(idle, egui::Button::new("Parcourir les dossiers").min_size(egui::vec2(170.0, 34.0)));
+                    browse_open = r.clicked();
+                    // De retour de l'explorateur à la manette : le focus revient ici.
+                    if pad_nav && ui.ctx().memory(|m| m.focused().is_none()) { r.request_focus(); }
+                } else {
+                    files = ui.add_enabled(idle, egui::Button::new("Choisir des fichiers").min_size(egui::vec2(170.0, 34.0))).clicked();
+                    folder = ui.add_enabled(idle, egui::Button::new("Scanner un dossier").min_size(egui::vec2(170.0, 34.0))).clicked();
+                }
                 if f.scanning { ui.spinner(); ui.label(RichText::new("Recherche des jeux…").size(13.0).color(pal().muted)); }
             });
             ui.add_space(8.0);
@@ -2798,6 +2853,23 @@ impl App {
                 cancel = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler").min_size(egui::vec2(0.0, 34.0))).clicked();
             });
         });
+        if browse_open { self.open_browse(); }
+        match browsed {
+            Some(browse::Pick::File(p)) => {
+                self.add_rows(vec![scan::from_file(&p)]);
+                if let Some(f) = self.add.as_mut() { f.browse = None; }
+            }
+            Some(browse::Pick::Scan(d)) => {
+                if let Some(f) = self.add.as_mut() { f.browse = None; f.scanning = true; }
+                let (tx, c) = (self.tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(Msg::Found(scan::scan_folder(&d)));
+                    c.request_repaint();
+                });
+            }
+            Some(browse::Pick::Close) => if let Some(f) = self.add.as_mut() { f.browse = None; },
+            None => {}
+        }
         if files {
             let (tx, c) = (self.tx.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -2840,7 +2912,9 @@ impl App {
                 });
             }
         }
-        if (cancel || modal.should_close()) && self.busy.is_none() { self.add = None; }
+        // Échap ou un clic à côté : l'explorateur se ferme d'abord.
+        if modal.should_close() && self.browsing() { if let Some(f) = self.add.as_mut() { f.browse = None; } }
+        else if (cancel || modal.should_close()) && self.busy.is_none() { self.add = None; }
     }
 
     fn editor_modal(&mut self, ctx: &egui::Context) {
@@ -2952,6 +3026,7 @@ impl App {
 
     fn settings_modal(&mut self, ctx: &egui::Context) {
         if !self.settings { return; }
+        if self.settings_tab != 7 { self.folder_pick = None; }
         let mut account = None;
         let (mut save, mut pick_image, mut changed, mut pick_sgdb, mut close, mut need_fonts) = (false, None, false, None, false, false);
         let mut save_steam = false;
@@ -3175,6 +3250,7 @@ impl App {
                             }
                             5 => self.controls_tab(ui),
                             6 => { if self.bp_settings(ui) { enter_bp = true; } }
+                            7 => self.folders_tab(ui),
                             _ => {
                                 field(ui, "Compte Steam");
                                 let shown = |a: &Account| if demo { "Mon compte".to_string() } else { a.name.clone() };
@@ -3285,7 +3361,9 @@ impl App {
             if self.cfg.steam_key.is_empty() { if let Some(a) = self.acc().map(|a| a.id.clone()) { self.cfg.owned.remove(&a); self.cfg.save(); } self.reload(ctx); }
             else { self.refresh_owned(ctx); }
         }
-        if modal.should_close() { self.settings = false; }
+        // Échap ou un clic à côté : le choix d'un dossier se ferme d'abord.
+        if modal.should_close() { if self.folder_pick.take().is_none() { self.settings = false; } }
+        if !self.settings { self.folder_pick = None; }
     }
 }
 
