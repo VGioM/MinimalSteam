@@ -18,6 +18,9 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Entrées regroupées** : plusieurs entrées non-Steam pour le même jeu (par exemple Prototype, Prototype 2 et Prototype Biohazard Bundle) peuvent compter leurs stats dans une seule, même après la suppression des autres.
 - **Statistiques exportables** : elles sont rangées dans `~/.config/Minimalsteam/statistiques` avec une copie de secours par jour, s'exportent et s'importent sans doublon, et peuvent être copiées automatiquement dans le dossier de ton choix.
 - **Lancement** en un double-clic, avec le bouton Jouer, la touche Entrée ou la manette.
+- **Mode Big Picture** : plein écran, en gros, tout à la manette, au clavier ou à la souris, comme une console (voir [plus bas](#mode-big-picture)).
+- **Lancement au démarrage du PC** (Réglages > Compte ou > Big Picture). Si l'AppImage est sur un disque secondaire, MinimalSteam attend jusqu'à une minute qu'il soit monté.
+- **Commandes à ta main** : dans Réglages > Commandes, deux touches de manette et deux touches de clavier ou de souris (molette, boutons de côté) par action. Toutes les manettes reconnues par Linux marchent (Xbox, PlayStation, 8BitDo…), en USB ou en Bluetooth, sticks et gâchettes compris.
 - **Jeux non-Steam lancés sans Steam**, avec Proton et dans leur préfixe habituel, donc avec les mêmes sauvegardes.
 - **AppImage et scripts `.sh`** ajoutés directement à MinimalSteam, sans passer par Steam.
 - **Synchronisation avec Steam** : envoie un ou plusieurs programmes dans Steam, avec ou sans collection MinimalSteam, et range chaque jeu dans la collection ou retire-le depuis sa fiche.
@@ -32,6 +35,41 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Mises à jour intégrées** depuis les releases GitHub.
 
 ![La fiche d'un jeu, avec le fond du jeu sélectionné](docs/fiche.jpg)
+
+## Mode Big Picture
+
+Pour jouer depuis le canapé comme sur une console : MinimalSteam passe en plein écran, en gros, et tout se fait à la **manette**, au **clavier** ou à la **souris**. Il s'ouvre avec le bouton **Big Picture** en haut de la fenêtre, **View** à la manette ou **F11**, et se ferme de la même façon.
+
+![Le mode Big Picture](docs/bigpicture.jpg)
+
+- **Bibliothèque** en grandes jaquettes, sur le fond du jeu choisi, avec ses onglets (LB / RB pour passer de l'un à l'autre), les Statistiques et les Amis.
+- **Fiche du jeu** : jouer ou arrêter, favori, images, carte graphique, version de Proton, lancer via Steam, statistiques, dossier, cacher. LB / RB passent au jeu précédent ou suivant.
+- **Menu d'options** (bouton Menu) sur n'importe quel jeu, sans ouvrir sa fiche.
+- **Tous les réglages** se pilotent à la manette : un cadre montre l'élément choisi, A l'active, LB / RB changent d'onglet, l'affichage suit.
+- **Aides de touches** en bas de l'écran, au nom des boutons de la manette ou des touches du clavier selon ce que tu utilises. Elles se cliquent aussi.
+- **Souris cachée** après 5 secondes sans la bouger, ou dès que tu joues à la manette, et aussi dans les jeux et les autres logiciels (effet « Cacher le pointeur » de KDE, seulement pendant le Big Picture). Pour un jeu qui a son propre curseur, comme WoW, choisis « Souris pendant ce jeu : toujours visible » sur sa fiche.
+- **Démarrage comme une console** : coche « Lancer MinimalSteam au démarrage du PC » et « Ouvrir MinimalSteam en Big Picture ».
+- **Taille de l'interface** réglable (130 % par défaut), plein écran ou non. Le mode peut aussi être retiré complètement.
+
+| Fiche d'un jeu | Menu d'options |
+|---|---|
+| ![La fiche d'un jeu en Big Picture](docs/bp-fiche.jpg) | ![Le menu d'options d'un jeu](docs/bp-options.jpg) |
+
+| Commandes à ta main | Réglages du Big Picture |
+|---|---|
+| ![Réglages > Commandes](docs/commandes.jpg) | ![Réglages > Big Picture](docs/bp-reglages.jpg) |
+
+### Manettes et commandes
+
+Toutes les manettes reconnues par Linux marchent, en USB ou en Bluetooth (Xbox, PlayStation, 8BitDo…), avec la croix, les deux sticks et les gâchettes. Une direction tenue se répète, et le stick droit fait défiler les pages. Dans **Réglages > Commandes**, chaque action a deux touches de manette et deux touches de clavier ou de souris (molette, boutons de côté) : clique sur une case, puis appuie sur la nouvelle touche. La manette marche aussi hors Big Picture.
+
+## Statistiques, amis et carte graphique
+
+| Statistiques | Amis |
+|---|---|
+| ![L'onglet Statistiques](docs/statistiques.jpg) | ![L'onglet Amis](docs/amis.jpg) |
+
+![La carte graphique selon le jeu](docs/carte-graphique.jpg)
 
 ## Ajouter des jeux non-Steam
 
@@ -79,15 +117,24 @@ Steam doit être installé (version native ou Flatpak) et connecté à ton compt
 
 ## Raccourcis
 
-| Action | Clavier | Manette |
+Touches d'origine, modifiables dans Réglages > Commandes :
+
+| Action | Clavier / souris | Manette |
 |---|---|---|
-| Se déplacer | Flèches | Croix ou stick gauche |
-| Lancer le jeu | Entrée ou double-clic | A |
-| Fermer la fiche | Échap | B |
-| Favori | | Y |
+| Se déplacer | Flèches | Croix ou stick gauche (maintenus : ça défile) |
+| Valider, lancer le jeu | Entrée ou double-clic | A |
+| Retour, fermer | Échap ou bouton « précédent » de la souris | B |
+| Options du jeu (Big Picture) | M | Menu |
+| Favori | F | Y |
+| Onglet précédent / suivant | Page préc. / Page suiv. | LB / RB |
+| Réglages | F10 | X |
+| Entrer / sortir du Big Picture | F11 | View |
+| Faire défiler | Molette | Stick droit |
 | Rechercher | Ctrl+F | |
 
-La manette est ignorée quand la fenêtre n'a pas le focus ou qu'un jeu tourne.
+Dans les réglages et les fenêtres, la manette déplace un cadre de sélection d'un élément à l'autre et A l'active ; LB et RB changent d'onglet de réglages. Sur la fiche d'un jeu en Big Picture, LB et RB passent au jeu précédent ou suivant.
+
+La manette n'agit que quand la fenêtre de MinimalSteam est au premier plan ; hors Big Picture, elle est aussi laissée au jeu tant qu'une partie tourne. Si Steam traduit la manette en touches de clavier, un appui ne compte qu'une fois.
 
 ## Comment ça marche
 
@@ -114,6 +161,8 @@ Ces écritures se font Steam fermé et **jamais pendant qu'un jeu lancé par Ste
 - Le temps de jeu sans Steam n'est compté que si MinimalSteam reste ouvert jusqu'à la fermeture du jeu.
 - Le temps de jeu jour par jour commence le premier jour d'utilisation de cette version : Steam ne garde pas d'historique avant. Une partie jouée pendant que MinimalSteam était fermé est retrouvée d'après le total de Steam, avec une date approchée.
 - MinimalSteam ne gère pas les ROM ni les émulateurs.
+- En Big Picture, la recherche se fait au clavier : il n'y a pas encore de clavier à l'écran.
+- La souris cachée dans les jeux et les autres logiciels demande KDE Plasma 6.2 ou plus ; ailleurs, elle n'est cachée que dans MinimalSteam.
 
 ## Remplace Biblijeu sur Linux
 

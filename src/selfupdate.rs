@@ -212,6 +212,12 @@ impl SelfUpdate {
 
     pub fn busy(&self) -> bool { self.busy }
 
+    /// Une fenêtre de mise à jour est ouverte (la manette doit alors la piloter).
+    pub fn dialog_open(&self) -> bool { !matches!(self.dialog, Dialog::None) }
+
+    /// Retour à la manette : ferme la fenêtre, sauf pendant un téléchargement.
+    pub fn dismiss(&mut self) { if !matches!(self.dialog, Dialog::Downloading(_)) { self.dialog = Dialog::None; } }
+
     pub fn check_now(&mut self, ctx: &egui::Context) { self.check(ctx, true); }
 
     fn check(&mut self, ctx: &egui::Context, interactive: bool) {

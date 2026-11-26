@@ -518,6 +518,7 @@ impl App {
                         Some(id) => self.game_page(ui, id, &mut pick),
                     }
                     ui.add_space(24.0);
+                    bigui::scroll_focus(ui);
                 });
                 return;
             }
@@ -536,6 +537,7 @@ impl App {
                             for (id, name, total) in &list[rows] {
                                 if stat_row(ui, name, &if *total > 0 { playtime(*total) } else { String::new() }, self.stats_pick == Some(*id)) { pick = Some(Some(*id)); }
                             }
+                            bigui::scroll_focus(ui);
                         });
                     });
                 });
@@ -548,6 +550,7 @@ impl App {
                             Some(id) => self.game_page(ui, id, &mut pick),
                         }
                         ui.add_space(24.0);
+                        bigui::scroll_focus(ui);
                     });
                 });
             });

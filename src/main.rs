@@ -9,7 +9,10 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 mod appinfo;
+mod bigui;
 mod blur;
+mod controls;
+mod controlsui;
 mod desc;
 mod descui;
 #[allow(dead_code)]
@@ -20,6 +23,7 @@ mod friends;
 mod friendsui;
 mod gamepad;
 mod gpu;
+mod kwincursor;
 mod owned;
 mod scan;
 #[allow(dead_code)]
@@ -31,7 +35,7 @@ mod statsui;
 mod steam;
 mod vdf;
 
-use gamepad::Pad;
+use controls::Action;
 use selfupdate::SelfUpdate;
 use sgdb::{Img, SgdbGame};
 use steam::{Account, Game, Kind};
@@ -235,6 +239,15 @@ struct Config {
     stats_views: std::collections::BTreeMap<String, u8>,
     /// Limite de watts et overclocking de la carte graphique, par jeu (NVIDIA, option à activer).
     gpu: gpu::GpuCfg,
+    /// Touches de la manette, du clavier et de la souris, pour chaque action.
+    controls: controls::Controls,
+    big_picture: bigui::BigCfg,
+    /// Jeux pendant lesquels le pointeur n'est jamais caché hors de MinimalSteam (compte:id), par
+    /// exemple ceux qui dessinent leur propre curseur.
+    cursor_visible: HashSet<String>,
+    /// Effet KDE « Cacher le pointeur » chargé par l'app : à défaire (aussi au démarrage suivant si
+    /// l'app s'est arrêtée brutalement).
+    kwin_restore: Option<kwincursor::Restore>,
 }
 
 /// Le dossier des statistiques, à part de la config pour se sauvegarder facilement.
@@ -472,11 +485,22 @@ enum Msg {
     Gpu(Result<String, String>),
     /// Autorisation de la carte graphique installée ou retirée.
     GpuHelper(Result<(), String>),
+    /// Pointeur caché partout (effet KDE chargé : ce qu'il faudra remettre), ou de nouveau visible (`None`).
+    KwinCursor(Option<Result<kwincursor::Restore, String>>),
 }
 
 struct Row { on: bool, exists: bool, name: String, exe: String, options: String, windows: bool }
 
 struct AddForm { rows: Vec<Row>, tool: Option<String>, tools: Vec<(String, String)>, fetch_art: bool, scanning: bool, error: Option<String> }
+
+/// La case de touche qu'on est en train de changer.
+#[derive(Clone, Debug)]
+struct Capture { action: Action, pad: bool, slot: usize, frame: u64, at: Instant }
+
+/// Temps laissé pour appuyer sur la nouvelle touche.
+const CAPTURE_FOR: Duration = Duration::from_secs(6);
+
+const SETTINGS_TABS: [&str; 7] = ["Thème", "Fonds", "Affichage", "Compte", "Carte graphique", "Commandes", "Big Picture"];
 
 struct Editor {
     id: u32,
@@ -519,7 +543,42 @@ struct App {
     tex: Textures,
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
-    pad: mpsc::Receiver<Pad>,
+    pad: mpsc::Receiver<gamepad::Ev>,
+    pad_names: gamepad::Names,
+    /// Directions tenues à la manette (répétition), actions de la manette pour cette image.
+    rep: controls::Repeater,
+    pad_acts: Vec<Action>,
+    /// Dernière commande venue de la manette (aides de touches à son nom), ou de la souris.
+    last_pad: bool,
+    mouse_nav: bool,
+    /// Fenêtre au premier plan depuis : la manette n'agit qu'après un court instant.
+    focus_since: Option<Instant>,
+    /// Focus egui déplacé par la manette avec une flèche : (focus d'avant, vers le haut, image).
+    /// S'il n'a pas bougé (curseur, champ de texte), on passe par Tab.
+    nav_check: Option<(Option<egui::Id>, bool, u64)>,
+    tab_fallback: Option<bool>,
+    nav_until: Option<Instant>,
+    /// Touche en cours de choix dans Réglages > Commandes.
+    capture: Option<Capture>,
+    /// Anti-doublon : touches réellement tapées, et touches qu'une action de manette vient de faire.
+    /// Steam (configuration « bureau ») peut traduire la manette en touches : un seul appui doit compter.
+    key_seen: Vec<(egui::Key, Instant)>,
+    pad_keys: Vec<(egui::Key, Instant)>,
+    /// Dit au fil de la manette si l'app écoute (premier plan) : sinon il ne la réveille pas.
+    pad_listen: Arc<std::sync::atomic::AtomicBool>,
+    /// Dernier mouvement ou clic de la souris ; pointeur caché depuis un appui de manette.
+    pointer_at: Instant,
+    cursor_pad: bool,
+    pointer_gone: bool,
+    /// Pointeur caché partout : dernier état demandé à KDE, et appel en cours.
+    kwin_want: Option<bool>,
+    kwin_busy: bool,
+    /// Lancement à l'ouverture de session (lu une fois, à l'ouverture des réglages).
+    autostart: Option<bool>,
+    big: bool,
+    bp: bigui::Bp,
+    /// La sélection a bougé à la manette ou au clavier cette image (pour faire défiler jusqu'à elle).
+    bp_moved: bool,
     steam_on: bool,
     running: HashSet<u32>,
     /// Sous-ensemble de `running` lancé sans Steam.
@@ -646,9 +705,13 @@ impl App {
         if let Some(b) = hook.blur { cfg.theme.blur = Some(b); cfg.theme.panel_blur = Some(b); }
         if let Some(b) = hook.top_blur { cfg.theme.top_blur = Some(b); }
         let shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| cfg.theme.blur_level(z));
+        // Effet « Cacher le pointeur » resté chargé (arrêt brutal de l'app) : on remet KDE comme avant.
+        if let Some(r) = cfg.kwin_restore.take().filter(|_| hook.path.is_none()) { kwincursor::show(&r); cfg.save(); }
+        let pad_listen = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (pad, pad_names) = gamepad::start(cc.egui_ctx.clone(), pad_listen.clone());
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
-            columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad: gamepad::start(cc.egui_ctx.clone()),
+            columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad, pad_names, rep: Default::default(), pad_acts: vec![], last_pad: false, mouse_nav: false, focus_since: None, nav_check: None, tab_fallback: None, nav_until: None, capture: None, key_seen: vec![], pad_keys: vec![], pad_listen, pointer_at: Instant::now(), cursor_pad: false, pointer_gone: false, kwin_want: None, kwin_busy: false, autostart: None, big: false, bp: Default::default(), bp_moved: false,
             steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), gpu_cards: None, gpu_want: None, gpu_pending: None, gpu_busy: false, hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
             stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), hour_mode: 0, stats_slot: None, report_view: 0, ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false, stats_alive: stats::now(),
@@ -672,6 +735,7 @@ impl App {
         }
         app.reload(&cc.egui_ctx);
         if std::env::var_os("APP_SCREENSHOT").is_none() { app.refresh_owned(&cc.egui_ctx); }
+        if app.cfg.big_picture.enabled && (app.cfg.big_picture.start || app.hook.big) { app.bp_enter(&cc.egui_ctx); }
         app
     }
 
@@ -1040,6 +1104,15 @@ impl App {
                     }
                 }
                 Msg::Fonts(list) => self.fonts = Some(list),
+                Msg::KwinCursor(r) => {
+                    self.kwin_busy = false;
+                    match r {
+                        Some(Ok(rest)) => { self.cfg.kwin_restore = Some(rest); self.cfg.save(); }
+                        // On ne réessaie pas en boucle : l'état voulu reste noté comme appliqué.
+                        Some(Err(e)) => self.set_status(e, true),
+                        None => { self.cfg.kwin_restore = None; self.cfg.save(); }
+                    }
+                }
                 Msg::FontReady(name, bytes) => {
                     if name == self.cfg.theme.font {
                         match bytes {
@@ -1432,40 +1505,291 @@ impl App {
         self.scroll_to = true;
     }
 
-    fn inputs(&mut self, ctx: &egui::Context) {
-        let modal = self.add.is_some() || self.editor.is_some() || self.settings;
-        let focused = ctx.input(|i| i.focused);
-        let pads: Vec<Pad> = self.pad.try_iter().collect();
-        // Manette ignorée hors focus ou pendant une partie : elle sert au jeu.
-        if focused && self.running.is_empty() {
-            for p in pads {
-                if modal { if p == Pad::Back { self.add = None; self.editor = None; self.settings = false; } continue; }
-                match p {
-                    Pad::Up => self.move_selection(0, -1),
-                    Pad::Down => self.move_selection(0, 1),
-                    Pad::Left => self.move_selection(-1, 0),
-                    Pad::Right => self.move_selection(1, 0),
-                    Pad::Confirm => match self.selected { Some(id) => self.launch(id), None => self.move_selection(0, 0) },
-                    Pad::Back => self.selected = None,
-                    Pad::Favorite => if let Some(id) = self.selected { self.toggle_favorite(id); },
+    fn open_settings(&mut self) { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
+
+    /// Une fenêtre ou une page faite de réglages : la manette y déplace le focus d'egui.
+    fn egui_nav(&self) -> bool { self.settings || self.editor.is_some() || self.add.is_some() || self.update.dialog_open() || self.bp_egui_page() }
+
+    /// Les touches de manette de cette image, avant qu'egui ne la traite : dans les réglages, elles
+    /// deviennent des flèches, Tab et Entrée pour egui ; ailleurs, des actions pour `inputs`.
+    fn pad_input(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        let now = Instant::now();
+        let test = self.hook.path.is_some();
+        // Les captures de test n'écoutent que les appuis simulés : une vraie manette utilisée à côté
+        // (en jeu) ne doit pas les piloter.
+        let mut evs: Vec<gamepad::Ev> = self.pad.try_iter().filter(|_| !test).collect();
+        evs.extend(self.hook.pad_events());
+        let mut btns = vec![];
+        for e in evs {
+            if e.down { self.rep.press(e.btn, now); btns.push(e.btn); } else { self.rep.release(e.btn); }
+        }
+        btns.extend(self.rep.due(now));
+        if self.rep.active() { ctx.request_repaint_after(controls::REPEAT_EVERY / 2); }
+        if raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. })) { self.mouse_nav = true; self.pointer_at = now; self.cursor_pad = false; }
+        if raw.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })) { self.mouse_nav = false; self.last_pad = false; }
+        // Pointeur caché : il ne survole plus rien (pas de contour sur la jaquette restée dessous).
+        let hidden = self.big && self.cfg.big_picture.hide_cursor && (self.cursor_pad || now.duration_since(self.pointer_at) >= bigui::CURSOR_IDLE);
+        if hidden && !self.pointer_gone { raw.events.push(egui::Event::PointerGone); self.pointer_gone = true; }
+        else if !hidden { self.pointer_gone = false; }
+        let key = |raw: &mut egui::RawInput, k: egui::Key, shift: bool| {
+            let modifiers = egui::Modifiers { shift, ..Default::default() };
+            raw.events.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers });
+            raw.events.push(egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers });
+        };
+        // Une touche qui ne fait que refléter un appui de manette déjà compté : on l'enlève.
+        let mirror = Duration::from_millis(150);
+        self.pad_keys.retain(|(_, t)| now.duration_since(*t) < mirror);
+        self.key_seen.retain(|(_, t)| now.duration_since(*t) < mirror);
+        let pad_keys = self.pad_keys.clone();
+        raw.events.retain(|e| !matches!(e, egui::Event::Key { key, pressed: true, .. } if pad_keys.iter().any(|(k, _)| k == key)));
+        for e in &raw.events { if let egui::Event::Key { key, pressed: true, .. } = e { self.key_seen.push((*key, now)); } }
+        self.pad_listen.store(raw.focused || test, std::sync::atomic::Ordering::Relaxed);
+        if let Some(up) = self.tab_fallback.take() { key(raw, egui::Key::Tab, up); }
+        // Fenêtre en arrière-plan (un jeu, une autre app) : la manette n'est pas pour nous.
+        if !raw.focused && !test { self.focus_since = None; self.rep.clear(); return; }
+        let since = *self.focus_since.get_or_insert(now);
+        if btns.is_empty() { return; }
+        // Juste après un retour au premier plan, les appuis étaient encore pour le jeu.
+        if now.duration_since(since) < Duration::from_millis(500) && !test { return; }
+        // Hors Big Picture, une partie en cours garde la manette pour elle (comme avant).
+        if !self.big && !self.running.is_empty() && !self.egui_nav() { return; }
+        self.last_pad = true;
+        self.mouse_nav = false;
+        self.cursor_pad = true;
+        if let Some(c) = &self.capture {
+            if c.pad && ctx.cumulative_pass_nr() > c.frame { let (a, slot) = (c.action, c.slot); self.capture = None; self.bind_pad(a, slot, Some(btns[0])); }
+            ctx.request_repaint();
+            return;
+        }
+        let nav = self.egui_nav();
+        for b in btns {
+            let acts = self.cfg.controls.of_btn(b);
+            // Stick droit libre : il fait défiler, comme une molette.
+            if acts.is_empty() && matches!(b, gamepad::Btn::RsUp | gamepad::Btn::RsDown) {
+                if raw.events.iter().all(|e| !matches!(e, egui::Event::PointerMoved(_))) && ctx.pointer_latest_pos().is_none() {
+                    // Sur le bord droit, au milieu : dans la zone qui défile, sans survoler un élément (infobulle).
+                    let r = ctx.screen_rect();
+                    raw.events.push(egui::Event::PointerMoved(egui::pos2(r.right() - 6.0, r.center().y)));
+                }
+                let dy = if b == gamepad::Btn::RsUp { 140.0 } else { -140.0 };
+                raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), modifiers: Default::default() });
+                continue;
+            }
+            for a in acts {
+                // Les touches qui font la même chose (celles de l'action, et la flèche ou Entrée d'egui).
+                let mut same: Vec<egui::Key> = self.cfg.controls.keys(a).iter().flatten().filter_map(|k| k.as_key()).collect();
+                same.extend(match a { Action::Up => Some(egui::Key::ArrowUp), Action::Down => Some(egui::Key::ArrowDown), Action::Left => Some(egui::Key::ArrowLeft), Action::Right => Some(egui::Key::ArrowRight), Action::Confirm => Some(egui::Key::Enter), Action::Back => Some(egui::Key::Escape), _ => None });
+                if self.key_seen.iter().any(|(k, _)| same.contains(k)) { continue; }
+                self.pad_keys.extend(same.into_iter().map(|k| (k, now)));
+                if nav && (a.is_dir() || a == Action::Confirm) {
+                    let focused = ctx.memory(|m| m.focused());
+                    let back = matches!(a, Action::Up | Action::Left);
+                    // Rien n'a le focus : Tab le donne au premier élément.
+                    if focused.is_none() { key(raw, egui::Key::Tab, back); }
+                    else if a == Action::Confirm { key(raw, egui::Key::Enter, false); }
+                    else {
+                        key(raw, match a { Action::Up => egui::Key::ArrowUp, Action::Down => egui::Key::ArrowDown, Action::Left => egui::Key::ArrowLeft, _ => egui::Key::ArrowRight }, false);
+                        if matches!(a, Action::Up | Action::Down) { self.nav_check = Some((focused, a == Action::Up, ctx.cumulative_pass_nr())); }
+                    }
+                    self.nav_until = Some(now + Duration::from_millis(400));
+                } else {
+                    self.pad_acts.push(a);
                 }
             }
         }
+        ctx.request_repaint();
+    }
+
+    fn bind_pad(&mut self, a: Action, slot: usize, b: Option<gamepad::Btn>) {
+        if let Some(lost) = self.cfg.controls.set_pad(a, slot, b) { self.set_status(format!("« {} » n'a plus cette touche.", lost.label()), false); }
+        if self.hook.path.is_none() { self.cfg.save(); }
+    }
+
+    fn bind_key(&mut self, a: Action, slot: usize, k: Option<controls::KeyIn>) {
+        if let Some(lost) = self.cfg.controls.set_key(a, slot, k) { self.set_status(format!("« {} » n'a plus cette touche.", lost.label()), false); }
+        if self.hook.path.is_none() { self.cfg.save(); }
+    }
+
+    /// Choix d'une touche de clavier ou de souris dans Réglages > Commandes. Échap annule.
+    fn capture_keys(&mut self, ctx: &egui::Context) -> bool {
+        let Some(c) = self.capture.clone() else { return false };
+        if c.at.elapsed() > CAPTURE_FOR { self.capture = None; return false; }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        if c.pad || ctx.cumulative_pass_nr() <= c.frame { return true; }
+        let got = ctx.input(|i| i.events.iter().find_map(|e| match e {
+            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(if *key == egui::Key::Escape { None } else { Some(controls::KeyIn::key(*key)) }),
+            egui::Event::PointerButton { button, pressed: true, .. } => controls::KeyIn::mouse(*button).map(Some),
+            _ => None,
+        }));
+        if let Some(k) = got {
+            self.capture = None;
+            // La touche ne doit rien faire d'autre : Échap fermerait les réglages, une flèche déplacerait le focus.
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Key { pressed: true, .. })));
+            if let Some(k) = k { self.bind_key(c.action, c.slot, Some(k)); }
+        }
+        true
+    }
+
+    fn inputs(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) { self.focus_search = true; }
-        if modal { return; }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.rename.take().is_some() { ctx.memory_mut(|m| m.stop_text_input()); return; }
-            if !self.query.is_empty() { self.query.clear(); } else { self.selected = None; }
+        // Focus egui qui n'a pas bougé avec une flèche (curseur, texte) : Tab à la prochaine image.
+        if let Some((before, up, frame)) = self.nav_check {
+            if ctx.cumulative_pass_nr() >= frame + 2 {
+                self.nav_check = None;
+                if before.is_some() && ctx.memory(|m| m.focused()) == before { self.tab_fallback = Some(up); ctx.request_repaint(); }
+            } else { ctx.request_repaint(); }
+        }
+        // À la manette, les textes ne doivent pas prendre le focus (egui les rend sélectionnables).
+        let selectable = !(self.big || (self.last_pad && !self.mouse_nav));
+        if ctx.style().interaction.selectable_labels != selectable { ctx.style_mut(|s| s.interaction.selectable_labels = selectable); }
+        let capturing = self.capture_keys(ctx);
+        let pads = std::mem::take(&mut self.pad_acts);
+        if capturing { return; }
+        let keys = self.cfg.controls.from_input(ctx);
+        if !keys.is_empty() { self.last_pad = false; }
+        let nav = self.egui_nav();
+        if nav && keys.iter().any(|a| a.is_dir()) { self.nav_until = Some(Instant::now() + Duration::from_millis(400)); }
+        let typing = ctx.wants_keyboard_input();
+        // Échap pendant une saisie : on arrête de taper (et on annule le renommage).
+        if typing && !nav && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // Comme avant : on annule le renommage, sinon on vide la recherche.
+            if self.rename.take().is_none() && !self.query.is_empty() { self.query.clear(); }
             ctx.memory_mut(|m| m.stop_text_input());
+            return;
         }
-        if ctx.wants_keyboard_input() { return; }
-        for (k, dx, dy) in [(egui::Key::ArrowLeft, -1, 0), (egui::Key::ArrowRight, 1, 0), (egui::Key::ArrowUp, 0, -1), (egui::Key::ArrowDown, 0, 1)] {
-            if ctx.input(|i| i.key_pressed(k)) { self.move_selection(dx, dy); }
+        // Au clavier, egui gère lui-même flèches et Entrée dans les réglages, et Échap ferme les fenêtres.
+        let from_keys = keys.into_iter().filter(|a| !nav || !(a.is_dir() || *a == Action::Confirm || (*a == Action::Back && !self.bp_egui_page())));
+        let acts: Vec<(Action, bool)> = pads.into_iter().map(|a| (a, true)).chain(from_keys.map(|a| (a, false))).collect();
+        for (a, pad) in acts { self.act(ctx, a, pad); }
+    }
+
+    fn act(&mut self, ctx: &egui::Context, a: Action, pad: bool) {
+        if a == Action::BigPicture && self.cfg.big_picture.enabled && !self.big {
+            self.settings = false; self.editor = None; self.add = None;
+            self.bp_enter(ctx);
+            return;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) { if let Some(id) = self.selected { self.launch(id); } }
+        if self.egui_nav() {
+            let tabs = SETTINGS_TABS.len() as i32;
+            match a {
+                Action::Back => {
+                    if ctx.memory(|m| m.any_popup_open()) { ctx.memory_mut(|m| m.close_popup()); }
+                    else if self.update.dialog_open() { self.update.dismiss(); }
+                    else if self.settings || self.editor.is_some() || self.add.is_some() { self.add = None; self.editor = None; self.settings = false; self.capture = None; }
+                    else if self.big { self.bp_action(ctx, a); }
+                }
+                Action::PrevTab | Action::NextTab if self.settings => {
+                    let step = if a == Action::PrevTab { -1 } else { 1 };
+                    self.settings_tab = (self.settings_tab as i32 + step).rem_euclid(tabs) as u8;
+                    self.color_edit = None;
+                    ctx.memory_mut(|m| if let Some(id) = m.focused() { m.surrender_focus(id) });
+                }
+                Action::Settings if self.settings => self.settings = false,
+                Action::BigPicture if self.big => { self.settings = false; self.editor = None; self.add = None; self.bp_exit(ctx); }
+                _ if self.big && !self.settings && self.editor.is_none() && self.add.is_none() && !self.update.dialog_open() => self.bp_action(ctx, a),
+                _ => {}
+            }
+            return;
+        }
+        if self.big { self.bp_moved |= a.is_dir(); self.bp_action(ctx, a); return; }
+        match a {
+            Action::Up => self.move_selection(0, -1),
+            Action::Down => self.move_selection(0, 1),
+            Action::Left => self.move_selection(-1, 0),
+            Action::Right => self.move_selection(1, 0),
+            Action::Confirm => match self.selected { Some(id) => self.launch(id), None => if pad { self.move_selection(0, 0) } },
+            Action::Back => {
+                if self.rename.take().is_some() { ctx.memory_mut(|m| m.stop_text_input()); }
+                else if !self.query.is_empty() && !pad { self.query.clear(); }
+                else { self.selected = None; }
+            }
+            Action::Favorite => if let Some(id) = self.selected { self.toggle_favorite(id); },
+            Action::PrevTab | Action::NextTab => {
+                let tabs: Vec<Filter> = self.cfg.tab_list().into_iter().filter(|t| t.1).map(|t| t.0).collect();
+                let at = tabs.iter().position(|t| *t == self.filter).unwrap_or(0) as i32;
+                let step = if a == Action::PrevTab { -1 } else { 1 };
+                self.filter = tabs[(at + step).rem_euclid(tabs.len() as i32) as usize];
+                if self.selected.is_some_and(|s| !self.visible().iter().any(|i| self.games[*i].id == s)) { self.selected = None; }
+                self.scroll_to = true;
+            }
+            Action::Settings => self.open_settings(),
+            Action::Options | Action::BigPicture => {}
+        }
+    }
+
+    /// À la manette ou au clavier, dans les réglages : un cadre bien visible autour de l'élément choisi.
+    fn focus_ring(&self, ctx: &egui::Context) {
+        if self.mouse_nav || !self.egui_nav() { return; }
+        let Some(id) = ctx.memory(|m| m.focused()) else { return };
+        let Some(r) = ctx.read_response(id) else { return };
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("focus-ring")));
+        let rect = r.rect.expand(3.0);
+        painter.rect_stroke(rect, 7.0, Stroke::new(2.5_f32, pal().accent), egui::StrokeKind::Outside);
+        painter.rect_stroke(rect.expand(2.5), 9.0, Stroke::new(1.0_f32, pal().accent.gamma_multiply(0.4)), egui::StrokeKind::Outside);
+    }
+
+    /// En Big Picture : pointeur caché après quelques secondes sans bouger la souris, ou dès qu'on
+    /// joue à la manette. Il revient au premier mouvement. À appeler après tous les widgets (ils
+    /// choisissent aussi le pointeur, la main au survol par exemple).
+    fn hide_cursor(&self, ctx: &egui::Context) {
+        if !self.big || !self.cfg.big_picture.hide_cursor { return; }
+        let idle = self.pointer_at.elapsed();
+        if self.cursor_pad || idle >= bigui::CURSOR_IDLE { ctx.set_cursor_icon(egui::CursorIcon::None); }
+        else { ctx.request_repaint_after(bigui::CURSOR_IDLE - idle + Duration::from_millis(50)); }
+    }
+
+    /// Pointeur caché aussi hors de MinimalSteam (jeux, autres logiciels) pendant le Big Picture, sauf
+    /// pendant un jeu marqué « souris toujours visible ». Les appels à KDE partent dans un fil.
+    fn kwin_sync(&mut self, ctx: &egui::Context) {
+        if self.hook.path.is_some() || self.kwin_busy { return; }
+        let keep = self.acc().is_some_and(|a| self.running.iter().chain(self.launched.keys()).any(|id| self.cfg.cursor_visible.contains(&gkey(&a.id, *id))));
+        let b = &self.cfg.big_picture;
+        let want = self.big && b.hide_cursor && b.hide_everywhere && !keep;
+        if self.kwin_want == Some(want) { return; }
+        // Au démarrage, rien à défaire si l'effet n'a pas été chargé par nous.
+        if self.kwin_want.is_none() && !want && self.cfg.kwin_restore.is_none() { self.kwin_want = Some(false); return; }
+        self.kwin_want = Some(want);
+        self.kwin_busy = true;
+        let restore = self.cfg.kwin_restore.clone();
+        self.spawn(ctx, move || {
+            if want { Msg::KwinCursor(Some(kwincursor::hide(bigui::CURSOR_IDLE.as_secs()))) }
+            else { if let Some(r) = restore { kwincursor::show(&r); } Msg::KwinCursor(None) }
+        });
+    }
+
+    fn cursor_kept(&self, id: u32) -> bool { self.acc().is_some_and(|a| self.cfg.cursor_visible.contains(&gkey(&a.id, id))) }
+
+    fn toggle_cursor_kept(&mut self, id: u32) {
+        let Some(k) = self.acc().map(|a| gkey(&a.id, id)) else { return };
+        if !self.cfg.cursor_visible.remove(&k) { self.cfg.cursor_visible.insert(k); }
+        if self.hook.path.is_none() { self.cfg.save(); }
+    }
+
+    /// Case « lancer à l'ouverture de session » (Réglages > Compte et > Big Picture).
+    fn autostart_row(&mut self, ui: &mut egui::Ui) {
+        let mut on = *self.autostart.get_or_insert_with(|| desktop::autostart_on("minimalsteam"));
+        let tip = "MinimalSteam s'ouvre tout seul quand tu allumes le PC (à l'ouverture de ta session). Avec « Ouvrir en Big Picture », le PC démarre directement sur ta bibliothèque, comme une console.";
+        if ui.checkbox(&mut on, "Lancer MinimalSteam au démarrage du PC").on_hover_text(tip).changed() {
+            // Les tests n'y touchent que dans un dossier de configuration à part.
+            if self.hook.path.is_some() && std::env::var_os("XDG_CONFIG_HOME").is_none() { return; }
+            let e = desktop::Entry { app_id: "minimalsteam", name: "MinimalSteam", comment: "Un lanceur épuré pour les jeux Steam et non-Steam", categories: "Game;", icon_png: &[] };
+            match desktop::set_autostart(&e, "Minimalsteam", on) {
+                Ok(()) => { self.autostart = Some(on); self.set_status(if on { "MinimalSteam se lancera au démarrage du PC." } else { "MinimalSteam ne se lancera plus au démarrage du PC." }, false); }
+                Err(err) => self.set_status(err, true),
+            }
+        }
     }
 
     fn hook_open(&mut self, ctx: &egui::Context) {
+        if let (Some(p), Some(id)) = (self.hook.bp_page.clone(), self.selected) {
+            match p.as_str() {
+                "game" => self.bp.page = bigui::Page::Game(id),
+                "menu" => self.bp.menu = Some((id, 0)),
+                "gpu" => self.bp.page = bigui::Page::Gpu(id),
+                "compat" => self.bp.page = bigui::Page::Compat(id),
+                _ => {}
+            }
+        }
         if self.hook.editor { if let Some(id) = self.selected { self.open_editor(ctx, id); } }
         if self.hook.picker { self.open_back_picker(ctx, Zone::Lib); }
         if self.hook.rename { if let Some(g) = self.selected.and_then(|id| self.game(id)) { self.rename = Some((g.id, g.name.clone())); self.rename_focus = true; } }
@@ -1519,12 +1843,17 @@ impl App {
             }
             ui.add_space(14.0);
         }
-        let search_w = (avail - title_w - add_w - 32.0 - 40.0).clamp(90.0, 260.0);
+        let bp_w = if !self.cfg.big_picture.enabled { 0.0 } else if narrow { 42.0 } else { text_w(ui, "Big Picture", 14.0) + 24.0 };
+        let search_w = (avail - title_w - add_w - bp_w - 32.0 - 40.0).clamp(90.0, 260.0);
         let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Rechercher un jeu").desired_width(search_w).margin(Margin::symmetric(10, 5)).background_color(pal().menu));
         if self.focus_search { r.request_focus(); self.focus_search = false; }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.visuals_mut().widgets.inactive.weak_bg_fill = pal().menu;
             if ui.add(egui::Button::new(RichText::new("⚙").size(16.0)).min_size(egui::vec2(32.0, 30.0))).on_hover_text("Réglages").clicked() { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
+            if self.cfg.big_picture.enabled {
+                let tip = format!("Mode Big Picture : plein écran, à la manette ({} à la manette, {} au clavier)", self.cfg.controls.hint(Action::BigPicture, true), self.cfg.controls.hint(Action::BigPicture, false));
+                if ui.add(egui::Button::new(RichText::new(if narrow { "BP" } else { "Big Picture" }).size(14.0)).min_size(egui::vec2(34.0, 30.0))).on_hover_text(tip).clicked() { let c = ui.ctx().clone(); self.bp_enter(&c); }
+            }
             let min = egui::vec2(if narrow { 34.0 } else { 0.0 }, 30.0);
             if fill_button(ui, add_label, min, 14.0, pal().accent, true) { self.open_add(); }
         });
@@ -2415,6 +2744,7 @@ impl App {
                             });
                         });
                     }
+                    bigui::scroll_focus(ui);
                 });
             }
             ui.add_space(8.0);
@@ -2555,6 +2885,7 @@ impl App {
                 if ed.loading { ui.add_space(10.0); ui.vertical_centered(|ui| ui.spinner()); }
                 else if ed.items.is_empty() && ed.game.is_some() && ed.error.is_none() { ui.label(RichText::new("Aucune image de ce type pour ce jeu.").color(pal().muted)); }
                 if ed.more && !ed.loading { ui.add_space(10.0); ui.vertical_centered(|ui| { more = ui.button("Voir plus").clicked(); }); }
+                bigui::scroll_focus(ui);
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -2599,6 +2930,7 @@ impl App {
         let (mut save, mut pick_image, mut changed, mut pick_sgdb, mut close, mut need_fonts) = (false, None, false, None, false, false);
         let mut save_steam = false;
         let mut sync_all = false;
+        let mut enter_bp = false;
         // Carte graphique : lue seulement quand on ouvre son onglet.
         let gpu_card = if self.settings_tab == 4 { self.gpu_card() } else { None };
         let gpu_err = self.gpu_cards.as_ref().and_then(|r| r.as_ref().err().cloned());
@@ -2628,8 +2960,13 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_width(128.0);
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    for (i, label) in ["Thème", "Fonds", "Affichage", "Compte", "Carte graphique"].into_iter().enumerate() {
-                        if nav_item(ui, label, self.settings_tab == i as u8) { self.settings_tab = i as u8; self.color_edit = None; }
+                    for (i, label) in SETTINGS_TABS.into_iter().enumerate() {
+                        let on = self.settings_tab == i as u8;
+                        let r = nav_item(ui, label, on);
+                        // À la manette, rien n'a encore le focus : on part de l'onglet de réglages actif
+                        // (sinon le premier élément serait « Fermer »).
+                        if on && self.last_pad && !self.mouse_nav && ui.ctx().memory(|m| m.focused().is_none()) { r.request_focus(); }
+                        if r.clicked() { self.settings_tab = i as u8; self.color_edit = None; }
                     }
                 });
                 ui.add_space(12.0);
@@ -2799,6 +3136,8 @@ impl App {
                                     }
                                 }
                             }
+                            5 => self.controls_tab(ui),
+                            6 => { if self.bp_settings(ui) { enter_bp = true; } }
                             _ => {
                                 field(ui, "Compte Steam");
                                 let shown = |a: &Account| if demo { "Mon compte".to_string() } else { a.name.clone() };
@@ -2856,6 +3195,7 @@ impl App {
                                 ui.colored_label(c, s);
                                 ui.add_space(12.0);
                                 field(ui, &format!("MinimalSteam {}", env!("CARGO_PKG_VERSION")));
+                                self.autostart_row(ui);
                                 ui.horizontal(|ui| {
                                     let label = if self.update.busy() { "Recherche…" } else { "Rechercher les mises à jour" };
                                     if ui.add_enabled(!self.update.busy(), egui::Button::new(label)).clicked() { self.update.check_now(ui.ctx()); }
@@ -2864,10 +3204,12 @@ impl App {
                                 });
                             }
                         }
+                        bigui::scroll_focus(ui);
                     });
                 });
             });
         });
+        if enter_bp { self.settings = false; self.bp_enter(ctx); }
         if need_fonts { self.fonts = Some(vec![]); self.spawn(ctx, || Msg::Fonts(fonts::list())); }
         if let Some(install) = gpu_helper { self.gpu_helper(ctx, install); }
         if close { self.settings = false; }
@@ -3190,7 +3532,7 @@ fn fill_back(painter: &egui::Painter, area: egui::Rect, tex: &egui::TextureHandl
     painter.rect_filled(area, 0.0, Color32::from_rgba_unmultiplied(tint[0], tint[1], tint[2], (dim as f32 * 2.55).round() as u8));
 }
 
-fn nav_item(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+fn nav_item(ui: &mut egui::Ui, label: &str, on: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(egui::vec2(128.0, 36.0), Sense::click());
     if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
     let rad = if soft() { 12.0 } else { 8.0 };
@@ -3201,7 +3543,7 @@ fn nav_item(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
     }
     else if resp.hovered() { ui.painter().rect_filled(r, rad, pal().hover); }
     ui.painter().text(r.left_center() + egui::vec2(12.0, 0.0), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(14.5), if on { pal().on_accent } else { pal().text });
-    resp.clicked()
+    resp
 }
 
 fn theme_card(ui: &mut egui::Ui, p: (&str, [u8; 3], [u8; 3], [u8; 3], [u8; 3]), on: bool) -> bool {
@@ -3374,9 +3716,11 @@ impl eframe::App for App {
         self.inputs(ctx);
         if !ctx.input(|i| i.pointer.any_down()) { self.shown_blur = [Zone::Lib, Zone::Panel, Zone::Top].map(|z| self.cfg.theme.blur_level(z)); }
         // Un peu plus grand que la fenêtre : avec un écran mis à l'échelle, le bord tombe entre deux pixels.
-        self.paint_back(ctx, ctx.screen_rect().expand(2.0));
-        self.paint_top(ctx);
-        self.top_bar(ctx);
+        if !self.big {
+            self.paint_back(ctx, ctx.screen_rect().expand(2.0));
+            self.paint_top(ctx);
+            self.top_bar(ctx);
+        }
         if let Some((text, error, at)) = self.status.clone() {
             if at.elapsed() > Duration::from_secs(5) { self.status = None; }
             else {
@@ -3390,11 +3734,15 @@ impl eframe::App for App {
         self.gpu_sync(ctx);
         self.tick_queue(ctx);
         self.queue_bar(ctx);
-        self.detail(ctx);
-        self.grid(ctx);
+        bigui::NAV_SCROLL.with(|n| n.set(self.nav_until.is_some_and(|t| Instant::now() < t)));
+        if self.big { self.big_picture(ctx); } else { self.detail(ctx); self.grid(ctx); }
+        self.bp_moved = false;
         self.add_modal(ctx);
         self.editor_modal(ctx);
         self.settings_modal(ctx);
+        self.focus_ring(ctx);
+        self.hide_cursor(ctx);
+        self.kwin_sync(ctx);
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) { self.dirty = false; self.cfg.save(); }
         // La durée de la partie en cours, affichée dans les stats, avance toute seule.
         if self.filter == Filter::Stats && self.stats.games.values().any(|r| r.open.is_some()) {
@@ -3413,11 +3761,17 @@ impl eframe::App for App {
         self.hook.ui(ctx);
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) { self.update.relaunch_if_needed(); }
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) { self.pad_input(ctx, raw); }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Le pointeur redevient visible partout en quittant.
+        if let Some(r) = self.cfg.kwin_restore.take() { kwincursor::show(&r); self.cfg.save(); }
+        self.update.relaunch_if_needed();
+    }
 }
 
 /// Captures d'écran de test : ne lance jamais de jeu et n'écrit rien dans Steam.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool }
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool, big: bool, bp_page: Option<String>, pad: VecDeque<Option<gamepad::Btn>>, pad_next: f32 }
 
 impl Default for TestHook {
     fn default() -> Self {
@@ -3427,7 +3781,10 @@ impl Default for TestHook {
         let (mut panel, mut lib, mut picker, mut top_clear, mut top) = (None, None, false, false, None);
         let (mut tab, mut zone, mut blur, mut top_blur, mut font) = (0, Zone::Lib, None, None, false);
         let mut rename = false;
+        let (mut big, mut bp_page) = (false, None);
         for part in spec.split(',') {
+            big |= part == "big";
+            if let Some(p) = part.strip_prefix("bp:") { bp_page = Some(p.to_string()); big = true; }
             if let Some(s) = part.strip_prefix("sel:") { select = Some(s.to_lowercase()); }
             editor |= part == "editor";
             add |= part == "add";
@@ -3451,11 +3808,21 @@ impl Default for TestHook {
             if let Some(t) = part.strip_prefix("theme:") { theme = Some(t.to_string()); }
             if let Some(s) = part.strip_prefix("size:") { size = s.parse().ok(); }
         }
-        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, rename, top_clear, top, panel, lib, hide, theme, size, back_game }
+        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, rename, top_clear, top, panel, lib, hide, theme, size, back_game, big, bp_page,
+            // MINIMALSTEAM_TEST_PAD=Down,Down,A,_,B : appuis de manette simulés, un toutes les 0,4 s (« _ » : attendre).
+            pad: std::env::var("MINIMALSTEAM_TEST_PAD").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(|s| serde_json::from_str(&format!("\"{s}\"")).ok()).collect(),
+            pad_next: std::env::var("MINIMALSTEAM_TEST_PAD_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(1.5) }
     }
 }
 
 impl TestHook {
+    /// Les appuis simulés dus maintenant (appui et relâchement dans la même image).
+    fn pad_events(&mut self) -> Vec<gamepad::Ev> {
+        if self.path.is_none() || self.pad.is_empty() || self.start.elapsed().as_secs_f32() < self.pad_next { return vec![]; }
+        self.pad_next += 0.4;
+        match self.pad.pop_front().flatten() { Some(btn) => vec![gamepad::Ev { btn, down: true }, gamepad::Ev { btn, down: false }], None => vec![] }
+    }
+
     fn ui(&mut self, ctx: &egui::Context) {
         let Some(path) = self.path.clone() else { return };
         if !self.requested && self.start.elapsed().as_secs_f32() >= self.delay {

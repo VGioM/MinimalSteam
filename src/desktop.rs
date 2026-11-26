@@ -117,6 +117,59 @@ fn keeps_target(desktop: &str) -> bool {
     exec_target(desktop).is_some_and(|p| p.exists() || on_removable_mount(&p))
 }
 
+// ------------------------------------------------------------ lancement à l'ouverture de session
+
+fn config_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+}
+
+/// `~/.config/autostart/<app_id>.desktop` : le bureau (KDE, GNOME…) lance ce qu'il vise à l'ouverture de session.
+fn autostart_file(base: &Path, app_id: &str) -> PathBuf { base.join("autostart").join(format!("{app_id}.desktop")) }
+
+/// Le petit script lancé à l'ouverture de session (rangé avec les réglages de l'app).
+fn autostart_script(base: &Path, app_dir: &str) -> PathBuf { base.join(app_dir).join("demarrage.sh") }
+
+/// Lancement à l'ouverture de session activé (entrée présente et pas désactivée).
+pub fn autostart_on(app_id: &str) -> bool { config_home().is_some_and(|b| autostart_on_in(&b, app_id)) }
+
+fn autostart_on_in(base: &Path, app_id: &str) -> bool {
+    Some(autostart_file(base, app_id)).and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|t| !t.lines().any(|l| l.trim() == "Hidden=true" || l.trim() == "X-GNOME-Autostart-enabled=false"))
+}
+
+/// Entre apostrophes pour sh.
+fn sh_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
+
+/// Script qui attend jusqu'à 60 s que l'AppImage soit là (un disque secondaire se monte parfois
+/// après l'ouverture de session), puis la lance.
+fn script_text(exe: &Path) -> String {
+    let q = sh_quote(&exe.to_string_lossy());
+    format!("#!/bin/sh\n# Écrit par MinimalSteam (Réglages > lancement au démarrage).\nfor i in $(seq 60); do\n  [ -x {q} ] && exec {q}\n  sleep 1\ndone\n")
+}
+
+/// Active ou coupe le lancement à l'ouverture de session, pour ce programme-ci.
+pub fn set_autostart(e: &Entry, app_dir: &str, on: bool) -> Result<(), String> {
+    let base = config_home().ok_or("Dossier de configuration introuvable.")?;
+    set_autostart_in(&base, e, app_dir, on)
+}
+
+fn set_autostart_in(base: &Path, e: &Entry, app_dir: &str, on: bool) -> Result<(), String> {
+    let (file, script) = (autostart_file(base, e.app_id), autostart_script(base, app_dir));
+    if !on {
+        for f in [&file, &script] { if f.exists() { std::fs::remove_file(f).map_err(|err| format!("Impossible de retirer {} : {err}", f.display()))?; } }
+        return Ok(());
+    }
+    let exe = std::env::var_os("APPIMAGE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()).ok_or("Programme introuvable.")?;
+    let err = |err: std::io::Error| format!("Impossible d'écrire le lancement au démarrage : {err}");
+    std::fs::create_dir_all(script.parent().unwrap()).map_err(err)?;
+    std::fs::write(&script, script_text(&exe)).map_err(err)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).map_err(err)?;
+    let s = script.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let text = format!("[Desktop Entry]\nType=Application\nName={}\nComment={}\nExec=\"{s}\"\nIcon={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n", e.name, e.comment, e.app_id);
+    std::fs::create_dir_all(file.parent().unwrap()).map_err(err)?;
+    std::fs::write(&file, text).map_err(err)
+}
+
 /// Retire le raccourci et l'icône d'un ancien nom de l'app.
 #[allow(dead_code)]
 pub fn remove_legacy(app_id: &str) {
@@ -132,6 +185,27 @@ pub fn remove_legacy(app_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autostart_script_quotes_paths() {
+        assert_eq!(sh_quote("/a b/c'd"), "'/a b/c'\\''d'");
+        let t = script_text(Path::new("/run/media/x/Mon Jeu.AppImage"));
+        assert!(t.contains("[ -x '/run/media/x/Mon Jeu.AppImage' ] && exec '/run/media/x/Mon Jeu.AppImage'"));
+    }
+
+    #[test]
+    fn autostart_round_trip() {
+        let dir = std::env::temp_dir().join(format!("ms-autostart-{}", std::process::id()));
+        let e = Entry { app_id: "minimalsteam-test", name: "MinimalSteam", comment: "x", categories: "Game;", icon_png: &[] };
+        assert!(!autostart_on_in(&dir, "minimalsteam-test"));
+        set_autostart_in(&dir, &e, "MinimalsteamTest", true).unwrap();
+        assert!(autostart_on_in(&dir, "minimalsteam-test"));
+        let entry = std::fs::read_to_string(dir.join("autostart/minimalsteam-test.desktop")).unwrap();
+        assert_eq!(exec_target(&entry), Some(dir.join("MinimalsteamTest/demarrage.sh")));
+        set_autostart_in(&dir, &e, "MinimalsteamTest", false).unwrap();
+        assert!(!autostart_on_in(&dir, "minimalsteam-test") && !dir.join("MinimalsteamTest/demarrage.sh").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_quoted_and_plain_exec() {

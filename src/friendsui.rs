@@ -196,6 +196,7 @@ impl App {
                     if ui.button(label).clicked() { self.show_hidden_friends = !self.show_hidden_friends; }
                 }
                 ui.add_space(20.0);
+                bigui::scroll_focus(ui);
             });
         });
         if open_key {
