@@ -489,8 +489,8 @@ enum Msg {
     Journal((Vec<direct::Run>, Vec<(u32, u64)>)),
     Friends(Result<(Vec<friends::Friend>, friends::Source), String>),
     Desc(String, Option<desc::Desc>),
-    DescSearch(Result<Vec<(u32, String)>, String>),
-    DescPicked(u32, Result<desc::Desc, String>),
+    DescSearch(Result<Vec<(desc::Source, String)>, String>),
+    DescPicked(Result<desc::Desc, String>),
     Queued(Vec<steam::NewGame>),
     QueueDone { applied: steam::Queue, result: Result<Option<String>, String> },
     /// Réglage de la carte graphique appliqué (ou erreur).
@@ -1192,19 +1192,27 @@ impl App {
                         match (d, self.descs.0.get_mut(&key)) {
                             // Rien de mieux trouvé : on garde le texte déjà là, sans rechercher encore.
                             (None, Some(old)) if !old.is_empty() => old.fr_checked = true,
-                            (d, _) => { self.descs.0.insert(key, d.unwrap_or_default()); }
+                            // Rien trouvé : noté comme cherché, pour ne pas recommencer à chaque fois.
+                            (d, _) => { self.descs.0.insert(key, d.unwrap_or(desc::Desc { fr_checked: true, ..Default::default() })); }
                         }
                         self.save_descs();
                     }
                 }
                 Msg::DescSearch(r) => if let Some(e) = self.desc_edit.as_mut() {
                     e.searching = false;
-                    match r { Ok(l) if l.is_empty() => e.error = Some("Aucun jeu trouvé sur le magasin Steam.".into()), Ok(l) => e.results = l, Err(err) => e.error = Some(err) }
+                    match r { Ok(l) if l.is_empty() => e.error = Some("Rien trouvé sur Wikipédia ni sur le magasin Steam.".into()), Ok(l) => e.results = l, Err(err) => e.error = Some(err) }
                 },
-                Msg::DescPicked(id, r) => if let Some(e) = self.desc_edit.as_mut() {
+                Msg::DescPicked(r) => if let Some(e) = self.desc_edit.as_mut() {
                     e.searching = false;
                     match r {
-                        Ok(d) => { e.text = d.short.clone(); e.picked = d.short; e.full = d.full; e.from = Some(id); }
+                        Ok(d) => {
+                            e.text = d.short.clone(); e.picked = d.short; e.full = d.full; e.from = d.from; e.wiki = d.wiki;
+                            // Big Picture : enregistré tout de suite, retour à la fiche du jeu.
+                            if e.direct {
+                                self.desc_save();
+                                if let bigui::Page::Desc(id) = self.bp.page { self.bp.page = bigui::Page::Game(id); }
+                            }
+                        }
                         Err(err) => e.error = Some(err),
                     }
                 },
@@ -1878,6 +1886,7 @@ impl App {
                 "game" => self.bp.page = bigui::Page::Game(id),
                 "menu" => self.bp.menu = Some((id, 0)),
                 "gpu" => self.bp.page = bigui::Page::Gpu(id),
+                "desc" => self.bp_do(ctx, id, bigui::Do::Desc),
                 "compat" => self.bp.page = bigui::Page::Compat(id),
                 "addtile" => { self.bp.add_tile = true; self.bp.follow = true; }
                 "browse" => { self.bp.add_tile = true; self.bp.follow = true; self.open_add(); }

@@ -7,10 +7,10 @@ use super::*;
 use controls::Action;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Page { Library, Game(u32), Gpu(u32), Compat(u32) }
+pub(crate) enum Page { Library, Game(u32), Gpu(u32), Compat(u32), Desc(u32) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Do { Play, Stop, Install, Favorite, Images, Gpu, Compat, ViaSteam, Cursor, Stats, Folder, Hide, Close }
+pub(crate) enum Do { Play, Stop, Install, Favorite, Images, Gpu, Compat, ViaSteam, Cursor, Stats, Desc, Folder, Hide, Close }
 
 pub(crate) struct Bp {
     pub page: Page,
@@ -19,6 +19,8 @@ pub(crate) struct Bp {
     /// Menu d'options ouvert par-dessus (jeu, élément choisi).
     pub menu: Option<(u32, usize)>,
     pub compat: usize,
+    /// Élément choisi dans la page « Description ».
+    pub desc: usize,
     /// Défilement de la bibliothèque (visé), et s'il doit suivre le jeu choisi.
     pub scroll: f32,
     pub follow: bool,
@@ -31,7 +33,7 @@ pub(crate) struct Bp {
 }
 
 impl Default for Bp {
-    fn default() -> Self { Bp { page: Page::Library, focus: 0, menu: None, compat: 0, scroll: 0.0, follow: true, zoom_before: 1.0, fullscreen: false, last_back: None, add_tile: false } }
+    fn default() -> Self { Bp { page: Page::Library, focus: 0, menu: None, compat: 0, desc: 0, scroll: 0.0, follow: true, zoom_before: 1.0, fullscreen: false, last_back: None, add_tile: false } }
 }
 
 /// Réglages du mode (Réglages > Big Picture).
@@ -251,12 +253,13 @@ impl App {
             v.push((Do::Cursor, format!("Souris pendant ce jeu : {}", if self.cursor_kept(g.id) { "toujours visible" } else { "cachée sans bouger" }), true));
         }
         if !g.pending { v.push((Do::Stats, "Statistiques".into(), true)); }
+        if !g.pending { v.push((Do::Desc, "Changer la description".into(), true)); }
         if g.folder.as_ref().is_some_and(|f| f.is_dir()) { v.push((Do::Folder, "Ouvrir le dossier du jeu".into(), true)); }
         if !g.pending { v.push((Do::Hide, if self.is_hidden(g.id) { "Ne plus cacher".into() } else { "Cacher ce jeu".into() }, true)); }
         v
     }
 
-    fn bp_do(&mut self, ctx: &egui::Context, id: u32, d: Do) {
+    pub(crate) fn bp_do(&mut self, ctx: &egui::Context, id: u32, d: Do) {
         let Some(g) = self.game(id).cloned() else { return };
         match d {
             Do::Play | Do::Install => { self.selected = Some(id); self.launch(id); }
@@ -273,6 +276,12 @@ impl App {
             Do::ViaSteam => self.menu_action(ctx, id, Menu::ViaSteam),
             Do::Cursor => self.toggle_cursor_kept(id),
             Do::Stats => { self.open_stats(id); self.bp.page = Page::Library; }
+            Do::Desc => {
+                self.desc_open(&g, true);
+                self.desc_search(ctx);
+                self.bp.desc = 0;
+                self.bp.page = Page::Desc(id);
+            }
             Do::Folder => self.menu_action(ctx, id, Menu::Folder),
             Do::Hide => {
                 self.toggle_hidden(id, &g.name);
@@ -383,13 +392,17 @@ impl App {
                     Action::Down => self.bp.focus = step_enabled(&acts, self.bp.focus, 1),
                     Action::Confirm => { let (d, _, on) = acts[self.bp.focus].clone(); if on { self.bp_do(ctx, id, d); } }
                     Action::Back => self.bp.page = Page::Library,
-                    Action::Options => self.bp.menu = Some((id, 0)),
+                    // Options : la fiche montre déjà les mêmes choix.
+                    Action::Options => {}
                     Action::Favorite => self.toggle_favorite(id),
-                    // LB / RB : jeu précédent ou suivant de l'onglet, comme sur une console.
-                    Action::PrevTab | Action::NextTab | Action::Left | Action::Right => {
+                    // LB / RB : onglet précédent ou suivant, comme dans la bibliothèque.
+                    Action::PrevTab => self.bp_tab(-1),
+                    Action::NextTab => self.bp_tab(1),
+                    // Gauche / droite : jeu précédent ou suivant de l'onglet.
+                    Action::Left | Action::Right => {
                         let v = self.visible();
                         if let Some(p) = v.iter().position(|i| self.games[*i].id == id) {
-                            let step = if matches!(a, Action::PrevTab | Action::Left) { -1 } else { 1 };
+                            let step = if a == Action::Left { -1 } else { 1 };
                             let n = (p as i32 + step).clamp(0, v.len() as i32 - 1) as usize;
                             let next = self.games[v[n]].id;
                             if next != id { self.selected = Some(next); self.bp.follow = true; self.open_page(next); }
@@ -415,6 +428,16 @@ impl App {
                 }
             }
             Page::Gpu(id) => if a == Action::Back { self.bp.page = Page::Game(id); },
+            Page::Desc(id) => {
+                let n = self.bp_desc_items().len();
+                match a {
+                    Action::Up => self.bp.desc = self.bp.desc.saturating_sub(1),
+                    Action::Down => self.bp.desc = (self.bp.desc + 1).min(n.saturating_sub(1)),
+                    Action::Confirm => self.bp_desc_choose(ctx, id),
+                    Action::Back => { self.desc_edit = None; self.bp.page = Page::Game(id); }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -429,7 +452,7 @@ impl App {
 
     pub(crate) fn big_picture(&mut self, ctx: &egui::Context) {
         // Le jeu montré a disparu (désinstallé, retiré) : retour à la bibliothèque.
-        if let Page::Game(id) | Page::Gpu(id) | Page::Compat(id) = self.bp.page {
+        if let Page::Game(id) | Page::Gpu(id) | Page::Compat(id) | Page::Desc(id) = self.bp.page {
             if self.game(id).is_none() { self.bp.page = Page::Library; }
         }
         if self.bp.menu.is_some_and(|(id, _)| self.game(id).is_none()) { self.bp.menu = None; }
@@ -445,6 +468,7 @@ impl App {
             Page::Game(id) => self.bp_game(ctx, id),
             Page::Gpu(id) => self.bp_gpu(ctx, id),
             Page::Compat(id) => self.bp_compat(ctx, id),
+            Page::Desc(id) => self.bp_desc(ctx, id),
         }
         if let Some((id, at)) = self.bp.menu { self.bp_menu(ctx, id, at); }
         // L'heure change à la minute.
@@ -456,7 +480,7 @@ impl App {
         let screen = ctx.screen_rect().expand(2.0);
         let painter = ctx.layer_painter(egui::LayerId::background());
         painter.rect_filled(screen, 0.0, Color32::from_rgb(10, 12, 16));
-        let page_game = matches!(self.bp.page, Page::Game(_) | Page::Gpu(_) | Page::Compat(_));
+        let page_game = matches!(self.bp.page, Page::Game(_) | Page::Gpu(_) | Page::Compat(_) | Page::Desc(_));
         let art = self.selected.and_then(|id| self.game(id)).and_then(|g| g.art(Kind::Hero).or(g.art(Kind::Wide)).or(g.art(Kind::Cover)).cloned());
         let tex = match art { Some(p) => self.tex.file(&p, if page_game { FULL } else { BLURRED }).cloned(), None => None };
         let tex = match tex { Some(t) => { self.bp.last_back = Some(t.clone()); Some(t) } None if art_loading(self) => self.bp.last_back.clone(), None => { self.bp.last_back = None; None } };
@@ -544,7 +568,8 @@ impl App {
                 Page::Library if stats => list.extend([(Action::Confirm, h(Action::Confirm), "Valider")]),
                 Page::Library if self.bp_on_add() => list.extend([(Action::Confirm, h(Action::Confirm), "Ajouter des jeux")]),
                 Page::Library => list.extend([(Action::Confirm, h(Action::Confirm), "Ouvrir"), (Action::Options, h(Action::Options), "Options"), (Action::Favorite, h(Action::Favorite), "Favori")]),
-                Page::Game(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Valider"), (Action::Options, h(Action::Options), "Options"), (Action::Back, h(Action::Back), "Retour")]),
+                Page::Game(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Valider"), (Action::Back, h(Action::Back), "Retour")]),
+                Page::Desc(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Choisir"), (Action::Back, h(Action::Back), "Retour")]),
                 Page::Compat(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Appliquer"), (Action::Back, h(Action::Back), "Retour")]),
                 Page::Gpu(_) => list.extend([(Action::Confirm, h(Action::Confirm), "Valider"), (Action::Back, h(Action::Back), "Retour")]),
             }
@@ -817,6 +842,58 @@ impl App {
             if self.busy.is_none() { self.menu_action(ctx, id, Menu::Compat(tool)); }
             self.bp.page = Page::Game(id);
         }
+    }
+
+    /// Les choix de la page « Description » : les fiches trouvées, puis le retour au texte automatique.
+    fn bp_desc_items(&self) -> Vec<(Option<desc::Source>, String)> {
+        let Some(e) = &self.desc_edit else { return vec![] };
+        let mut v: Vec<(Option<desc::Source>, String)> = e.results.iter().map(|(s, n)| (Some(s.clone()), s.label(n))).collect();
+        if self.descs.0.get(&e.key).is_some_and(|d| d.custom) { v.push((None, "Revenir à la description trouvée automatiquement".into())); }
+        v
+    }
+
+    fn bp_desc_choose(&mut self, ctx: &egui::Context, id: u32) {
+        if self.desc_edit.as_ref().is_none_or(|e| e.searching) { return; }
+        let items = self.bp_desc_items();
+        let Some((src, _)) = items.get(self.bp.desc).cloned() else { return };
+        match src {
+            Some(s) => self.desc_pick(ctx, s),
+            None => {
+                let key = self.desc_edit.as_ref().map(|e| e.key.clone()).unwrap_or_default();
+                self.desc_reset(&key);
+                self.bp.page = Page::Game(id);
+            }
+        }
+    }
+
+    fn bp_desc(&mut self, ctx: &egui::Context, id: u32) {
+        let Some(g) = self.game(id).cloned() else { return };
+        // Plus rien en cours (fiche quittée autrement) : retour au jeu.
+        if self.desc_edit.is_none() { self.bp.page = Page::Game(id); return; }
+        let items = self.bp_desc_items();
+        self.bp.desc = self.bp.desc.min(items.len().saturating_sub(1));
+        let (searching, error, query) = self.desc_edit.as_ref().map(|e| (e.searching, e.error.clone(), e.query.clone())).unwrap_or_default();
+        let mut pick = None;
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin::symmetric(64, 30))).show(ctx, |ui| {
+            let w = ui.available_width().min(900.0);
+            ui.label(RichText::new(format!("Description — {}", g.name)).size(30.0).strong().color(Color32::WHITE));
+            let note = if searching && items.is_empty() { format!("Recherche de « {query} »…") } else if searching { "Chargement de la fiche…".to_string() } else { "Wikipédia couvre tous les jeux (consoles comprises), le magasin Steam seulement ceux sur PC.".to_string() };
+            ui.label(RichText::new(note).size(16.0).color(pal().muted));
+            if let Some(err) = &error { ui.label(RichText::new(err).size(16.0).color(GOLD)); }
+            ui.add_space(18.0);
+            pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false), "bp-desc", PadTarget::Page).show(ui, |ui| {
+                egui::Frame::new().inner_margin(Margin::same(FOCUS_ROOM as i8)).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                    for (i, (_, l)) in items.iter().enumerate() {
+                        let resp = big_button(ui, egui::Id::new(("bp-desc", i)), l, egui::vec2(w - 2.0 * FOCUS_ROOM, 52.0), self.bp.desc == i, !searching, false, false);
+                        if self.bp.desc == i && self.bp_moved { ui.scroll_to_rect(resp.rect.expand(FOCUS_ROOM), None); }
+                        if resp.hovered() && moved(ui) { self.bp.desc = i; }
+                        if resp.clicked() { self.bp.desc = i; pick = Some(i); }
+                    }
+                });
+            });
+        });
+        if pick.is_some() { self.bp_desc_choose(ctx, id); }
     }
 
     fn bp_gpu(&mut self, ctx: &egui::Context, id: u32) {

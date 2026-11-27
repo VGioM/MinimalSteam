@@ -131,23 +131,66 @@ fn norm(s: &str) -> String { s.to_lowercase().chars().filter(|c| c.is_alphanumer
 
 fn words(s: &str) -> Vec<String> { s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(String::from).collect() }
 
+fn wiki_get(url: String) -> Option<serde_json::Value> { agent().get(&url).header("User-Agent", "MinimalSteam (lanceur de jeux)").call().ok()?.body_mut().read_json().ok() }
+
+/// Les titres d'articles de Wikipédia en français pour ce nom de jeu (toutes plateformes).
+pub fn wiki_search(name: &str) -> Option<Vec<String>> {
+    let v = wiki_get(format!("https://fr.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit=8&format=json", encode(&format!("{name} jeu vidéo"))))?;
+    Some(v.get("query")?.get("search")?.as_array()?.iter().filter_map(|r| r.get("title")?.as_str().map(String::from)).collect())
+}
+
+/// Le résumé d'un article de Wikipédia en français.
+pub fn wiki_page(title: &str) -> Result<Desc, String> {
+    let v = wiki_get(format!("https://fr.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles={}&format=json", encode(title))).ok_or("Wikipédia ne répond pas.")?;
+    let text = v.get("query").and_then(|q| q.get("pages")).and_then(|p| p.as_object()).and_then(|p| p.values().next()).and_then(|p| p.get("extract")).and_then(|e| e.as_str()).unwrap_or_default().trim().to_string();
+    if text.is_empty() { return Err("Cet article n'a pas de résumé.".into()); }
+    let full = text.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n\n");
+    Ok(Desc { short: first_para(&full), full, from: None, custom: false, wiki: Some(title.to_string()), fr_checked: true })
+}
+
 /// Le résumé de l'article Wikipédia en français du jeu, si un article porte bien son nom.
 pub fn wikipedia(name: &str) -> Option<Desc> {
-    let get = |url: String| -> Option<serde_json::Value> { agent().get(&url).header("User-Agent", "MinimalSteam (lanceur de jeux)").call().ok()?.body_mut().read_json().ok() };
-    let v = get(format!("https://fr.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit=8&format=json", encode(&format!("{name} jeu vidéo"))))?;
-    let titles: Vec<String> = v.get("query")?.get("search")?.as_array()?.iter().filter_map(|r| r.get("title")?.as_str().map(String::from)).collect();
+    let titles = wiki_search(name)?;
     // Le titre doit être le nom du jeu (à la ponctuation près), ou contenir tous ses mots sans en ajouter beaucoup.
     let want = words(name);
     let title = titles.iter().find(|t| norm(t) == norm(name)).or_else(|| titles.iter().find(|t| {
         let tw = words(t);
         want.iter().all(|w| tw.contains(w)) && tw.len() <= want.len() + 2
     }))?;
-    let v = get(format!("https://fr.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&redirects=1&titles={}&format=json", encode(title)))?;
-    let text = v.get("query")?.get("pages")?.as_object()?.values().next()?.get("extract")?.as_str()?.trim().to_string();
+    let d = wiki_page(title).ok()?;
     // Un article de jeu vidéo, pas une page d'homonymie ou un film du même nom.
-    if text.len() < 80 || !text.to_lowercase().contains("jeu") { return None; }
-    let full = text.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n\n");
-    Some(Desc { short: first_para(&full), full, from: None, custom: false, wiki: Some(title.clone()), fr_checked: true })
+    if d.full.len() < 80 || !d.full.to_lowercase().contains("jeu") { return None; }
+    Some(d)
+}
+
+/// D'où prendre une description choisie à la main.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Source { Steam(u32), Wiki(String) }
+
+impl Source {
+    pub fn label(&self, name: &str) -> String {
+        match self { Source::Steam(_) => format!("Steam : {name}"), Source::Wiki(_) => format!("Wikipédia : {name}") }
+    }
+}
+
+/// Cherche des fiches pour un nom : articles de Wikipédia en français (tous les jeux, consoles
+/// comprises), puis jeux du magasin Steam (PC).
+pub fn candidates(term: &str) -> Result<Vec<(Source, String)>, String> {
+    let wiki = wiki_search(term);
+    let steam = search(term);
+    let mut out: Vec<(Source, String)> = wiki.clone().unwrap_or_default().into_iter().map(|t| (Source::Wiki(t.clone()), t)).collect();
+    if let Ok(l) = &steam { out.extend(l.iter().take(8).map(|(id, n)| (Source::Steam(*id), n.clone()))); }
+    // Ce qui porte exactement le nom du jeu d'abord.
+    out.sort_by_key(|(_, n)| norm(n) != norm(term));
+    match (wiki, steam) {
+        (None, Err(e)) => Err(format!("Wikipédia ne répond pas. {e}")),
+        _ => Ok(out),
+    }
+}
+
+/// Le texte d'une fiche choisie.
+pub fn fetch(src: &Source) -> Result<Desc, String> {
+    match src { Source::Steam(id) => store(*id), Source::Wiki(t) => wiki_page(t) }
 }
 
 /// Trouve tout seul la description d'un jeu. `steam` : l'id Steam s'il en a un.
@@ -201,6 +244,15 @@ mod tests {
         let d = wikipedia("STAR WARS Jedi Knight: Jedi Academy").expect("article");
         assert!(d.full.contains("Raven Software"), "{}", d.full);
         assert!(d.french());
+    }
+
+    #[test]
+    #[ignore]
+    fn console_game_found() {
+        let d = find(Path::new("/nonexistent"), "0", None, "Fable II").expect("Fable II");
+        assert_eq!(d.wiki.as_deref(), Some("Fable II"));
+        let l = candidates("Fable II").expect("liste");
+        assert!(l.iter().any(|(s, _)| *s == Source::Wiki("Fable II".into())));
     }
 
     #[test]
