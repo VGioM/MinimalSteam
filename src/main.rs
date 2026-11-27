@@ -2644,7 +2644,7 @@ impl App {
                     info(ui, "Emplacement", &g.disk);
                 });
                 ui.add_space(8.0);
-                self.desc_block(ui, &g);
+                self.desc_block(ui, &g, false);
                 ui.add_space(8.0);
                 if g.installed && !g.local {
                 let mut pick = chosen.clone();

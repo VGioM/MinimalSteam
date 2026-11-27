@@ -26,7 +26,8 @@ impl App {
         self.spawn(ctx, move || Msg::DescSearch(desc::search(&term)));
     }
 
-    pub(crate) fn desc_block(&mut self, ui: &mut egui::Ui, g: &Game) {
+    /// `whole` : texte entier d'office, sans « Lire la suite » (Big Picture : la page défile au stick).
+    pub(crate) fn desc_block(&mut self, ui: &mut egui::Ui, g: &Game, whole: bool) {
         let Some(key) = self.acc().map(|a| gkey(&a.id, g.id)) else { return };
         let ctx = ui.ctx().clone();
         // Résumé anglais au-dessus d'un texte français (déjà en cache) : corrigé sur place.
@@ -70,10 +71,10 @@ impl App {
                     if d.as_ref().is_some_and(|d| d.custom) { reset = ui.button("Rétablir").on_hover_text("Revenir à la description trouvée automatiquement").clicked(); }
                 });
             } else if let Some(d) = d.as_ref().filter(|d| !d.is_empty()) {
-                let more = self.desc_more && !d.full.is_empty();
+                let more = (whole || self.desc_more) && !d.full.is_empty();
                 let text = if more { &d.full } else if d.short.is_empty() { &d.full } else { &d.short };
                 ui.add(egui::Label::new(RichText::new(text).size(13.5)).wrap());
-                if !d.full.is_empty() && !d.short.is_empty() && d.full.trim() != d.short.trim() {
+                if !whole && !d.full.is_empty() && !d.short.is_empty() && d.full.trim() != d.short.trim() {
                     if ui.add(egui::Button::new(RichText::new(if more { "Réduire" } else { "Lire la suite" }).size(12.5).color(pal().accent)).frame(false)).clicked() { self.desc_more = !self.desc_more; }
                 }
                 if let Some(t) = &d.wiki {

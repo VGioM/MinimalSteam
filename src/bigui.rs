@@ -750,7 +750,7 @@ impl App {
                                 ui.style_mut().override_text_style = None;
                                 self.bp_infos(ui, &g);
                                 ui.add_space(8.0);
-                                self.desc_block(ui, &g);
+                                self.desc_block(ui, &g, true);
                             });
                         });
                     }
@@ -760,7 +760,7 @@ impl App {
                         ui.set_width(ui.available_width());
                         self.bp_infos(ui, &g);
                         ui.add_space(8.0);
-                        self.desc_block(ui, &g);
+                        self.desc_block(ui, &g, true);
                     });
                 }
               });
