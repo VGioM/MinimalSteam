@@ -109,7 +109,7 @@ impl App {
             on.sort_by_key(|f| if f.state == 1 || f.state >= 5 { 0 } else { 1 });
             let mut off: Vec<&Friend> = picked.iter().copied().filter(|f| !f.online()).collect();
             off.sort_by_key(|f| std::cmp::Reverse(f.last_off));
-            egui::ScrollArea::vertical().id_salt("friends").auto_shrink(false).show(ui, |ui| {
+            bigui::pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false), "friends", bigui::PadTarget::Page).show(ui, |ui| {
                 if picked.is_empty() {
                     ui.add_space(20.0);
                     ui.label(RichText::new(if fav_only { "Aucun favori : clique sur l'étoile d'un ami pour l'ajouter." } else if !q.is_empty() { "Aucun ami ne correspond." } else { "Aucun ami à afficher." }).color(pal().muted));

@@ -511,7 +511,7 @@ impl App {
                 });
                 ui.add_space(8.0);
                 let h = ui.available_height();
-                egui::ScrollArea::vertical().id_salt(("stats-page", self.stats_pick)).auto_shrink(false).max_height(h).show(ui, |ui| {
+                bigui::pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false).max_height(h), ("stats-page", self.stats_pick), bigui::PadTarget::Page).show(ui, |ui| {
                     ui.set_width((ui.available_width() - 8.0).max(280.0));
                     match self.stats_pick {
                         None => self.overview(ui, &list, &mut pick),
@@ -543,7 +543,7 @@ impl App {
                 });
                 ui.add_space(14.0);
                 ui.vertical(|ui| {
-                    egui::ScrollArea::vertical().id_salt(("stats-page", self.stats_pick)).auto_shrink(false).max_height(h).show(ui, |ui| {
+                    bigui::pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false).max_height(h), ("stats-page", self.stats_pick), bigui::PadTarget::Page).show(ui, |ui| {
                         ui.set_width((ui.available_width() - 8.0).max(300.0));
                         match self.stats_pick {
                             None => self.overview(ui, &list, &mut pick),

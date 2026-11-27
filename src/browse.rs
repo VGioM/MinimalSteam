@@ -211,7 +211,7 @@ impl Browse {
         ui.add_space(4.0);
         let width = ui.available_width();
         let mut back_to = None;
-        egui::ScrollArea::vertical().id_salt(("browse", &self.dir)).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+        crate::bigui::pad_area(ui, egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]), ("browse", &self.dir), crate::bigui::PadTarget::Window).show(ui, |ui| {
             ui.set_width(width - 14.0);
             if self.entries.is_empty() {
                 ui.label(RichText::new(if self.choose { "Pas de sous-dossier ici." } else { "Ni sous-dossier ni programme ici." }).color(pal().muted));

@@ -32,6 +32,16 @@ pub struct Ev { pub btn: Btn, pub down: bool }
 /// Les manettes branchées (leur nom), pour les réglages.
 pub type Names = Arc<Mutex<Vec<String>>>;
 
+/// L'inclinaison verticale du stick droit (−1 en haut, 1 en bas ; un `f32` en bits), de la dernière
+/// manette qui l'a bougé : le défilement suit l'inclinaison, image par image.
+pub type Stick = Arc<std::sync::atomic::AtomicU32>;
+
+/// En deçà, le stick droit est au repos (jeu du ressort, usure).
+pub const STICK_DEAD: f32 = 0.18;
+
+pub fn stick_value(s: &Stick) -> f32 { f32::from_bits(s.load(std::sync::atomic::Ordering::Relaxed)) }
+fn set_stick(s: &Stick, v: f32) { s.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed) }
+
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
 const BTN_SOUTH: u16 = 304;
@@ -137,7 +147,7 @@ fn abs_range(f: &std::fs::File, code: u16) -> Option<(i32, i32)> {
     (r >= 0 && info[2] > info[1]).then_some((info[1], info[2]))
 }
 
-fn read_device(path: String, sys: std::path::PathBuf, active: Arc<Mutex<HashSet<String>>>, names: Names, tx: mpsc::Sender<Ev>, wake: impl Fn()) {
+fn read_device(path: String, sys: std::path::PathBuf, active: Arc<Mutex<HashSet<String>>>, names: Names, stick: Stick, tx: mpsc::Sender<Ev>, wake: impl Fn()) {
     let name = std::fs::read_to_string(sys.join("device/name")).unwrap_or_default().trim().to_string();
     let abs = bits(&std::fs::read_to_string(sys.join("device/capabilities/abs")).unwrap_or_default());
     if let Ok(mut f) = std::fs::File::open(&path) {
@@ -161,8 +171,16 @@ fn read_device(path: String, sys: std::path::PathBuf, active: Arc<Mutex<HashSet<
                 EV_KEY if value != 2 => key(code).map(|btn| vec![Ev { btn, down: value == 1 }]).unwrap_or_default(),
                 EV_ABS => match axes.get(&code) {
                     Some(a) => {
+                        let v = norm(a, value);
+                        if a.role == Role::StickY(true) {
+                            // Le stick droit quitte le repos : l'app se réveille et défile ensuite
+                            // d'elle-même à chaque image tant qu'il est incliné.
+                            let was = stick_value(&stick).abs() > STICK_DEAD;
+                            set_stick(&stick, v);
+                            if !was && v.abs() > STICK_DEAD { wake(); }
+                        }
                         let old = state.get(&code).copied().unwrap_or(0);
-                        let (new, out) = axis_change(a.role, old, norm(a, value));
+                        let (new, out) = axis_change(a.role, old, v);
                         state.insert(code, new);
                         out
                     }
@@ -178,6 +196,7 @@ fn read_device(path: String, sys: std::path::PathBuf, active: Arc<Mutex<HashSet<
             wake();
         }
         for btn in held { let _ = tx.send(Ev { btn, down: false }); }
+        if axes.values().any(|a| a.role == Role::StickY(true)) { set_stick(&stick, 0.0); }
         if let Ok(mut n) = names.lock() { if let Some(i) = n.iter().position(|x| *x == name) { n.remove(i); } }
     }
     if let Ok(mut a) = active.lock() { a.remove(&path); }
@@ -186,9 +205,11 @@ fn read_device(path: String, sys: std::path::PathBuf, active: Arc<Mutex<HashSet<
 
 /// `listen` : l'app est au premier plan. Sinon (un jeu tourne devant), les appuis attendent dans la
 /// file sans redessiner l'app à chaque mouvement de stick.
-pub fn start(ctx: egui::Context, listen: Arc<std::sync::atomic::AtomicBool>) -> (mpsc::Receiver<Ev>, Names) {
+pub fn start(ctx: egui::Context, listen: Arc<std::sync::atomic::AtomicBool>) -> (mpsc::Receiver<Ev>, Names, Stick) {
     let (tx, rx) = mpsc::channel();
     let names: Names = Arc::default();
+    let stick: Stick = Arc::new(std::sync::atomic::AtomicU32::new(0.0f32.to_bits()));
+    let stick_out = stick.clone();
     let active = Arc::new(Mutex::new(HashSet::new()));
     let out = names.clone();
     std::thread::spawn(move || loop {
@@ -205,13 +226,13 @@ pub fn start(ctx: egui::Context, listen: Arc<std::sync::atomic::AtomicBool>) -> 
                 // Pas les droits (rare : c'est logind qui les donne à la session) : on réessaiera.
                 if std::fs::File::open(&path).is_err() { continue; }
                 if let Ok(mut a) = active.lock() { a.insert(path.clone()); }
-                let (active, names, tx, ctx, listen) = (active.clone(), names.clone(), tx.clone(), ctx.clone(), listen.clone());
-                std::thread::spawn(move || read_device(path, sys, active, names, tx, move || if listen.load(std::sync::atomic::Ordering::Relaxed) { ctx.request_repaint() }));
+                let (active, names, stick, tx, ctx, listen) = (active.clone(), names.clone(), stick.clone(), tx.clone(), ctx.clone(), listen.clone());
+                std::thread::spawn(move || read_device(path, sys, active, names, stick, tx, move || if listen.load(std::sync::atomic::Ordering::Relaxed) { ctx.request_repaint() }));
             }
         }
         std::thread::sleep(Duration::from_secs(2));
     });
-    (rx, out)
+    (rx, out, stick_out)
 }
 
 #[cfg(test)]

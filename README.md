@@ -63,7 +63,7 @@ Pour jouer depuis le canapé comme sur une console : MinimalSteam passe en plein
 
 ### Manettes et commandes
 
-Toutes les manettes reconnues par Linux marchent, en USB ou en Bluetooth (Xbox, PlayStation, 8BitDo…), avec la croix, les deux sticks et les gâchettes. Une direction tenue se répète, et le stick droit fait défiler les pages. Dans **Réglages > Commandes**, chaque action a deux touches de manette et deux touches de clavier ou de souris (molette, boutons de côté) : clique sur une case, puis appuie sur la nouvelle touche. La manette marche aussi hors Big Picture.
+Toutes les manettes reconnues par Linux marchent, en USB ou en Bluetooth (Xbox, PlayStation, 8BitDo…), avec la croix, les deux sticks et les gâchettes. Une direction tenue se répète, et le stick droit fait défiler les pages, plus ou moins vite selon son inclinaison. Dans **Réglages > Commandes**, chaque action a deux touches de manette et deux touches de clavier ou de souris (molette, boutons de côté) : clique sur une case, puis appuie sur la nouvelle touche. La manette marche aussi hors Big Picture.
 
 ## Statistiques, amis et carte graphique
 

@@ -517,6 +517,8 @@ struct Capture { action: Action, pad: bool, slot: usize, frame: u64, at: Instant
 
 /// Temps laissé pour appuyer sur la nouvelle touche.
 const CAPTURE_FOR: Duration = Duration::from_secs(6);
+/// Défilement au stick droit poussé à fond, en points par seconde.
+const STICK_SPEED: f32 = 2200.0;
 
 const SETTINGS_TABS: [&str; 8] = ["Thème", "Fonds", "Affichage", "Compte", "Carte graphique", "Commandes", "Big Picture", "Dossiers de jeux"];
 
@@ -563,9 +565,18 @@ struct App {
     rx: mpsc::Receiver<Msg>,
     pad: mpsc::Receiver<gamepad::Ev>,
     pad_names: gamepad::Names,
+    /// Le stick droit en analogique (le défilement suit son inclinaison).
+    rs_stick: gamepad::Stick,
+    /// Le stick droit tenu en tout-ou-rien (−1 haut, 1 bas) : les appuis simulés des tests, qui
+    /// n'ont pas d'inclinaison analogique.
+    rs_held: i8,
+    /// L'image précédente du défilement au stick droit (pour avancer selon le temps écoulé).
+    rs_last: Option<Instant>,
     /// Directions tenues à la manette (répétition), actions de la manette pour cette image.
     rep: controls::Repeater,
     pad_acts: Vec<Action>,
+    /// Défilement du stick droit pour cette image, en points (positif : vers le haut, comme la molette).
+    pad_scroll: f32,
     /// Dernière commande venue de la manette (aides de touches à son nom), ou de la souris.
     last_pad: bool,
     mouse_nav: bool,
@@ -730,10 +741,10 @@ impl App {
         // Effet « Cacher le pointeur » resté chargé (arrêt brutal de l'app) : on remet KDE comme avant.
         if let Some(r) = cfg.kwin_restore.take().filter(|_| hook.path.is_none()) { kwincursor::show(&r); cfg.save(); }
         let pad_listen = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let (pad, pad_names) = gamepad::start(cc.egui_ctx.clone(), pad_listen.clone());
+        let (pad, pad_names, rs_stick) = gamepad::start(cc.egui_ctx.clone(), pad_listen.clone());
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
-            columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad, pad_names, rep: Default::default(), pad_acts: vec![], last_pad: false, mouse_nav: false, focus_since: None, nav_check: None, tab_fallback: None, nav_until: None, capture: None, key_seen: vec![], pad_keys: vec![], pad_listen, pointer_at: Instant::now(), cursor_pad: false, pointer_gone: false, kwin_want: None, kwin_busy: false, autostart: None, big: false, bp: Default::default(), folder_pick: None, folder_rename: None, bp_moved: false,
+            columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad, pad_names, rs_stick, rs_held: 0, rs_last: None, rep: Default::default(), pad_acts: vec![], pad_scroll: 0.0, last_pad: false, mouse_nav: false, focus_since: None, nav_check: None, tab_fallback: None, nav_until: None, capture: None, key_seen: vec![], pad_keys: vec![], pad_listen, pointer_at: Instant::now(), cursor_pad: false, pointer_gone: false, kwin_want: None, kwin_busy: false, autostart: None, big: false, bp: Default::default(), folder_pick: None, folder_rename: None, bp_moved: false,
             steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), gpu_cards: None, gpu_want: None, gpu_pending: None, gpu_busy: false, hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
             stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), hour_mode: 0, stats_slot: None, report_view: 0, ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false, stats_alive: stats::now(),
@@ -1556,10 +1567,16 @@ impl App {
         evs.extend(self.hook.pad_events());
         let mut btns = vec![];
         for e in evs {
+            match (e.btn, e.down) {
+                (gamepad::Btn::RsUp, true) => self.rs_held = -1,
+                (gamepad::Btn::RsDown, true) => self.rs_held = 1,
+                (gamepad::Btn::RsUp, false) if self.rs_held == -1 => self.rs_held = 0,
+                (gamepad::Btn::RsDown, false) if self.rs_held == 1 => self.rs_held = 0,
+                _ => {}
+            }
             if e.down { self.rep.press(e.btn, now); btns.push(e.btn); } else { self.rep.release(e.btn); }
         }
         btns.extend(self.rep.due(now));
-        if self.rep.active() { ctx.request_repaint_after(controls::REPEAT_EVERY / 2); }
         if raw.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. })) { self.mouse_nav = true; self.pointer_at = now; self.cursor_pad = false; }
         if raw.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. })) { self.mouse_nav = false; self.last_pad = false; }
         // Pointeur caché : il ne survole plus rien (pas de contour sur la jaquette restée dessous).
@@ -1583,6 +1600,7 @@ impl App {
         // Fenêtre en arrière-plan (un jeu, une autre app) : la manette n'est pas pour nous.
         if !raw.focused && !test { self.focus_since = None; self.rep.clear(); return; }
         let since = *self.focus_since.get_or_insert(now);
+        self.stick_scroll(ctx, now, since, test);
         if btns.is_empty() { return; }
         // Juste après un retour au premier plan, les appuis étaient encore pour le jeu.
         if now.duration_since(since) < Duration::from_millis(500) && !test { return; }
@@ -1599,17 +1617,6 @@ impl App {
         let nav = self.egui_nav();
         for b in btns {
             let acts = self.cfg.controls.of_btn(b);
-            // Stick droit libre : il fait défiler, comme une molette.
-            if acts.is_empty() && matches!(b, gamepad::Btn::RsUp | gamepad::Btn::RsDown) {
-                if raw.events.iter().all(|e| !matches!(e, egui::Event::PointerMoved(_))) && ctx.pointer_latest_pos().is_none() {
-                    // Sur le bord droit, au milieu : dans la zone qui défile, sans survoler un élément (infobulle).
-                    let r = ctx.screen_rect();
-                    raw.events.push(egui::Event::PointerMoved(egui::pos2(r.right() - 6.0, r.center().y)));
-                }
-                let dy = if b == gamepad::Btn::RsUp { 140.0 } else { -140.0 };
-                raw.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), modifiers: Default::default() });
-                continue;
-            }
             for a in acts {
                 // Les touches qui font la même chose (celles de l'action, et la flèche ou Entrée d'egui).
                 let mut same: Vec<egui::Key> = self.cfg.controls.keys(a).iter().flatten().filter_map(|k| k.as_key()).collect();
@@ -1633,6 +1640,35 @@ impl App {
             }
         }
         ctx.request_repaint();
+    }
+
+    /// Stick droit libre (sans action) : il fait défiler en continu, plus vite quand on l'incline plus,
+    /// d'un pas calculé à chaque image selon le temps écoulé (des pas fixes répétés saccadaient).
+    fn stick_scroll(&mut self, ctx: &egui::Context, now: Instant, since: Instant, test: bool) {
+        let analog = gamepad::stick_value(&self.rs_stick);
+        let v = if analog.abs() > gamepad::STICK_DEAD { analog.signum() * (analog.abs() - gamepad::STICK_DEAD) / (1.0 - gamepad::STICK_DEAD) } else { self.rs_held as f32 };
+        let bound = |b| !self.cfg.controls.of_btn(b).is_empty();
+        let free = v != 0.0 && !bound(if v > 0.0 { gamepad::Btn::RsDown } else { gamepad::Btn::RsUp })
+            && self.capture.is_none()
+            && (test || now.duration_since(since) >= Duration::from_millis(500))
+            && (self.big || self.running.is_empty() || self.egui_nav());
+        if !free { self.rs_last = None; return; }
+        // Première image : un pas d'image normal ; après une longue image (chargement), pas de bond.
+        let dt = self.rs_last.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32().min(0.05));
+        self.rs_last = Some(now);
+        // Doux au début de la course, rapide à fond.
+        self.pad_scroll -= v.signum() * v * v * STICK_SPEED * dt;
+        self.last_pad = true;
+        self.mouse_nav = false;
+        self.cursor_pad = true;
+        ctx.request_repaint();
+    }
+
+    /// Qui reçoit le défilement du stick droit : une fenêtre ouverte passe avant la page derrière.
+    fn pad_target(&self) -> bigui::PadTarget {
+        if self.settings || self.editor.is_some() || self.add.is_some() || self.update.dialog_open() || (self.big && self.bp.menu.is_some()) { bigui::PadTarget::Window }
+        else if matches!(self.filter, Filter::Stats | Filter::Friends) || (self.big && self.bp.page != bigui::Page::Library) { bigui::PadTarget::Page }
+        else { bigui::PadTarget::Library }
     }
 
     fn bind_pad(&mut self, a: Action, slot: usize, b: Option<gamepad::Btn>) {
@@ -2151,6 +2187,7 @@ impl App {
         // La molette sur le haut fait défiler les jeux, sauf si une fenêtre ou un menu est ouvert.
         let free = self.add.is_none() && self.editor.is_none() && !self.settings && !ctx.memory(|m| m.any_popup_open());
         let wheel = if over_top && free { ctx.input(|i| i.smooth_scroll_delta.y) } else { 0.0 };
+        let pad_scroll = std::mem::take(&mut self.pad_scroll);
         let quality = if cover > 240.0 { 720 } else { 420 };
         let list = self.cfg.list_view;
         egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(Margin { left: 22, right: 10, top: if clear { 0 } else { 18 }, bottom: 0 })).show(ctx, |ui| {
@@ -2185,7 +2222,7 @@ impl App {
                 return;
             }
             let scroll_to = std::mem::take(&mut self.scroll_to);
-            egui::ScrollArea::vertical().auto_shrink(false).show_viewport(ui, |ui, vp| {
+            bigui::scroll_by(ui, egui::ScrollArea::vertical().auto_shrink(false), "library", pad_scroll).show_viewport(ui, |ui, vp| {
                 if wheel != 0.0 { ui.scroll_with_delta_animation(egui::vec2(0.0, wheel), egui::style::ScrollAnimation::none()); }
                 if list { self.list_rows(ui, vp, &visible, offset, over_bar, scroll_to, &mut acts); return; }
                 let icons = cover < ICON_BELOW;
@@ -2807,7 +2844,7 @@ impl App {
                 if !f.scanning { ui.label(RichText::new("Aucun jeu sélectionné pour l'instant.").color(pal().muted)); }
             } else {
                 let width = ui.available_width();
-                egui::ScrollArea::vertical().max_height((screen.height() - 400.0).clamp(150.0, 380.0)).auto_shrink([false, true]).show(ui, |ui| {
+                bigui::pad_area(ui, egui::ScrollArea::vertical().max_height((screen.height() - 400.0).clamp(150.0, 380.0)).auto_shrink([false, true]), "add-rows", bigui::PadTarget::Window).show(ui, |ui| {
                     ui.set_width(width - 14.0);
                     for (n, r) in f.rows.iter_mut().enumerate() {
                         ui.push_id(n, |ui| {
@@ -2954,7 +2991,7 @@ impl App {
             if let Some(e) = &ed.error { ui.colored_label(BAD, e); }
             ui.add_space(6.0);
             let height = (screen.height() - 300.0).clamp(280.0, 620.0);
-            egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
+            bigui::pad_area(ui, egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, false]), "editor-images", bigui::PadTarget::Window).show(ui, |ui| {
                 let portrait = ed.kind == Kind::Cover;
                 let square = ed.kind == Kind::Icon;
                 let target = if portrait { 150.0 } else if square { 110.0 } else { 280.0 };
@@ -3076,7 +3113,7 @@ impl App {
                 ui.add_space(14.0);
                 ui.vertical(|ui| {
                     let content = width - 170.0;
-                    egui::ScrollArea::vertical().id_salt("settings").max_height(height).min_scrolled_height(height).auto_shrink([false, false]).show(ui, |ui| {
+                    bigui::pad_area(ui, egui::ScrollArea::vertical().max_height(height).min_scrolled_height(height).auto_shrink([false, false]), "settings", bigui::PadTarget::Window).show(ui, |ui| {
                         ui.set_width(content - 14.0);
                         match self.settings_tab {
                             0 => {
@@ -3850,8 +3887,17 @@ impl eframe::App for App {
         self.tick_queue(ctx);
         self.queue_bar(ctx);
         bigui::NAV_SCROLL.with(|n| n.set(self.nav_until.is_some_and(|t| Instant::now() < t)));
+        // Le stick droit : la grille le prend dans `self.pad_scroll`, les autres zones par `bigui::pad_area`.
+        let target = self.pad_target();
+        let other = if target == bigui::PadTarget::Library { 0.0 } else { std::mem::take(&mut self.pad_scroll) };
+        bigui::PAD_SCROLL.with(|p| p.set((target, other)));
         if self.big { self.big_picture(ctx); } else { self.detail(ctx); self.grid(ctx); }
         self.bp_moved = false;
+        // Pas consommé (autre page) : ne s'accumule pas pour plus tard.
+        self.pad_scroll = 0.0;
+        // Croix et sticks tenus : la prochaine répétition. Demandé ici, pas dans raw_input_hook :
+        // egui efface au début de l'image les demandes de redessin à retardement faites avant.
+        if self.rep.active() { ctx.request_repaint_after(controls::REPEAT_EVERY / 2); }
         self.add_modal(ctx);
         self.editor_modal(ctx);
         self.settings_modal(ctx);
@@ -3886,7 +3932,7 @@ impl eframe::App for App {
 }
 
 /// Captures d'écran de test : ne lance jamais de jeu et n'écrit rien dans Steam.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool, big: bool, bp_page: Option<String>, pad: VecDeque<Option<gamepad::Btn>>, pad_next: f32 }
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool, big: bool, bp_page: Option<String>, pad: VecDeque<Option<(gamepad::Btn, Option<bool>)>>, pad_next: f32 }
 
 impl Default for TestHook {
     fn default() -> Self {
@@ -3925,7 +3971,11 @@ impl Default for TestHook {
         }
         TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, rename, top_clear, top, panel, lib, hide, theme, size, back_game, big, bp_page,
             // MINIMALSTEAM_TEST_PAD=Down,Down,A,_,B : appuis de manette simulés, un toutes les 0,4 s (« _ » : attendre).
-            pad: std::env::var("MINIMALSTEAM_TEST_PAD").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(|s| serde_json::from_str(&format!("\"{s}\"")).ok()).collect(),
+            // +LsDown appuie sans relâcher, -LsDown relâche (touche tenue).
+            pad: std::env::var("MINIMALSTEAM_TEST_PAD").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(|s| {
+                let (hold, name) = match s.as_bytes()[0] { b'+' => (Some(true), &s[1..]), b'-' => (Some(false), &s[1..]), _ => (None, s) };
+                serde_json::from_str(&format!("\"{name}\"")).ok().map(|b| (b, hold))
+            }).collect(),
             pad_next: std::env::var("MINIMALSTEAM_TEST_PAD_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(1.5) }
     }
 }
@@ -3935,7 +3985,11 @@ impl TestHook {
     fn pad_events(&mut self) -> Vec<gamepad::Ev> {
         if self.path.is_none() || self.pad.is_empty() || self.start.elapsed().as_secs_f32() < self.pad_next { return vec![]; }
         self.pad_next += 0.4;
-        match self.pad.pop_front().flatten() { Some(btn) => vec![gamepad::Ev { btn, down: true }, gamepad::Ev { btn, down: false }], None => vec![] }
+        match self.pad.pop_front().flatten() {
+            Some((btn, None)) => vec![gamepad::Ev { btn, down: true }, gamepad::Ev { btn, down: false }],
+            Some((btn, Some(down))) => vec![gamepad::Ev { btn, down }],
+            None => vec![],
+        }
     }
 
     fn ui(&mut self, ctx: &egui::Context) {

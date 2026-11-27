@@ -608,9 +608,13 @@ impl App {
             let cur = if on_add { Some(visible.len()) } else { sel };
             let over = ui.rect_contains_pointer(grid);
             if over { let d = ui.input(|i| i.smooth_scroll_delta.y); if d != 0.0 { self.bp.scroll -= d; self.bp.follow = false; } }
+            let pad = std::mem::take(&mut self.pad_scroll);
+            if pad != 0.0 { self.bp.scroll -= pad; self.bp.follow = false; }
             if let (true, Some(p)) = (self.bp.follow, cur) { self.bp.scroll = follow(self.bp.scroll, p / cols, step, tile_h, grid.height()); self.bp.follow = false; }
             self.bp.scroll = self.bp.scroll.clamp(0.0, max_scroll);
-            let shown = ui.ctx().animate_value_with_time(egui::Id::new("bp-scroll"), self.bp.scroll, 0.16);
+            // Au stick droit, la position avance déjà un peu à chaque image : une animation par-dessus
+            // la ferait traîner et à-coups. Elle reste pour la molette et le suivi de la sélection.
+            let shown = ui.ctx().animate_value_with_time(egui::Id::new("bp-scroll"), self.bp.scroll, if pad != 0.0 { 0.001 } else { 0.16 });
             // Marge pour que le halo des cases du bord ne soit pas coupé.
             let clip = egui::Rect::from_min_max(grid.min - egui::vec2(18.0, 14.0), grid.max + egui::vec2(18.0, 4.0));
             let p = ui.painter().with_clip_rect(clip);
@@ -701,7 +705,7 @@ impl App {
             // Deux colonnes si la place le permet, sinon les actions puis le texte, l'une sous l'autre.
             let two = area.width() >= 900.0;
             let left_w = if two { (area.width() * 0.42).clamp(380.0, 560.0) } else { area.width() };
-            egui::ScrollArea::vertical().id_salt(("bp-game", id)).auto_shrink(false).show(ui, |ui| {
+            pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false), ("bp-game", id), PadTarget::Page).show(ui, |ui| {
               egui::Frame::new().inner_margin(Margin::same(room)).show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| {
@@ -794,7 +798,7 @@ impl App {
             ui.label(RichText::new(format!("Compatibilité — {}", g.name)).size(30.0).strong().color(Color32::WHITE));
             ui.label(RichText::new(note).size(16.0).color(pal().muted));
             ui.add_space(18.0);
-            egui::ScrollArea::vertical().id_salt("bp-compat").auto_shrink(false).show(ui, |ui| {
+            pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false), "bp-compat", PadTarget::Page).show(ui, |ui| {
                 // Marge autour de la liste : le halo du premier et du dernier élément n'est pas coupé.
                 egui::Frame::new().inner_margin(Margin::same(FOCUS_ROOM as i8)).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 10.0;
@@ -824,7 +828,7 @@ impl App {
             let w = ui.available_width().min(760.0);
             ui.label(RichText::new(format!("Carte graphique — {}", g.name)).size(30.0).strong().color(Color32::WHITE));
             ui.add_space(14.0);
-            egui::ScrollArea::vertical().id_salt("bp-gpu").auto_shrink(false).show(ui, |ui| {
+            pad_area(ui, egui::ScrollArea::vertical().auto_shrink(false), "bp-gpu", PadTarget::Page).show(ui, |ui| {
                 egui::Frame::new().fill(Color32::from_black_alpha(170)).corner_radius(14).inner_margin(Margin::same(22)).show(ui, |ui| {
                     ui.set_width(w);
                     match &card {
@@ -880,7 +884,7 @@ impl App {
                 ui.set_width(w);
                 ui.horizontal(|ui| { ui.add_space(FOCUS_ROOM); ui.add(egui::Label::new(RichText::new(&g.name).size(22.0).strong().color(Color32::WHITE)).truncate()); });
                 ui.add_space(12.0 - FOCUS_ROOM);
-                egui::ScrollArea::vertical().max_height(screen.height() - 200.0).auto_shrink([false, true]).show(ui, |ui| {
+                pad_area(ui, egui::ScrollArea::vertical().max_height(screen.height() - 200.0).auto_shrink([false, true]), "bp-options", PadTarget::Window).show(ui, |ui| {
                     egui::Frame::new().inner_margin(Margin::same(FOCUS_ROOM as i8)).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
                         for (i, (d, label, on)) in acts.iter().enumerate() {
@@ -930,7 +934,33 @@ pub(crate) fn scroll_focus(ui: &egui::Ui) {
     }
 }
 
+/// Où va le défilement du stick droit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PadTarget { Library, Page, Window }
+
+/// Une zone qui défile : la position avance du défilement du stick droit quand il lui revient (son
+/// niveau, voir `PadTarget` ; la première zone de ce niveau dessinée le prend).
+pub(crate) fn pad_area(ui: &egui::Ui, area: egui::ScrollArea, salt: impl std::hash::Hash, level: PadTarget) -> egui::ScrollArea {
+    let d = PAD_SCROLL.with(|p| { let (t, d) = p.get(); if t == level && d != 0.0 { p.set((t, 0.0)); d } else { 0.0 } });
+    scroll_by(ui, area, salt, d)
+}
+
+/// Donne à `area` son identifiant (`salt`) et avance sa position de `d` points (positif : vers le
+/// haut, comme la molette). On écrit la position elle-même : `Ui::scroll_with_delta` irait à la
+/// première zone qui se termine, souvent une petite zone imbriquée (liste des polices…).
+pub(crate) fn scroll_by(ui: &egui::Ui, area: egui::ScrollArea, salt: impl std::hash::Hash, d: f32) -> egui::ScrollArea {
+    let salt = egui::Id::new(salt);
+    let area = area.id_salt(salt);
+    if d == 0.0 { return area; }
+    // Le même identifiant que celui qu'egui calcule pour la zone (`ScrollArea::id_salt` puis
+    // `make_persistent_id`). Au-delà du bas, egui ramène la position dans les bornes.
+    let id = ui.make_persistent_id(egui::Id::new(salt));
+    let y = egui::scroll_area::State::load(ui.ctx(), id).map_or(0.0, |s| s.offset.y);
+    area.vertical_scroll_offset((y - d).max(0.0))
+}
+
 thread_local! {
+    pub(crate) static PAD_SCROLL: Cell<(PadTarget, f32)> = const { Cell::new((PadTarget::Library, 0.0)) };
     /// Vrai juste après un déplacement du focus à la manette ou au clavier.
     pub(crate) static NAV_SCROLL: Cell<bool> = const { Cell::new(false) };
 }
@@ -938,6 +968,39 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le stick droit fait défiler la zone visée, même quand elle contient une petite zone imbriquée
+    /// (Réglages > Affichage et sa liste de polices), et pas cette dernière.
+    #[test]
+    fn pad_scroll_reaches_outer_area() {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() };
+        let frame = |level: PadTarget, d: f32| -> (f32, f32) {
+            let mut offsets = (f32::NAN, f32::NAN);
+            PAD_SCROLL.with(|p| p.set((level, d)));
+            let _ = ctx.run(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let out = pad_area(ui, egui::ScrollArea::vertical().max_height(300.0), "settings", PadTarget::Window).show(ui, |ui| {
+                        ui.add_space(100.0);
+                        let inner = egui::ScrollArea::vertical().id_salt("fonts").max_height(100.0).show(ui, |ui| { ui.add_space(500.0); });
+                        ui.add_space(1500.0);
+                        inner.state.offset.y
+                    });
+                    offsets = (out.state.offset.y, out.inner);
+                });
+            });
+            offsets
+        };
+        frame(PadTarget::Window, 0.0);
+        assert_eq!(frame(PadTarget::Window, 0.0), (0.0, 0.0));
+        // Vers le bas (négatif, comme la molette), deux images de suite : ça s'additionne.
+        assert_eq!(frame(PadTarget::Window, -150.0), (150.0, 0.0));
+        assert_eq!(frame(PadTarget::Window, -50.0), (200.0, 0.0));
+        // Destiné à un autre niveau (la page derrière la fenêtre) : rien ne bouge.
+        assert_eq!(frame(PadTarget::Page, -80.0), (200.0, 0.0));
+        // Vers le haut : jamais au-dessus du début.
+        assert_eq!(frame(PadTarget::Window, 400.0), (0.0, 0.0));
+    }
 
     #[test]
     fn grid_layout_fits() {
