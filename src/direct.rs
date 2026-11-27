@@ -45,6 +45,18 @@ pub fn is_windows(exe: &str) -> bool {
     matches!(Path::new(exe).extension().and_then(|e| e.to_str()).map(str::to_lowercase).as_deref(), Some("exe" | "bat" | "cmd" | "msi"))
 }
 
+/// Un programme Linux remis à la main (copié, retéléchargé) perd souvent son droit d'exécution :
+/// on le lui rend, comme le ferait « Rendre exécutable » dans le gestionnaire de fichiers.
+/// Les programmes Windows et les scripts .sh n'en ont pas besoin. `true` s'il a fallu le changer.
+pub fn make_runnable(exe: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Path::new(exe);
+    if is_windows(exe) || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sh")) { return false; }
+    let Ok(m) = std::fs::metadata(p) else { return false };
+    if !m.is_file() || m.permissions().mode() & 0o100 != 0 { return false; }
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(m.permissions().mode() | 0o100)).is_ok()
+}
+
 /// Le dossier de la version de Proton choisie dans Steam.
 fn proton_dir(a: &Account, tool: &str) -> Option<PathBuf> {
     if let Some((id, _)) = OFFICIAL.iter().find(|t| t.1 == tool) {
@@ -102,7 +114,8 @@ fn scoped(id: u32, options: &str, cmd: &[&str]) -> std::process::Command {
 /// `env` : variables ajoutées pour ce jeu (par exemple le pointeur invisible).
 pub fn launch(a: &Account, g: &Game, env: &[(String, String)]) -> Result<bool, String> {
     let exe = Path::new(&g.exe);
-    if !exe.is_file() { return Err(format!("Programme introuvable : {}", g.exe)); }
+    if !exe.is_file() { return Err(format!("Programme introuvable : {}. Indique où il est avec « Changer le programme… ».", g.exe)); }
+    make_runnable(&g.exe);
     let dir = g.folder.clone().filter(|d| d.is_dir()).or_else(|| exe.parent().map(Path::to_path_buf));
     let mut c = if is_windows(&g.exe) {
         if !steam::in_path("umu-run") { return Ok(false); }
@@ -139,6 +152,22 @@ pub fn launch(a: &Account, g: &Game, env: &[(String, String)]) -> Result<bool, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runnable_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("ms-run-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let (app, sh, win) = (d.join("Jeu.appimage"), d.join("jeu.sh"), d.join("jeu.exe"));
+        for f in [&app, &sh, &win] { std::fs::write(f, b"x").unwrap(); std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap(); }
+        assert!(make_runnable(app.to_str().unwrap()));
+        assert_eq!(std::fs::metadata(&app).unwrap().permissions().mode() & 0o777, 0o744);
+        assert!(!make_runnable(app.to_str().unwrap()));
+        assert!(!make_runnable(sh.to_str().unwrap()) && !make_runnable(win.to_str().unwrap()));
+        assert_eq!(std::fs::metadata(&win).unwrap().permissions().mode() & 0o777, 0o644);
+        assert!(!make_runnable(d.join("absent").to_str().unwrap()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 
     #[test]
     fn launch_options() {

@@ -30,8 +30,9 @@ Steam, c'est un magasin, une communauté, des actualités, des recommandations�
 - **Onglet Lancés** pour voir et arrêter tout ce qui tourne, Steam ou non.
 - **Jeux cachés** : cache un jeu depuis sa fiche, il ne s'affiche plus que dans l'onglet **Cachés**. Rien n'est changé dans Steam.
 - **Suppression d'un jeu non-Steam** de ta bibliothèque Steam, depuis sa fiche. Les fichiers du jeu restent sur le disque.
+- **Programme d'un jeu non-Steam modifiable** (fiche, clic droit ou Big Picture) : jeu déplacé, disque changé ou nouvelle version, il garde ses images, son temps de jeu, son préfixe Proton et ses statistiques. S'il est dans Steam, le nouveau chemin y est aussi enregistré. Un programme Linux qui a perdu son droit d'exécution (copié ou retéléchargé) le retrouve tout seul au lancement.
 - **Images modifiables** depuis [SteamGridDB](https://www.steamgriddb.com/) : couverture, bannière, arrière-plan, logo et icône.
-- **Menu clic droit** sur chaque jaquette : jouer, favori, renommer, images, dossier, Proton, collection, cacher, supprimer…
+- **Menu clic droit** sur chaque jaquette : jouer, favori, renommer, changer le programme, images, dossier, Proton, collection, cacher, supprimer…
 - **Apparence à ton goût** : thèmes, couleurs, fond, arrondi et taille des jaquettes, avec le rendu **Lumière** (arrondi, reflets et halos) ou **Legacy** (plat).
 - **Mises à jour intégrées** depuis les releases GitHub.
 
@@ -146,7 +147,7 @@ Les **jeux non-Steam** se lancent directement, avec la version de Proton, le pr�
 
 Si Steam a laissé un nom provisoire comme `appid_730` dans le manifeste d'un jeu, MinimalSteam affiche le vrai nom, lu dans le cache de Steam (`appcache/appinfo.vdf`).
 
-L'app ne modifie les fichiers de Steam que pour ajouter, renommer ou supprimer un jeu non-Steam, changer de Proton ou appliquer une icône :
+L'app ne modifie les fichiers de Steam que pour ajouter, renommer, changer de programme ou supprimer un jeu non-Steam, changer de Proton ou appliquer une icône :
 
 | Fichier | Rôle |
 |---|---|

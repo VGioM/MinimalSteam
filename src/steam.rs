@@ -541,6 +541,14 @@ fn set_compat(path: &Path, id: u32, tool: Option<&str>) -> Result<(), String> {
     write_atomic(path, new.as_bytes())
 }
 
+/// Retire l'outil de compatibilité de ce jeu s'il en a un. Sans config.vdf ni réglage, rien à faire.
+fn drop_compat(path: &Path, id: u32) -> Result<(), String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Ok(()) };
+    let Ok((_, open, close)) = mapping(&text) else { return Ok(()) };
+    if find_entry(&text, open, close, id).is_none() { return Ok(()); }
+    set_compat(path, id, None)
+}
+
 fn write_icons_to(path: &Path, icons: &[(u32, String)]) -> Result<(), String> {
     let data = std::fs::read(&path).map_err(|e| format!("Lecture de shortcuts.vdf impossible : {e}"))?;
     let (mut root, end) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
@@ -576,6 +584,30 @@ fn write_names_to(path: &Path, names: &[(u32, String)]) -> Result<(), String> {
         if name.is_empty() || entry.str("AppName").as_deref() == Some(name.as_str()) { continue; }
         entry.set_int("appid", id as i32);
         entry.set_str("AppName", &name);
+        done += 1;
+    }
+    if done == 0 { return Ok(()); }
+    backup(path)?;
+    write_atomic(path, &vdf::write(&root, end))
+}
+
+/// Change le programme de raccourcis (et leur dossier de départ). L'identifiant est écrit avant :
+/// un ancien raccourci le calcule d'après son programme et perdrait sinon images, temps et préfixe.
+fn write_exes_to(path: &Path, exes: &[(u32, String)]) -> Result<(), String> {
+    let data = std::fs::read(path).map_err(|e| format!("Lecture de shortcuts.vdf impossible : {e}"))?;
+    let (mut root, end) = vdf::parse_file(&data).map_err(|e| format!("shortcuts.vdf illisible : {e}"))?;
+    if vdf::write(&root, end) != data { return Err("shortcuts.vdf a un format inattendu : il n'a pas été modifié.".into()); }
+    let list = root.as_map_mut().and_then(|m| m.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(b"shortcuts"))).and_then(|(_, v)| v.as_map_mut()).ok_or("shortcuts.vdf ne contient pas de raccourcis.")?;
+    let mut done = 0;
+    for (_, entry) in list.iter_mut() {
+        let Some(id) = shortcut_id(entry) else { continue };
+        let Some((_, exe)) = exes.iter().find(|(i, _)| *i == id) else { continue };
+        let quoted = format!("\"{exe}\"");
+        if exe.is_empty() || entry.str("Exe").as_deref() == Some(quoted.as_str()) { continue; }
+        let dir = Path::new(exe).parent().map(|d| d.display().to_string()).unwrap_or_default();
+        entry.set_int("appid", id as i32);
+        entry.set_str("Exe", &quoted);
+        entry.set_str("StartDir", &format!("\"{dir}\""));
         done += 1;
     }
     if done == 0 { return Ok(()); }
@@ -829,13 +861,14 @@ fn with_steam_closed<T>(a: &Account, work: impl FnOnce() -> Result<T, String>) -
 pub struct Queue { pub games: Vec<NewGame>, pub compat: Vec<(u32, Option<String>)>, pub icons: Vec<(u32, String)>, pub names: Vec<(u32, String)>, /// Programmes hors Steam à y ajouter, et s'ils vont dans la collection.
     pub sync: Vec<(crate::direct::LocalGame, bool)>, /// Jeux à mettre dans la collection (true) ou à en retirer (false).
     pub collection: Vec<(u32, bool)>, /// Jeux non-Steam à retirer de Steam.
-    pub remove: Vec<u32> }
+    pub remove: Vec<u32>, /// Nouveau programme de jeux non-Steam.
+    pub exes: Vec<(u32, String)> }
 
 impl Queue {
-    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() && self.sync.is_empty() && self.collection.is_empty() && self.remove.is_empty() }
-    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() + self.sync.len() + self.collection.len() + self.remove.len() }
+    pub fn is_empty(&self) -> bool { self.games.is_empty() && self.compat.is_empty() && self.icons.is_empty() && self.names.is_empty() && self.sync.is_empty() && self.collection.is_empty() && self.remove.is_empty() && self.exes.is_empty() }
+    pub fn len(&self) -> usize { self.games.len() + self.compat.len() + self.icons.len() + self.names.len() + self.sync.len() + self.collection.len() + self.remove.len() + self.exes.len() }
     /// Une icône seule ne vaut pas un redémarrage de Steam.
-    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() || !self.sync.is_empty() || !self.collection.is_empty() || !self.remove.is_empty() }
+    pub fn needs_restart(&self) -> bool { !self.games.is_empty() || !self.compat.is_empty() || !self.names.is_empty() || !self.sync.is_empty() || !self.collection.is_empty() || !self.remove.is_empty() || !self.exes.is_empty() }
 }
 
 fn shortcut_ids(path: &Path) -> Result<HashSet<u32>, String> {
@@ -856,6 +889,13 @@ fn write_queue(shortcuts: &Path, config: &Path, q: &Queue) -> Result<Option<Stri
     for g in &q.games { if let Some(t) = g.tool.as_deref() { set_compat(config, new_id(&g.name, &g.exe), Some(t))?; } }
     for (id, tool) in &q.compat { set_compat(config, *id, tool.as_deref())?; }
     if !q.names.is_empty() && shortcuts.exists() { write_names_to(shortcuts, &q.names)?; }
+    if !q.exes.is_empty() && shortcuts.exists() {
+        write_exes_to(shortcuts, &q.exes)?;
+        // Un programme Linux lancé par Steam à travers Proton ne démarrerait pas.
+        for (id, exe) in &q.exes {
+            if !crate::direct::is_windows(exe) && !q.compat.iter().any(|(i, _)| i == id) { drop_compat(config, *id)?; }
+        }
+    }
     let present = shortcut_ids(shortcuts)?;
     let missing: Vec<(u32, NewGame)> = q.sync.iter().filter(|(l, _)| !present.contains(&l.id)).map(|(l, _)| (l.id, NewGame { name: l.name.clone(), exe: l.exe.clone(), options: l.options.clone(), tool: None, icon: l.icon.clone() })).collect();
     if !missing.is_empty() { insert_shortcuts(shortcuts, &missing)?; }
@@ -1143,6 +1183,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Nouveau programme : même identifiant (même ancien sans `appid`), nouveau dossier de départ.
+    #[test]
+    fn new_exe_keeps_id() {
+        use vdf::Value::{Map, Str};
+        let d = temp("new-exe");
+        let p = d.join("shortcuts.vdf");
+        let entry = Map(vec![(b"AppName".to_vec(), Str(b"Vieux".to_vec())), (b"Exe".to_vec(), Str(b"\"/j/v.exe\"".to_vec())), (b"StartDir".to_vec(), Str(b"\"/j\"".to_vec())), (b"LaunchOptions".to_vec(), Str(b"-w".to_vec()))]);
+        let root = Map(vec![(b"shortcuts".to_vec(), Map(vec![(b"0".to_vec(), entry)]))]);
+        std::fs::write(&p, vdf::write(&root, true)).unwrap();
+        let id = legacy_appid(b"\"/j/v.exe\"", b"Vieux");
+        let q = Queue { exes: vec![(id, "/autre disque/Jeu/v.exe".into())], ..Default::default() };
+        assert!(q.needs_restart());
+        write_queue(&p, &d.join("config.vdf"), &q).unwrap();
+        let once = std::fs::read(&p).unwrap();
+        write_queue(&p, &d.join("config.vdf"), &q).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), once);
+        let (v, _) = vdf::parse_file(&once).unwrap();
+        let e = v.get("shortcuts").unwrap().get("0").unwrap().clone();
+        assert_eq!(shortcut_id(&e), Some(id));
+        assert_eq!(e.str("Exe").as_deref(), Some("\"/autre disque/Jeu/v.exe\""));
+        assert_eq!(e.str("StartDir").as_deref(), Some("\"/autre disque/Jeu\""));
+        assert_eq!(e.str("LaunchOptions").as_deref(), Some("-w"));
+        // Devenu un programme Linux : Steam ne doit plus le lancer à travers Proton.
+        let c = d.join("config.vdf");
+        std::fs::write(&c, format!("\"CompatToolMapping\"\n{{\n\t\"{id}\"\n\t{{\n\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}}\n\t\"7\"\n\t{{\n\t\t\"name\"\t\t\"proton_9\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}}\n}}\n")).unwrap();
+        write_queue(&p, &c, &q).unwrap();
+        assert!(std::fs::read_to_string(&c).unwrap().contains(&id.to_string()), "programme Windows : Proton gardé");
+        let linux = Queue { exes: vec![(id, "/autre disque/Jeu/Jeu.AppImage".into())], ..Default::default() };
+        write_queue(&p, &c, &linux).unwrap();
+        let text = std::fs::read_to_string(&c).unwrap();
+        assert!(!text.contains(&id.to_string()) && text.contains("\"7\""), "{text}");
+        // Sans config.vdf : pas d'erreur.
+        let _ = std::fs::remove_file(&c);
+        write_queue(&p, &c, &linux).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// Un ancien raccourci sans `appid` garde lui aussi son identifiant.
     #[test]
     fn rename_pins_legacy_id() {
@@ -1210,7 +1287,7 @@ mod tests {
         std::fs::write(&c, "\"CompatToolMapping\"\n{\n\t\"10\"\n\t{\n\t\t\"name\"\t\t\"old\"\n\t\t\"config\"\t\t\"\"\n\t\t\"priority\"\t\t\"250\"\n\t}\n}\n").unwrap();
         let g = NewGame { name: "Jeu".into(), exe: "/j/jeu.exe".into(), options: String::new(), tool: Some("proton_11".into()), icon: String::new() };
         let id = new_id(&g.name, &g.exe);
-        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![], sync: vec![], collection: vec![], remove: vec![] };
+        let q = Queue { games: vec![g], compat: vec![(10, None)], icons: vec![(id, "/i.png".into())], names: vec![], sync: vec![], collection: vec![], remove: vec![], exes: vec![] };
         write_queue(&s, &c, &q).unwrap();
         write_queue(&s, &c, &q).unwrap();
         let (v, _) = vdf::parse_file(&std::fs::read(&s).unwrap()).unwrap();

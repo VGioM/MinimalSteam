@@ -223,6 +223,8 @@ struct Config {
     hidden: HashSet<String>,
     /// Jeux non-Steam à retirer de Steam.
     pending_remove: HashMap<String, Vec<u32>>,
+    /// Nouveau programme de jeux non-Steam, écrit dans Steam quand il peut redémarrer.
+    pending_exes: HashMap<String, Vec<(u32, String)>>,
     /// Les onglets dans l'ordre choisi, et s'ils sont affichés.
     tabs: Vec<(Filter, bool)>,
     /// Options d'affichage dans la barre : complètes, réduites à un bouton, ou retirées.
@@ -331,6 +333,7 @@ fn game_menu(ui: &mut egui::Ui, g: &Game, st: &MenuState, tools: &[(String, Stri
     item(ui, &mut out, true, if st.favorite { "★  Retirer des favoris" } else { "☆  Ajouter aux favoris" }, Menu::Favorite);
     ui.separator();
     if !g.steam { item(ui, &mut out, !g.pending, "Renommer…", Menu::Rename); }
+    if !g.steam { item(ui, &mut out, !g.pending && !st.running, "Changer le programme…", Menu::Exe); }
     if g.installed { item(ui, &mut out, true, "Modifier les images…", Menu::Images); }
     item(ui, &mut out, st.folder, "Ouvrir le dossier du jeu", Menu::Folder);
     if g.installed && !g.local && !g.pending {
@@ -476,6 +479,8 @@ enum Msg {
     List { game: u64, kind: Kind, page: u32, result: Result<Vec<Img>, String> },
     Applied { id: u32, kind: Kind, result: Result<PathBuf, String> },
     Found(Vec<scan::Found>),
+    /// Le nouveau programme d'un jeu, choisi dans la fenêtre du système.
+    Exe(u32, PathBuf),
     Fonts(Vec<String>),
     FontReady(String, Option<Vec<u8>>),
     BackImage(PathBuf, Zone),
@@ -544,7 +549,7 @@ enum Act { Select(u32), Launch(u32), Menu(u32, Menu) }
 
 /// Les choix du menu clic droit d'un jeu.
 #[derive(Clone, Debug, PartialEq)]
-enum Menu { Play, Details, Stats, Stop, Favorite, Rename, Images, Folder, Compat(Option<String>), ViaSteam, Collection, Sync, Hide, CancelAdd, RemoveLocal, Remove }
+enum Menu { Play, Details, Stats, Stop, Favorite, Rename, Images, Folder, Compat(Option<String>), ViaSteam, Collection, Sync, Hide, CancelAdd, RemoveLocal, Remove, Exe }
 
 struct App {
     cfg: Config,
@@ -641,6 +646,8 @@ struct App {
     tools: Vec<(String, String)>,
     compat_edit: Option<(u32, Option<String>)>,
     rename: Option<(u32, String)>,
+    /// Choix du nouveau programme d'un jeu non-Steam.
+    exe_pick: Option<(u32, browse::Browse)>,
     rename_focus: bool,
     game_filter: [String; 3],
     settings_zone: Zone,
@@ -745,7 +752,7 @@ impl App {
         let mut app = App {
             cfg, accounts, account, watched, games: vec![], loaded: false, error: None, query: String::new(), filter: Filter::All, selected: None,
             columns: 1, scroll_to: false, focus_search: false, tex: Textures::new(&cc.egui_ctx), tx, rx, pad, pad_names, rs_stick, rs_held: 0, rs_last: None, rep: Default::default(), pad_acts: vec![], pad_scroll: 0.0, last_pad: false, mouse_nav: false, focus_since: None, nav_check: None, tab_fallback: None, nav_until: None, capture: None, key_seen: vec![], pad_keys: vec![], pad_listen, pointer_at: Instant::now(), cursor_pad: false, pointer_gone: false, kwin_want: None, kwin_busy: false, autostart: None, big: false, bp: Default::default(), folder_pick: None, folder_rename: None, bp_moved: false,
-            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), gpu_cards: None, gpu_want: None, gpu_pending: None, gpu_busy: false, hook,
+            steam_on, running, direct: HashSet::new(), sessions: HashMap::new(), steam_key_input, owned_busy: false, sync_off: HashSet::new(), in_collection: HashSet::new(), launched: HashMap::new(), stopping: HashMap::new(), stop_confirm: None, remove_confirm: None, busy: None, status: None, add: None, editor: None, settings: hook.settings, key_input, settings_tab: hook.tab, tab_drag: None, color_edit: None, dirty: false, tools: vec![], compat_edit: None, rename: None, exe_pick: None, rename_focus: false, game_filter: Default::default(), settings_zone: hook.zone, backdrops: Default::default(), fonts: None, font_filter: String::new(), font_applied: "\u{0}".into(), shown_blur, last_back: Default::default(), countdown: None, hold: false, update: SelfUpdate::new(), gpu_cards: None, gpu_want: None, gpu_pending: None, gpu_busy: false, hook,
             stats: if std::env::var_os("APP_SCREENSHOT").is_some() { stats::Store::default() } else { stats_dir().map(|d| stats::Store::load(&d)).unwrap_or_default() },
             stats_pick: None, achs: HashMap::new(), rarity: HashMap::new(), ach_done: true, show_hidden: false, stats_day: None, stats_month: 0, stats_year: 0, del_open: false, del_sel: Default::default(), del_confirm: None, report_period: statsui::Period::default(), hour_mode: 0, stats_slot: None, report_view: 0, ach_open: true, ach_all: false, ach_query: String::new(), merge_pick: None, stats_written: String::new(), stats_cached: None, stats_rev: 0, journal_asked: false, stats_alive: stats::now(),
             descs: config_dir("Minimalsteam").map(|d| desc::Store::load(&d)).unwrap_or_default(), desc_asked: HashSet::new(), friends: None, friends_busy: false, friends_at: None, show_hidden_friends: false, desc_more: false, desc_edit: None,
@@ -818,7 +825,7 @@ impl App {
         if !list.contains(&id) { list.push(id); }
         // Rien d'autre ne doit le remettre dans Steam ou dans la liste.
         self.cfg.local_games.retain(|l| l.id != id);
-        for m in [&mut self.cfg.pending_names, &mut self.cfg.pending_icons] { if let Some(l) = m.get_mut(&account) { l.retain(|(i, _)| *i != id); } }
+        for m in [&mut self.cfg.pending_names, &mut self.cfg.pending_icons, &mut self.cfg.pending_exes] { if let Some(l) = m.get_mut(&account) { l.retain(|(i, _)| *i != id); } }
         if let Some(l) = self.cfg.pending_compat.get_mut(&account) { l.retain(|(i, _)| *i != id); }
         if let Some(l) = self.cfg.pending_sync.get_mut(&account) { l.retain(|(i, _)| *i != id); }
         if let Some(l) = self.cfg.pending_collection.get_mut(&account) { l.retain(|(i, _)| *i != id); }
@@ -1113,6 +1120,7 @@ impl App {
                         Err(e) => self.set_status(e, true),
                     }
                 }
+                Msg::Exe(id, p) => self.set_exe(ctx, id, p),
                 Msg::Found(list) => { if let Some(f) = self.add.as_mut() { f.scanning = false; } self.add_rows(list); }
                 Msg::BackImage(p, panel) => {
                     let path = p.to_string_lossy().to_string();
@@ -1257,6 +1265,9 @@ impl App {
                                 if let Some(l) = self.cfg.pending_icons.get_mut(&id) { l.retain(|x| !applied.icons.contains(x)); if l.is_empty() { self.cfg.pending_icons.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_names.get_mut(&id) { l.retain(|x| !applied.names.contains(x)); if l.is_empty() { self.cfg.pending_names.remove(&id); } }
                                 if let Some(l) = self.cfg.pending_remove.get_mut(&id) { l.retain(|x| !applied.remove.contains(x)); if l.is_empty() { self.cfg.pending_remove.remove(&id); } }
+                                if let Some(l) = self.cfg.pending_exes.get_mut(&id) { l.retain(|x| !applied.exes.contains(x)); if l.is_empty() { self.cfg.pending_exes.remove(&id); } }
+                                // Un programme synchronisé garde ce chemin s'il est retiré de Steam plus tard.
+                                for (i, exe) in &applied.exes { if let Some(l) = self.cfg.local_games.iter_mut().find(|l| l.id == *i) { l.exe = exe.clone(); } }
                                 self.cfg.save();
                             }
                             match warning { Some(w) => self.set_status(w, true), None => self.set_status("Changements enregistrés dans Steam.", false) }
@@ -1319,6 +1330,7 @@ impl App {
             collection: self.cfg.pending_collection.get(id).cloned().unwrap_or_default(),
             sync: self.cfg.pending_sync.get(id).into_iter().flatten().filter_map(|(i, c)| Some((self.cfg.local_games.iter().find(|l| l.id == *i)?.clone(), *c))).collect(),
             remove: self.cfg.pending_remove.get(id).cloned().unwrap_or_default(),
+            exes: self.cfg.pending_exes.get(id).cloned().unwrap_or_default(),
         }
     }
 
@@ -1335,6 +1347,14 @@ impl App {
         }
         for (id, name) in &q.names {
             if let Some(g) = self.games.iter_mut().find(|g| g.id == *id) { g.name = name.clone(); }
+        }
+        for (id, exe) in &q.exes {
+            if let Some(g) = self.games.iter_mut().find(|g| g.id == *id) {
+                g.exe = exe.clone();
+                g.folder = Path::new(exe).parent().map(Path::to_path_buf);
+                // Programme Linux : Steam n'y mettra pas de Proton (voir steam::write_queue).
+                if !direct::is_windows(exe) && !q.compat.iter().any(|(i, _)| i == id) { g.compat = None; }
+            }
         }
         for n in &q.games {
             let id = steam::new_id(&n.name, &n.exe);
@@ -1391,6 +1411,95 @@ impl App {
         self.games.sort_by_key(|x| x.name.to_lowercase());
         if self.game_active() { self.set_status("Nouveau nom en attente : appliqué à la fermeture du jeu.", false); }
         self.reload(ctx);
+    }
+
+    /// Le programme du jeu a bougé (disque, dossier, nouvelle version) : même jeu, même identifiant,
+    /// donc mêmes images, temps de jeu, préfixe et statistiques. Tout de suite pour MinimalSteam ;
+    /// Steam le reçoit quand il peut redémarrer, comme un nouveau nom.
+    fn set_exe(&mut self, ctx: &egui::Context, id: u32, path: PathBuf) {
+        let Some(g) = self.game(id).cloned() else { return };
+        if g.steam || g.pending { return; }
+        let exe = path.display().to_string();
+        self.exe_pick = None;
+        if !path.is_file() { self.set_status(format!("Ce n'est pas un fichier : {exe}"), true); return; }
+        if exe == g.exe { self.set_status("C'est déjà le programme de ce jeu.", false); return; }
+        // Un jeu Windows doit être dans Steam (son préfixe, et SaveSteam y lit son nom).
+        if g.local && direct::is_windows(&exe) {
+            self.set_status("Un programme Windows passe par Steam : ajoute-le avec « Ajouter des jeux ».", true);
+            return;
+        }
+        let fixed = if direct::make_runnable(&exe) { " (rendu exécutable)" } else { "" };
+        if g.local {
+            if let Some(l) = self.cfg.local_games.iter_mut().find(|l| l.id == id) { l.exe = exe.clone(); }
+            self.cfg.save();
+            self.set_status(format!("Nouveau programme de {}{fixed} : {exe}", g.name), false);
+            self.reload(ctx);
+            return;
+        }
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        let list = self.cfg.pending_exes.entry(account).or_default();
+        list.retain(|(i, _)| *i != id);
+        list.push((id, exe.clone()));
+        self.cfg.save();
+        if let Some(x) = self.games.iter_mut().find(|x| x.id == id) { x.exe = exe.clone(); x.folder = path.parent().map(Path::to_path_buf); }
+        let when = if self.game_active() { "à la fermeture du jeu" } else if self.steam_on { "dans quelques secondes (redémarre Steam)" } else { "tout de suite" };
+        self.set_status(format!("Nouveau programme de {}{fixed} : enregistré dans Steam {when}.", g.name), false);
+        self.reload(ctx);
+    }
+
+    fn cancel_exe(&mut self, ctx: &egui::Context, id: u32) {
+        let Some(account) = self.acc().map(|a| a.id.clone()) else { return };
+        if let Some(l) = self.cfg.pending_exes.get_mut(&account) { l.retain(|(i, _)| *i != id); if l.is_empty() { self.cfg.pending_exes.remove(&account); } }
+        self.cfg.save();
+        self.set_status("Changement de programme annulé.", false);
+        self.reload(ctx);
+    }
+
+    /// Choisir le nouveau programme d'un jeu : l'explorateur de MinimalSteam (pilotable à la
+    /// manette), ouvert dans le dossier actuel du jeu s'il existe encore.
+    fn open_exe_pick(&mut self, id: u32) {
+        let Some(g) = self.game(id) else { return };
+        let mut b = browse::Browse::new(&self.game_folder_places(), true, false);
+        b.single = true;
+        let start = Path::new(&g.exe).ancestors().skip(1).find(|d| d.is_dir() && !d.as_os_str().is_empty()).map(Path::to_path_buf);
+        if let Some(d) = start { b.open(d); }
+        // Le focus va sur le programme actuel s'il est là.
+        b.came_from = Some(PathBuf::from(&g.exe));
+        self.selected = Some(id);
+        self.exe_pick = Some((id, b));
+    }
+
+    fn exe_modal(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.exe_pick.as_ref().map(|p| p.0) else { return };
+        let Some(g) = self.game(id).cloned() else { self.exe_pick = None; return };
+        let screen = ctx.screen_rect();
+        let (mut picked, mut close, mut system) = (None, false, false);
+        let modal = egui::Modal::new(egui::Id::new("exe-pick")).frame(modal_frame(ctx)).show(ctx, |ui| {
+            ui.set_width((screen.width() - 120.0).clamp(560.0, 760.0));
+            let Some((_, b)) = self.exe_pick.as_mut() else { return };
+            ui.heading(format!("Programme de {}", g.name));
+            let missing = !Path::new(&g.exe).is_file();
+            ui.label(RichText::new(if missing { format!("Introuvable : {}", g.exe) } else { format!("Actuel : {}", g.exe) }).size(13.0).color(if missing { BAD } else { pal().muted }));
+            ui.add_space(6.0);
+            match b.ui(ui, (screen.height() - 330.0).clamp(160.0, 520.0)) {
+                Some(browse::Pick::File(p)) => picked = Some(p),
+                Some(browse::Pick::Close) => close = true,
+                _ => {}
+            }
+            ui.add_space(6.0);
+            system = ui.button("Fenêtre du système…").on_hover_text("Choisir le programme avec la fenêtre de fichiers habituelle").clicked();
+        });
+        if modal.should_close() || close { self.exe_pick = None; }
+        if let Some(p) = picked { self.set_exe(ctx, id, p); }
+        if system {
+            let (tx, c) = (self.tx.clone(), ctx.clone());
+            let start = self.exe_pick.as_ref().map(|(_, b)| b.dir.clone());
+            std::thread::spawn(move || {
+                let mut d = rfd::FileDialog::new().set_title("Choisir le programme du jeu");
+                if let Some(s) = start { d = d.set_directory(s); }
+                if let Some(p) = d.pick_file() { let _ = tx.send(Msg::Exe(id, p)); c.request_repaint(); }
+            });
+        }
     }
 
     fn cancel_name(&mut self, ctx: &egui::Context, id: u32) {
@@ -1562,7 +1671,7 @@ impl App {
     fn open_settings(&mut self) { self.settings = true; self.key_input = self.cfg.api_key.clone(); }
 
     /// Une fenêtre ou une page faite de réglages : la manette y déplace le focus d'egui.
-    fn egui_nav(&self) -> bool { self.settings || self.editor.is_some() || self.add.is_some() || self.update.dialog_open() || self.bp_egui_page() }
+    fn egui_nav(&self) -> bool { self.exe_pick.is_some() || self.settings || self.editor.is_some() || self.add.is_some() || self.update.dialog_open() || self.bp_egui_page() }
 
     /// Les touches de manette de cette image, avant qu'egui ne la traite : dans les réglages, elles
     /// deviennent des flèches, Tab et Entrée pour egui ; ailleurs, des actions pour `inputs`.
@@ -1754,13 +1863,14 @@ impl App {
                 Action::Back => {
                     if ctx.memory(|m| m.any_popup_open()) { ctx.memory_mut(|m| m.close_popup()); }
                     else if self.update.dialog_open() { self.update.dismiss(); }
+                    else if self.exe_pick.is_some() { self.exe_pick = None; }
                     else if self.browsing() { if let Some(f) = self.add.as_mut() { f.browse = None; } }
                     else if self.settings && self.folder_pick.is_some() { self.folder_pick = None; }
                     else if self.settings || self.editor.is_some() || self.add.is_some() { self.add = None; self.editor = None; self.settings = false; self.capture = None; }
                     else if self.big { self.bp_action(ctx, a); }
                 }
-                Action::PrevTab if (self.browsing() && !self.settings) || (self.settings && self.folder_pick.is_some()) => {
-                    let b = if self.settings { self.folder_pick.as_mut() } else { self.add.as_mut().and_then(|f| f.browse.as_mut()) };
+                Action::PrevTab if self.exe_pick.is_some() || (self.browsing() && !self.settings) || (self.settings && self.folder_pick.is_some()) => {
+                    let b = if let Some((_, b)) = self.exe_pick.as_mut() { Some(b) } else if self.settings { self.folder_pick.as_mut() } else { self.add.as_mut().and_then(|f| f.browse.as_mut()) };
                     if let Some(b) = b { b.up(); }
                     ctx.memory_mut(|m| if let Some(id) = m.focused() { m.surrender_focus(id) });
                 }
@@ -1772,7 +1882,7 @@ impl App {
                 }
                 Action::Settings if self.settings => self.settings = false,
                 Action::BigPicture if self.big => { self.settings = false; self.editor = None; self.add = None; self.bp_exit(ctx); }
-                _ if self.big && !self.settings && self.editor.is_none() && self.add.is_none() && !self.update.dialog_open() => self.bp_action(ctx, a),
+                _ if self.big && self.exe_pick.is_none() && !self.settings && self.editor.is_none() && self.add.is_none() && !self.update.dialog_open() => self.bp_action(ctx, a),
                 _ => {}
             }
             return;
@@ -1894,6 +2004,7 @@ impl App {
             }
         }
         if self.hook.editor { if let Some(id) = self.selected { self.open_editor(ctx, id); } }
+        if self.hook.exe { if let Some(id) = self.selected { self.open_exe_pick(id); } }
         if self.hook.picker { self.open_back_picker(ctx, Zone::Lib); }
         if self.hook.rename { if let Some(g) = self.selected.and_then(|id| self.game(id)) { self.rename = Some((g.id, g.name.clone())); self.rename_focus = true; } }
     }
@@ -2408,6 +2519,7 @@ impl App {
             Menu::Favorite => self.toggle_favorite(id),
             Menu::Rename => { self.selected = Some(id); self.rename = Some((id, g.name.clone())); self.rename_focus = true; }
             Menu::Images => { self.selected = Some(id); self.open_editor(ctx, id); }
+            Menu::Exe => self.open_exe_pick(id),
             Menu::Folder => if let Some(f) = &g.folder {
                 match steam::open_folder(f) { Ok(()) => self.set_status("Dossier du jeu ouvert.", false), Err(e) => self.set_status(e, true) }
             },
@@ -2554,6 +2666,8 @@ impl App {
         let via_key = gkey(self.acc().map_or("", |a| a.id.as_str()), g.id);
         let (mut rename_open, mut rename_save, mut rename_cancel, mut name_undo) = (false, false, false, false);
         let name_queued = self.acc().and_then(|a| self.cfg.pending_names.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
+        let exe_queued = self.acc().and_then(|a| self.cfg.pending_exes.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
+        let (mut exe_open, mut exe_undo) = (false, false);
         let halting = self.stopping.get(&g.id).is_some_and(|t| t.elapsed() < Duration::from_secs(20));
         let confirming = self.stop_confirm.is_some_and(|(c, t)| c == g.id && t.elapsed() < STOP_CONFIRM);
         if confirming || halting { ctx.request_repaint_after(Duration::from_millis(250)); }
@@ -2765,6 +2879,19 @@ impl App {
                             name_undo = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler")).clicked();
                         });
                     }
+                    ui.add_space(6.0);
+                    let missing = !g.pending && !Path::new(&g.exe).is_file();
+                    let label = if missing { "Changer le programme (introuvable)" } else { "Changer le programme" };
+                    exe_open = ui.add_enabled(!g.pending && !running && busy.is_none(), egui::Button::new(if missing { RichText::new(label).color(BAD) } else { RichText::new(label) }).min_size(egui::vec2(310.0, 36.0)))
+                        .on_hover_text(format!("Actuel : {}", g.exe))
+                        .on_disabled_hover_text(if g.pending { "Possible une fois le jeu enregistré dans Steam" } else { "Possible quand le jeu est fermé" }).clicked();
+                    if exe_queued {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(GOLD, "Nouveau programme en attente.");
+                            exe_undo = ui.add_enabled(busy.is_none(), egui::Button::new("Annuler")).clicked();
+                        });
+                    }
                 }
                 if !g.pending {
                     ui.add_space(6.0);
@@ -2810,6 +2937,8 @@ impl App {
         if rename_cancel { self.rename = None; }
         if rename_save { let name = self.rename.take().map(|r| r.1).unwrap_or_default(); self.queue_name(ctx, &g, name); }
         if name_undo { self.cancel_name(ctx, g.id); }
+        if exe_open { self.open_exe_pick(g.id); }
+        if exe_undo { self.cancel_exe(ctx, g.id); }
     }
 
     fn add_modal(&mut self, ctx: &egui::Context) {
@@ -3908,6 +4037,7 @@ impl eframe::App for App {
         // egui efface au début de l'image les demandes de redessin à retardement faites avant.
         if self.rep.active() { ctx.request_repaint_after(controls::REPEAT_EVERY / 2); }
         self.add_modal(ctx);
+        self.exe_modal(ctx);
         self.editor_modal(ctx);
         self.settings_modal(ctx);
         self.focus_ring(ctx);
@@ -3941,7 +4071,7 @@ impl eframe::App for App {
 }
 
 /// Captures d'écran de test : ne lance jamais de jeu et n'écrit rien dans Steam.
-struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool, big: bool, bp_page: Option<String>, pad: VecDeque<Option<(gamepad::Btn, Option<bool>)>>, pad_next: f32 }
+struct TestHook { path: Option<String>, delay: f32, start: Instant, requested: bool, select: Option<String>, editor: bool, exe: bool, add: bool, settings: bool, demo: bool, queue: bool, font: bool, tab: u8, zone: Zone, blur: Option<u8>, top_blur: Option<u8>, picker: bool, rename: bool, top_clear: bool, top: Option<String>, panel: Option<String>, lib: Option<String>, hide: Vec<String>, theme: Option<String>, size: Option<u16>, back_game: bool, big: bool, bp_page: Option<String>, pad: VecDeque<Option<(gamepad::Btn, Option<bool>)>>, pad_next: f32 }
 
 impl Default for TestHook {
     fn default() -> Self {
@@ -3950,13 +4080,14 @@ impl Default for TestHook {
         let (mut hide, mut theme, mut size, mut queue) = (Vec::new(), None, None, false);
         let (mut panel, mut lib, mut picker, mut top_clear, mut top) = (None, None, false, false, None);
         let (mut tab, mut zone, mut blur, mut top_blur, mut font) = (0, Zone::Lib, None, None, false);
-        let mut rename = false;
+        let (mut rename, mut exe) = (false, false);
         let (mut big, mut bp_page) = (false, None);
         for part in spec.split(',') {
             big |= part == "big";
             if let Some(p) = part.strip_prefix("bp:") { bp_page = Some(p.to_string()); big = true; }
             if let Some(s) = part.strip_prefix("sel:") { select = Some(s.to_lowercase()); }
             editor |= part == "editor";
+            exe |= part == "exe";
             add |= part == "add";
             settings |= part == "settings";
             demo |= part == "demo";
@@ -3978,7 +4109,7 @@ impl Default for TestHook {
             if let Some(t) = part.strip_prefix("theme:") { theme = Some(t.to_string()); }
             if let Some(s) = part.strip_prefix("size:") { size = s.parse().ok(); }
         }
-        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, rename, top_clear, top, panel, lib, hide, theme, size, back_game, big, bp_page,
+        TestHook { path: std::env::var("APP_SCREENSHOT").ok().filter(|s| !s.is_empty()), delay: std::env::var("APP_SCREENSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0), start: Instant::now(), requested: false, select, editor, exe, add, settings, demo, queue, font, tab, zone, blur, top_blur, picker, rename, top_clear, top, panel, lib, hide, theme, size, back_game, big, bp_page,
             // MINIMALSTEAM_TEST_PAD=Down,Down,A,_,B : appuis de manette simulés, un toutes les 0,4 s (« _ » : attendre).
             // +LsDown appuie sans relâcher, -LsDown relâche (touche tenue).
             pad: std::env::var("MINIMALSTEAM_TEST_PAD").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(|s| {

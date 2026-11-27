@@ -10,7 +10,7 @@ use controls::Action;
 pub(crate) enum Page { Library, Game(u32), Gpu(u32), Compat(u32), Desc(u32) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Do { Play, Stop, Install, Favorite, Images, Gpu, Compat, ViaSteam, Cursor, Stats, Desc, Folder, Hide, Close }
+pub(crate) enum Do { Play, Stop, Install, Favorite, Images, Gpu, Compat, ViaSteam, Cursor, Stats, Desc, Folder, Exe, Hide, Close }
 
 pub(crate) struct Bp {
     pub page: Page,
@@ -255,6 +255,11 @@ impl App {
         if !g.pending { v.push((Do::Stats, "Statistiques".into(), true)); }
         if !g.pending { v.push((Do::Desc, "Changer la description".into(), true)); }
         if g.folder.as_ref().is_some_and(|f| f.is_dir()) { v.push((Do::Folder, "Ouvrir le dossier du jeu".into(), true)); }
+        if !g.steam && !g.pending {
+            let queued = self.acc().and_then(|a| self.cfg.pending_exes.get(&a.id)).is_some_and(|l| l.iter().any(|(i, _)| *i == g.id));
+            let label = if queued { "Changer le programme (nouveau en attente)" } else if !Path::new(&g.exe).is_file() { "Changer le programme (introuvable)" } else { "Changer le programme" };
+            v.push((Do::Exe, label.into(), !running && self.busy.is_none()));
+        }
         if !g.pending { v.push((Do::Hide, if self.is_hidden(g.id) { "Ne plus cacher".into() } else { "Cacher ce jeu".into() }, true)); }
         v
     }
@@ -283,6 +288,7 @@ impl App {
                 self.bp.page = Page::Desc(id);
             }
             Do::Folder => self.menu_action(ctx, id, Menu::Folder),
+            Do::Exe => { self.open_exe_pick(id); ctx.memory_mut(|m| if let Some(f) = m.focused() { m.surrender_focus(f) }); }
             Do::Hide => {
                 self.toggle_hidden(id, &g.name);
                 // Le jeu quitte peut-être l'onglet : retour à la bibliothèque, sur un jeu voisin.

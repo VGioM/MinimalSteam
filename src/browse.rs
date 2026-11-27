@@ -24,6 +24,8 @@ pub(crate) struct Browse {
     pub came_from: Option<PathBuf>,
     /// On choisit un dossier (Réglages > Dossiers de jeux) : pas de programmes dans la liste.
     pub choose: bool,
+    /// On remplace le programme d'un jeu : un seul fichier, pas d'ajout de tout un dossier.
+    pub single: bool,
 }
 
 /// Ce que l'utilisateur a choisi.
@@ -156,7 +158,7 @@ impl Browse {
         if extras || places.is_empty() { places.push(("Dossier personnel".into(), home.clone())); }
         if extras { for d in drives() { if !places.iter().any(|p| p.1 == d) { places.push((format!("Disque {}", short(&d)), d)); } } }
         let start = if choose { home } else { libs.first().cloned().unwrap_or(home) };
-        let mut b = Browse { dir: PathBuf::new(), entries: vec![], error: None, places, focus: true, came_from: None, choose };
+        let mut b = Browse { dir: PathBuf::new(), entries: vec![], error: None, places, focus: true, came_from: None, choose, single: false };
         b.open(start);
         b
     }
@@ -197,14 +199,19 @@ impl Browse {
         ui.horizontal(|ui| {
             let r = ui.add_enabled(self.dir.parent().is_some(), egui::Button::new("Dossier parent").min_size(egui::vec2(0.0, 32.0)));
             up = r.clicked();
-            let s = if self.choose {
+            let s = if self.single {
+                ui.add(egui::Button::new("Fermer").min_size(egui::vec2(0.0, 32.0)))
+            } else if self.choose {
                 ui.add(egui::Button::new("Choisir ce dossier").min_size(egui::vec2(0.0, 32.0)))
             } else {
                 ui.add(egui::Button::new("Ajouter les jeux de ce dossier").min_size(egui::vec2(0.0, 32.0)))
                     .on_hover_text("Chaque sous-dossier est un jeu : MinimalSteam trouve son programme.")
             };
-            if s.clicked() { pick = Some(Pick::Scan(self.dir.clone())); }
-            if ui.add(egui::Button::new("Fermer").min_size(egui::vec2(0.0, 32.0))).clicked() { pick = Some(Pick::Close); }
+            if self.single { if s.clicked() { pick = Some(Pick::Close); } }
+            else {
+                if s.clicked() { pick = Some(Pick::Scan(self.dir.clone())); }
+                if ui.add(egui::Button::new("Fermer").min_size(egui::vec2(0.0, 32.0))).clicked() { pick = Some(Pick::Close); }
+            }
             if self.entries.is_empty() { first = Some(s); }
         });
         if let Some(e) = &self.error { ui.colored_label(BAD, e); }
@@ -219,7 +226,7 @@ impl Browse {
             for (n, e) in self.entries.iter().enumerate() {
                 let text = if e.dir { RichText::new(format!("{}   ›", e.name)).size(15.0) } else { RichText::new(format!("▶  {}", e.name)).size(15.0).color(pal().accent) };
                 let r = ui.add(egui::Button::new(text).frame(true).min_size(egui::vec2(width - 14.0, 34.0)));
-                let r = if e.dir { r } else { r.on_hover_text("Ajouter ce programme") };
+                let r = if e.dir { r } else { r.on_hover_text(if self.single { "Choisir ce programme" } else { "Ajouter ce programme" }) };
                 if r.clicked() { if e.dir { go = Some(e.path.clone()); } else { pick = Some(Pick::File(e.path.clone())); } }
                 if n == 0 { first = Some(r.clone()); }
                 if self.came_from.as_ref() == Some(&e.path) { back_to = Some(r); }
@@ -388,7 +395,7 @@ mod tests {
         std::fs::set_permissions(d.join("donnees"), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(list(&d).unwrap().iter().any(|e| e.name == "donnees" && !e.dir));
         assert!(list(&d.join("absent")).is_err());
-        let mut b = Browse { dir: PathBuf::new(), entries: vec![], error: None, places: vec![], focus: false, came_from: None, choose: false };
+        let mut b = Browse { dir: PathBuf::new(), entries: vec![], error: None, places: vec![], focus: false, came_from: None, choose: false, single: false };
         b.open(d.join("Alpha"));
         assert_eq!(b.entries.len(), 1);
         b.up();
